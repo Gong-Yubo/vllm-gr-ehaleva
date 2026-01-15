@@ -93,7 +93,7 @@ vllm_gr/
 │   ├── sched               # request level scheduling
 │       ├── __init__.py
 │       └── gr_scheduler.py # GRScheduler (inherits from vLLMSc)
-│   └── kv_cache_manager.py # 
+│   └── kv_cache_manager.py #
 ├── entrypoint/             # Entry points (aligned with vllm/entrypoints/)
 │   ├── __init__.py
 │   ├── cli.py              # CLI commands (serve, bench, etc.)
@@ -123,7 +123,7 @@ vllm_gr/
 └── worker/                 # Worker (vllm/v1/worker aligned)
     ├── __init__.py
     └── gpu_worker.py
-    └── gpu_model_runner.py    
+    └── gpu_model_runner.py  
 ```
 
 ### 2.3 Integration Points with vLLM v1
@@ -170,7 +170,7 @@ The plugin integrates with vLLM's v1 engine through:
   - Enables programmatic access for offline inference
   - Supports batch processing of recommendation requests
 
-**Integration**: 
+**Integration**:
 - CLI commands via `pyproject.toml` entry points (e.g., `[project.scripts]`)
 - Plugin registration via `pyproject.toml` entry points
 - API server extends vLLM's existing API server infrastructure
@@ -209,14 +209,14 @@ from vllm.engine.llm_engine import LLMEngine
 
 class GREngine(LLMEngine):
     """GR Engine inherits from vLLM's LLMEngine"""
-    def __init__(self, vllm_config, executor_class, log_stats, 
-                 usage_context=UsageContext.ENGINE_CONTEXT, 
+    def __init__(self, vllm_config, executor_class, log_stats,
+                 usage_context=UsageContext.ENGINE_CONTEXT,
                  stat_loggers=None, **kwargs):
-        super().__init__(vllm_config, executor_class, log_stats, 
+        super().__init__(vllm_config, executor_class, log_stats,
                         usage_context, stat_loggers, **kwargs)
         # Additional initialization for recommendation workloads
         self._initialize_recommendation_features()
-    
+
     def _initialize_recommendation_features(self):
         """Initialize recommendation-specific features"""
         # Recommendation context management
@@ -306,7 +306,7 @@ class GRScheduler(Scheduler):
         super().__init__(scheduler_config, cache_config, **kwargs)
         # Additional initialization for recommendation workloads
         self._initialize_recommendation_scheduling()
-    
+
     def _initialize_recommendation_scheduling(self):
         """Initialize recommendation-specific scheduling features"""
         # Variable-length sequence batching optimization
@@ -762,10 +762,10 @@ graph TB
     Ranker --> Metrics[MetricsCollector]
     Metrics --> Output[OutputProcessor]
     Output --> Response[Response Formatter]
-    
+
     Core[RecommendationCore] -.-> Engine[GREngine]
     Core -.-> Worker
-    
+
     Attention -.-> Cache[Attention Cache]
     Encoder -.-> EncodingCache[Encoding Cache]
 ```

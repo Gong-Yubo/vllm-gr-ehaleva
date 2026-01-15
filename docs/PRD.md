@@ -40,7 +40,7 @@ HSTU is a specialized self-attention module that processes user interaction sequ
 ### 2.1 Current Challenges
 Serving HSTU models at scale faces several critical challenges:
 
-1. **Inefficient Sequence Processing**: 
+1. **Inefficient Sequence Processing**:
    - Traditional frameworks struggle with long, heterogeneous, high-cardinality user interaction sequences
    - Variable-length sequences cause memory fragmentation and inefficient batching
 
