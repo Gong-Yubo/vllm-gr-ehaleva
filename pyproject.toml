@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-gr"
 version = "0.1.0"
-description = "High-throughput serving plugin for HSTU generative recommendation models"
+description = "High-throughput serving plugin for generative recommendation models"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
