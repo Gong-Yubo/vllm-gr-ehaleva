@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import sys
 from vllm.entrypoints.cli.main import main as vllm_main
 import logging
@@ -12,15 +14,11 @@ def main():
         )
         # Launch vLLM-gr specialized serving path
         from vllm.entrypoints.utils import cli_env_setup
+        from vllm_gr.patch import run_patch
 
+        run_patch()
         cli_env_setup()
-
-        # For now remove the --gr flag from sys.argv to avoid issues in vLLM CLI
-        idx = sys.argv.index("--gr")
-        # Remove the flag and its value (if it has one)
-        if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--"):
-            sys.argv.pop(idx + 1)  # Remove value
-        sys.argv.pop(idx)  # Remove flag
+        sys.argv.remove("--gr")
 
     # Delegate to original vLLM CLI
     vllm_main()

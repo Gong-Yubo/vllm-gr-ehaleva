@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "pybind11","numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,7 @@ name = "vllm-gr"
 version = "0.1.0"
 description = "High-throughput serving plugin for generative recommendation models"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "vLLM-Gr Team"}
@@ -18,8 +18,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -29,18 +27,19 @@ classifiers = [
 ]
 
 dependencies = [
-    "vllm>=0.13.0",
-    "numpy",
-    "transformers",
+    "vllm==0.14.*"
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-asyncio",
+    "tblib",
     "pytest-cov",
     "black",
     "ruff",
     "mypy",
+    "psutil"
 ]
 
 [project.scripts]
@@ -55,11 +54,15 @@ packages = ["vllm_gr"]
 
 [tool.black]
 line-length = 100
-target-version = ["py39", "py310", "py311", "py312", "py313"]
+target-version = ["py310", "py311", "py312", "py313"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
+
+[tool.mypy]
+strict = true
+
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
