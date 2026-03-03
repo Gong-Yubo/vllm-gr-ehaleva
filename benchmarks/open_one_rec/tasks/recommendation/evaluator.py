@@ -1,7 +1,8 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
+
 """
 Recommendation Task Evaluator
 
@@ -9,12 +10,13 @@ Universal evaluator for all recommendation tasks.
 Computes Pass@k and Position1_Pass@k metrics.
 """
 
-from .base_evaluator import BaseEval
-from .. import utils as utils_sid
-from .. import utils_by_pid as utils_pid
 import json
-from typing import Dict, Any, Tuple, List
 import logging
+from typing import Any, Dict, List, Tuple
+
+from benchmarks.open_one_rec.base_evaluator import BaseEval
+from benchmarks.open_one_rec.tasks.recommendation import utils as utils_sid
+from benchmarks.open_one_rec.tasks.recommendation import utils_by_pid as utils_pid
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +52,7 @@ class RecommendationEvaluator(BaseEval):
 
         if evaluation_mode in ("pid", "both"):
             for k in k_values:
-                metrics.extend(
-                    [
-                        f"pid_pass@{k}",
-                        f"pid_position1_pass@{k}",
-                        f"pid_recall@{k}",
-                    ]
-                )
+                metrics.extend([f"pid_pass@{k}", f"pid_position1_pass@{k}", f"pid_recall@{k}"])
 
         return metrics
 
@@ -108,7 +104,8 @@ class RecommendationEvaluator(BaseEval):
             return unique_generations
         else:
             raise ValueError(
-                f"Unknown selection strategy: '{strategy}'. Supported strategies: 'first_k', 'top_k_by_logprobs'"
+                f"Unknown selection strategy: '{strategy}'. "
+                f"Supported strategies: 'first_k', 'top_k_by_logprobs'"
             )
 
     def _evaluate_single_mode(
@@ -210,16 +207,14 @@ class RecommendationEvaluator(BaseEval):
 
             if not ground_truth_ids:
                 logger.info(
-                    f"Sample {sample_id}: no valid ID found in ground truth ({evaluation_mode} mode)",
+                    f"Sample {sample_id}: no valid ID found in ground truth ({evaluation_mode} mode)"
                 )
                 per_sample_metrics[sample_id] = create_failed_metrics()
                 continue
 
             # Apply selection strategy to reorder generations
             selected_generations = self._select_generations_by_strategy(
-                generations=generations,
-                logprobs=logprobs,
-                strategy=select_k_strategy,
+                generations=generations, logprobs=logprobs, strategy=select_k_strategy
             )
 
             # Extract predicted IDs from selected generations
@@ -351,9 +346,7 @@ class RecommendationEvaluator(BaseEval):
             )
         return metrics
 
-    def _compute_metrics_from_scratch(
-        self,
-    ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    def _compute_metrics_from_scratch(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         """
         Compute all evaluation metrics from scratch
 
@@ -382,29 +375,17 @@ class RecommendationEvaluator(BaseEval):
             else:
                 mapping_filename = "sid2pid.json"
             pid_mapping_path = str(Path(self.data_dir) / mapping_filename)
-            logger.info(f"Loading PID mapping from {pid_mapping_path}...")
+            logger.info(f"Loading PID mapping from {pid_mapping_path}")
             code_to_pid = utils_pid.load_pid_mapping(pid_mapping_path)
 
         # Define evaluation modes to run
         # Format: (mode_name, metric_prefix, debug_filename, log_message)
         modes_config = {
             "sid": [("sid", "", "debug.json", "Evaluating using SID mode...")],
-            "pid": [
-                (
-                    "pid",
-                    "pid_",
-                    "debug_pid.json",
-                    "Evaluating using PID mode...",
-                )
-            ],
+            "pid": [("pid", "pid_", "debug_pid.json", "Evaluating using PID mode...")],
             "both": [
                 ("sid", "", "debug_sid.json", "  Running SID evaluation..."),
-                (
-                    "pid",
-                    "pid_",
-                    "debug_pid.json",
-                    "  Running PID evaluation...",
-                ),
+                ("pid", "pid_", "debug_pid.json", "  Running PID evaluation..."),
             ],
         }
 
@@ -422,27 +403,20 @@ class RecommendationEvaluator(BaseEval):
         all_debug_info = {}
 
         # Run evaluation for each configured mode
-        for (
-            mode_name,
-            metric_prefix,
-            debug_filename,
-            log_message,
-        ) in modes_config[evaluation_mode]:
+        for mode_name, metric_prefix, debug_filename, log_message in modes_config[evaluation_mode]:
             logger.info(f"{log_message}")
 
             # Run evaluation
-            (
-                pass_counts,
-                position1_pass_counts,
-                recall_sums,
-                mode_per_sample_metrics,
-                debug_info,
-            ) = self._evaluate_single_mode(
-                k_values=k_values,
-                evaluation_mode=mode_name,
-                select_k_strategy=select_k_strategy,
-                code_to_pid=code_to_pid if mode_name == "pid" else None,
-                sid_to_pid_strategy=sid_to_pid_strategy if mode_name == "pid" else "most_popular",
+            pass_counts, position1_pass_counts, recall_sums, mode_per_sample_metrics, debug_info = (
+                self._evaluate_single_mode(
+                    k_values=k_values,
+                    evaluation_mode=mode_name,
+                    select_k_strategy=select_k_strategy,
+                    code_to_pid=code_to_pid if mode_name == "pid" else None,
+                    sid_to_pid_strategy=sid_to_pid_strategy
+                    if mode_name == "pid"
+                    else "most_popular",
+                )
             )
 
             # Calculate and add metrics
@@ -472,19 +446,11 @@ class RecommendationEvaluator(BaseEval):
 
             # Store debug info for later saving
             if self.debug and self.predictions_dir:
-                all_debug_info[mode_name] = (
-                    debug_info,
-                    debug_filename,
-                    mode_metrics,
-                )
+                all_debug_info[mode_name] = (debug_info, debug_filename, mode_metrics)
 
         # Save debug info
         if self.debug and self.predictions_dir:
-            for mode_name, (
-                debug_info,
-                debug_filename,
-                mode_metrics,
-            ) in all_debug_info.items():
+            for mode_name, (debug_info, debug_filename, mode_metrics) in all_debug_info.items():
                 # For single mode, include all metrics; for both mode, filter by prefix
                 if evaluation_mode == "both":
                     prefix = "pid_" if mode_name == "pid" else ""
@@ -508,10 +474,7 @@ class RecommendationEvaluator(BaseEval):
         return metrics, per_sample_metrics
 
     def _save_debug_info(
-        self,
-        debug_info: Dict[str, Any],
-        metrics: Dict[str, Any],
-        debug_filename: str = None,
+        self, debug_info: Dict[str, Any], metrics: Dict[str, Any], debug_filename: str = None
     ):
         """
         Save detailed debug information to file
@@ -545,7 +508,7 @@ class RecommendationEvaluator(BaseEval):
         logger.info(f"No generation samples: {len(debug_info['no_generation_samples'])}")
 
         # Print metrics
-        logger.info("\n[bold]Metrics:[/bold]")
+        logger.info("\nMetrics:")
         for metric_name, metric_value in metrics.items():
             if metric_name != "total_samples":
                 logger.info(f"  {metric_name}: {metric_value}")
@@ -562,4 +525,3 @@ class RecommendationEvaluator(BaseEval):
                 elif "ground_truth_pids" in item:
                     logger.info(f"    Ground truth PIDs: {item['ground_truth_pids']}")
                 logger.info(f"    Top 5 generations: {item['top_10_generations'][:5]}")
-                logger.info()

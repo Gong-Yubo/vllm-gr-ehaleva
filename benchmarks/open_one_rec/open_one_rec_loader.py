@@ -1,4 +1,4 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
@@ -8,38 +8,30 @@ Base Loader for all task data loaders
 Provides common functionality for data loading, sampling, and file path resolution.
 """
 
-from .evaluators.label_pred import (
-    LabelPredEvaluator,
-)
-from .evaluators.recommendation import (
-    RecommendationEvaluator,
-)
-from .evaluators.item_understand import (
-    ItemUnderstandEvaluator,
-)
-from .evaluators.rec_reason import (
-    RecoReasonEvaluator,
-)
-from .configs.config import (
-    LABEL_COND_CONFIG,
-    VIDEO_CONFIG,
-    PRODUCT_CONFIG,
-    AD_CONFIG,
-    INTERACTIVE_CONFIG,
-    LABEL_PRED_CONFIG,
-    ITEM_UNDERSTAND_CONFIG,
-    REC_REASON_CONFIG,
-)
-import os
 import json
-from json import JSONDecodeError
-import pandas as pd
-from typing import Dict, Any, Optional
+import logging
+import os
 from abc import ABC
 from dataclasses import dataclass
-from typing import Type
+from json import JSONDecodeError
+from typing import Any, Dict, Optional, Type
 
-import logging
+import pandas as pd
+
+from .tasks.item_understand.config import ITEM_UNDERSTAND_CONFIG
+from .tasks.item_understand.evaluator import ItemUnderstandEvaluator
+from .tasks.label_pred import LabelPredEvaluator
+from .tasks.label_pred.config import LABEL_PRED_CONFIG
+from .tasks.rec_reason.config import REC_REASON_CONFIG
+from .tasks.rec_reason.evaluator import RecoReasonEvaluator
+from .tasks.recommendation.config import (
+    AD_CONFIG,
+    INTERACTIVE_CONFIG,
+    LABEL_COND_CONFIG,
+    PRODUCT_CONFIG,
+    VIDEO_CONFIG,
+)
+from .tasks.recommendation.evaluator import RecommendationEvaluator
 
 logger = logging.getLogger(__name__)
 
@@ -427,12 +419,12 @@ class BaseLoader(ABC):
         return df
 
     def _sample_data(self, df: pd.DataFrame, sample_size: int) -> pd.DataFrame:
-        """Sample data from DataFrame"""
+        """Reproducibly sample data (take head) from DataFrame"""
         if sample_size >= len(df):
             return df
 
         logger.info(f"Sampling {sample_size} samples (total: {len(df)})")
-        return df.head(sample_size)
+        return df.sample(sample_size, random_state=42)
 
     def _save_sample_data(self, df: pd.DataFrame, split: str, sample_size: int):
         """Save sample data in parquet format"""

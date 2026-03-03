@@ -1,4 +1,4 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
@@ -9,17 +9,16 @@ Evaluator for label_pred classification task.
 Computes AUC metric from logprobs-based predictions.
 """
 
-from typing import Dict, Any, Tuple, List
+import logging
+from typing import Any, Dict, List, Tuple
 
-from .base_evaluator import BaseEval
-from ..utils import (
+from benchmarks.open_one_rec.base_evaluator import BaseEval
+from benchmarks.open_one_rec.tasks.label_pred.utils import (
+    calculate_auc,
     extract_label_from_answer,
     extract_probability_from_logprobs,
-    calculate_auc,
     get_debug_info,
 )
-
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +244,7 @@ class LabelPredEvaluator(BaseEval):
         logger.info(f"Invalid samples: {len(debug_info['invalid_samples'])}")
 
         # Print metrics
-        logger.info("\n[bold]Metrics:[/bold]")
+        logger.info("\nMetrics:")
         logger.info(f"  AUC: {metrics['auc']:.4f}")
 
         # Show some invalid sample examples
@@ -256,4 +255,4 @@ class LabelPredEvaluator(BaseEval):
                 logger.info(f"    Sample ID: {item['sample_id']}")
                 logger.info(f"    Reason: {item['reason']}")
                 logger.info(f"    Ground truth: {item['ground_truth']}")
-                logger.info()
+                logger.info("")

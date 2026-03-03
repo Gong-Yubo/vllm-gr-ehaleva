@@ -1,19 +1,22 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
+
 """
 Recommendation Task Utilities (PID-based)
 
 Functions for PID extraction and recommendation metrics computation using PIDs.
 """
 
-import re
 import json
+import logging
 import random
-from typing import Set, Dict, List, Any, Tuple, Optional
+import re
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+logger = logging.getLogger(__name__)
 
 # Encoding constants for (code1, code2, code3) -> single int
 # Each code is in range [0, 8192], needs 13 bits
@@ -43,7 +46,7 @@ def load_pid_mapping(mapping_path: str) -> Dict[int, List[Dict[str, int]]]:
     # Convert string keys back to integers
     code_to_pid = {int(k): v for k, v in sid_to_pid_json.items()}
 
-    print(f"[INFO] Loaded {len(code_to_pid)} SID to PID mappings from {mapping_path}")
+    logger.info(f"[INFO] Loaded {len(code_to_pid)} SID to PID mappings from {mapping_path}")
     return code_to_pid
 
 
@@ -77,7 +80,7 @@ def extract_sid_codes_from_text(text: str) -> Optional[Tuple[int, int, int]]:
         return None
     if len(matches) > 1:
         # Log warning but use first match
-        print(f"[WARNING] Expected 1 SID code, got {len(matches)}, using first")
+        logger.warning(f"[WARNING] Expected 1 SID code, got {len(matches)}, using first")
     return (int(matches[0][0]), int(matches[0][1]), int(matches[0][2]))
 
 

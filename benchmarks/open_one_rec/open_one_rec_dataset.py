@@ -1,12 +1,8 @@
 import random
-from vllm.benchmarks.datasets import (
-    BenchmarkDataset,
-    TokenizerLike,
-    SampleRequest,
-)
-from .open_one_rec_loader import (
-    DataLoaderWrapper,
-)
+
+from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest, TokenizerLike
+
+from .open_one_rec_loader import DataLoaderWrapper
 
 # -----------------------------------------------------------------------------
 # OpenOneRec Dataset Implementation
@@ -59,8 +55,8 @@ class OneRecDataset(BenchmarkDataset):
             # Convert to expected format
             for id, data in test_data.items():
                 output_len = data.get(
-                    "expected_output_len", 16
-                )  # Default to 16 for short GR generations
+                    "expected_output_len", 5
+                )  # Default to 5 for short GR generations
 
                 self.data.append(
                     {

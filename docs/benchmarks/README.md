@@ -6,7 +6,11 @@ OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchma
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
+  - [Offline Throughput Mode](#mode-1-offline-throughput-mode-simple-local)
+  - [Offline Accuracy Mode](#mode-2-offline-accuracy-mode-simple-local)
+  - [Online, API Server Mode](#mode-3-online-api-server-mode-production-like)
 - [Installation](#installation)
+- [Open One Rec Benchmark Dataset](#open-one-rec-benchmark-dataset)
 - [Usage](#usage)
 - [Task Types](#task-types)
 - [Evaluation](#evaluation)
@@ -18,11 +22,11 @@ OneRec is a benchmark suite designed to evaluate generative recommendation model
 
 | Task Type | Category | Description | Sample Size |
 |-----------|----------|-------------|------------|
-| `ad` | Recommendation | Predict ad engagement | 500 |
-| `product` | Recommendation | Product recommendation reasoning | 1000 |
-| `label_cond` | Recommendation | Conditional label prediction | 800 |
-| `video` | Recommendation | Video recommendation scoring | 1500 |
-| `interactive` | Recommendation | Interactive engagement prediction | 600 |
+| `ad` | Recommendation | Predict ad engagement | 27677 |
+| `product` | Recommendation | Product recommendation reasoning | 27910 |
+| `label_cond` | Recommendation | Conditional label prediction | 34891 |
+| `video` | Recommendation | Video recommendation scoring | 38781 |
+| `interactive` | Recommendation | Interactive engagement prediction | 1000 |
 | `label_pred` | Classification | User engagement classification | 346190 |
 
 ### Key Features
@@ -38,7 +42,7 @@ OneRec is a benchmark suite designed to evaluate generative recommendation model
 
 OneRec supports two operation modes. Choose based on your needs:
 
-### Mode 1: Throughput Mode (Simple, Local)
+### Mode 1: Offline Throughput Mode (Simple, Local)
 
 For quick local benchmarking without an API server:
 
@@ -50,69 +54,73 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-path ./data \
   --task-types video \
   --num-prompts 1000 \
+  --max-logprobs 1024 \
   --output-json results/throughput.json  
-
 ```
 
 **Best for**: Quick testing, development, maximizing throughput
 
-### Mode 2: API Server Mode (Production-like)
+Read further in [Throughput manual](throughput.md)
+
+### Mode 2: Offline Accuracy Mode (Simple, Local)
+
+For quick local benchmarking without an API server:
+
+```bash
+# Single command - everything in one process
+python -m benchmarks.open_one_rec.one_rec_acc_test
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-path ./data \
+  --task-type video \
+  --num-prompts 1000 \
+  --result-dir results/acc_test_results
+```
+
+**Best for**: Testing, development, validating accuracy
+
+Read further in [Accuracy manual](accuracy.md)
+
+### Mode 3: Online, API Server Mode (Production-like)
 
 For production-like testing with separate server and client:
 
 ```bash
-# Terminal 1: Start vLLM API server
-  vllm-gr serve \
-  --model OpenOneRec/OneRec-1.7B \
-  --max-logprobs 1024 \
-  --default-chat-template-kwargs '{"enable_thinking": false}'
+# On Terminal 1: Start vLLM API server
+  vllm-gr serve OpenOneRec/OneRec-1.7B \
+    --gr \
+    --max-logprobs 1024 \
+    --default-chat-template-kwargs '{"enable_thinking": false}'
 
 
-# Terminal 2: Run benchmark against server
+# On Terminal 2:
+# For throughput -- Run throughput benchmark against server
 python -m benchmarks.open_one_rec.one_rec_main bench serve \
-  --endpoint http://localhost:8000/v1 \
-  --model OpenOneRec/OneRec-1.7B \
+  --endpoint /v1/chat/completions \
   --backend openai-chat \
+  --model OpenOneRec/OneRec-1.7B \
   --dataset-name  onerec \
   --dataset-path ./data \
   --task-types video \
-  --num-prompts 1000
+  --num-prompts 100 \
+  --use-beam-search \
+  --n 128
+
+# For accuracy -- Run accuracy benchmark against server
+python -m benchmarks.open_one_rec.one_rec_acc_test \
+  --endpoint /v1/chat/completions \
+  --backend openai-chat \
+  --model OpenOneRec/OneRec-1.7B \
+  --dataset-name  onerec \
+  --dataset-path ./data \
+  --task-type video \
+  --num-prompts 100 \
+  --result-dir results/acc_test_results
 ```
+Note, that for benchmark accuracy results, the test itself sets a default beam width
+
 
 **Best for**: Production-like testing, distributed deployment, load testing
 
-### With Beam Search
-
-Both modes support beam search:
-
-```bash
-# Throughput mode with beam search
-python -m  benchmarks.open_one_rec.one_rec_main bench throughput \
-  --model OpenOneRec/OneRec-1.7B \
-  --dataset-name onerec \
-  --dataset-path ./data \
-  --task-types video \
-  --num-prompts 1000 \
-  --use-beam-search \
-  --n 8 \
-  --output-json results/throughput.json  
-
-
-# API mode with beam search (requires API server)
-python -m benchmarks.open_one_rec.one_rec_main bench serve \
-  --endpoint http://localhost:8000/v1 \
-  --model OpenOneRec/OneRec-1.7B \
-  --backend openai-chat \
-  --dataset-name onerec \
-  --dataset-path ./data \  
-  --task-types video \
-  --num-prompts 1000 \
-  --use-beam-search \
-  --n 8 \
-  --save-result \
-  --result-dir results/serve \  
-  --save-detailed  
-```
 
 ### Operation Modes Comparison
 
@@ -213,7 +221,7 @@ Each Parquet file must contain these columns:
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--task-types` | str | All 8 tasks | Comma-separated list of task types to run |
+| `--task-types` | str | All 6 tasks | Comma-separated list of task types to run |
 | `--use-beam-search` | bool | False | Enable beam search during generation |
 | `--n` | int | 8 | Number of beams for beam search |
 

@@ -1,4 +1,4 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
@@ -8,11 +8,11 @@ Item Understand Evaluator
 Evaluates model predictions on Item Understand task using WIP (LLM-as-Judge).
 """
 
-import os
-from typing import Dict, Any, Tuple, List
-from .base_evaluator import BaseEval
-
 import logging
+import os
+from typing import Any, Dict, List, Tuple
+
+from benchmarks.open_one_rec.base_evaluator import BaseEval
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,8 @@ class ItemUnderstandEvaluator(BaseEval):
         """
         try:
             from api import get_client_from_config
-            from vllm.benchmarks.open_one_rec.utils import evaluate_wip
+
+            from benchmarks.open_one_rec.tasks.item_understand.utils import evaluate_wip
         except ImportError as e:
             logger.info(f"[red]Failed to import WIP evaluation modules: {e}[/red]")
             return {}, {}
@@ -164,7 +165,7 @@ class ItemUnderstandEvaluator(BaseEval):
             )
 
             logger.info(
-                f"[green]WIP evaluation completed: {wip_metrics.get('wip_num_samples', 0)} samples evaluated[/green]"
+                f"WIP evaluation completed: {wip_metrics.get('wip_num_samples', 0)} samples evaluated"
             )
             return wip_metrics, wip_per_sample
 

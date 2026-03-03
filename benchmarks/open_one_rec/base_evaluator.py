@@ -1,4 +1,4 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
@@ -9,10 +9,10 @@ Provides common interface for evaluation logic.
 """
 
 import json
+import logging
 import os
 from abc import ABC
-from typing import Dict, Any, Tuple, Optional, List
-import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

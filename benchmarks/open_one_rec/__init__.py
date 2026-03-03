@@ -1,4 +1,7 @@
 try:
-    from benchmarks.open_one_rec import one_rec_patch  # noqa: F401
+    from . import one_rec_patch
+
+    print("OpenOneRec patch applied.")
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     one_rec_patch = None  # type: ignore
+    print("OpenOneRec patch NOT applied.")

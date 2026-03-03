@@ -1,4 +1,4 @@
-# Imported from: https://https://github.com/Kuaishou-OneRec/OpenOneRec
+# Imported from: https://github.com/Kuaishou-OneRec/OpenOneRec
 # Original commit: ae668a6a30bd71bde7a3f459fe0ac958182ce1d2
 # Date imported: 2026‑01‑09
 # License: Apache 2.0 License (inherited from source)
@@ -8,12 +8,11 @@ Recommendation Reason Evaluator
 Evaluates model predictions on Recommendation Reason task using LLM-based multi-dimensional evaluation.
 """
 
-from typing import Dict, Any, Tuple, List
-
-from .base_evaluator import BaseEval
-from ..utils import extract_after_think, evaluate_reasoning
-
 import logging
+from typing import Any, Dict, List, Tuple
+
+from benchmarks.open_one_rec.base_evaluator import BaseEval
+from benchmarks.open_one_rec.tasks.rec_reason.utils import evaluate_reasoning, extract_after_think
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ class RecoReasonEvaluator(BaseEval):
             ValueError: If endpoint configuration invalid
         """
         try:
-            from openai import OpenAI, AsyncOpenAI
+            from openai import AsyncOpenAI, OpenAI
         except ImportError:
             raise ImportError("OpenAI client not installed. Install with: pip install openai")
 
