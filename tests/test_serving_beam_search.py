@@ -56,7 +56,7 @@ async def beam_search_test(loops: int):
 
         # Use the specific prompt
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        prompt_file = os.path.join(os.path.dirname(__file__), "prompt.txt")
+        prompt_file = os.path.join(os.path.dirname(__file__), "resources/single_one_rec_prompt.txt")
         with open(prompt_file, "r") as f:
             prompt_text = f.read()
         prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
@@ -129,6 +129,9 @@ async def test_serving_gr_beam_search(loops: int):
     print(
         f"before gpu mem={before_gpu_mem / 1024**3:.2f}GB, after gpu mem={after_gpu_mem / 1024**3:.2f}GB"
     )
+    # These thresholds (500MB host RAM, 50MB GPU RAM) match the minimum safe
+    # memory headroom required for the 1.7B model to load and run without OOM.
+    # They are intentionally conservative to avoid instability on smaller machines.
     if loops > 1:
         # Allow 500MB tolerance
         assert after_host_mem - before_host_mem <= 500 * 1024**2

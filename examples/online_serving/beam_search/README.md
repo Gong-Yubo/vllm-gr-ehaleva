@@ -19,7 +19,7 @@ run client (on another terminal)
 - the server would reply with **beam_width** suggested items.
 
 ```bash
-./client.sh [-b beam_width ]
+bash ./client.sh [-b beam_width ]
 
 
 ```
