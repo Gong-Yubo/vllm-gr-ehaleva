@@ -1,17 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-
-try:
-    import minheap_cpp as minheap
-except ImportError:
-    minheap = None
 import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 
 import numpy as np
-
 from vllm.beam_search import BeamSearchSequence
 from vllm.entrypoints.openai.protocol import VLLMValidationError
 from vllm.inputs.data import PromptType, TokensPrompt
@@ -22,9 +16,8 @@ from vllm.multimodal import MultiModalDataDict
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
-from vllm.utils.async_utils import (
-    collect_from_async_generator,
-)
+from vllm.utils.async_utils import collect_from_async_generator
+
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
 
@@ -175,8 +168,23 @@ async def beam_search(
             )
             tasks.append(task)
 
+        catalog_tasks = []
+        if self.models.catalog is not None:
+
+            def get_valid_tokens_set(beam) -> set[int]:
+                generated_tokens = beam.tokens[len(prompt_token_ids) :]
+                return self.models.catalog.valid(generated_tokens)
+
+            for beam in all_beams:
+                catalog_tasks.append(asyncio.to_thread(get_valid_tokens_set, beam))
+
         gen_start = time.perf_counter()
-        output = [x[0] for x in await asyncio.gather(*tasks)]
+        if catalog_tasks:
+            all_results = await asyncio.gather(*(tasks + catalog_tasks))
+            output = [x[0] for x in all_results[: len(tasks)]]
+            valid_tokens_sets = all_results[len(tasks) :]
+        else:
+            output = [x[0] for x in await asyncio.gather(*tasks)]
         if token > 0:
             generation_time += time.perf_counter() - gen_start
         new_beams = []
@@ -215,6 +223,11 @@ async def beam_search(
                 logprobs = result.outputs[0].logprobs[0]
                 if len(logprobs) > logprobs_num:
                     logprobs = dict(list(logprobs.items())[:logprobs_num])
+                if self.models.catalog is not None and catalog_tasks:
+                    valid_tokens_set = valid_tokens_sets[i]
+                    for token_id in list(logprobs.keys()):
+                        if token_id not in valid_tokens_set:
+                            logprobs[token_id].logprob = -float("inf")
                 all_beams_token_id.extend(list(logprobs.keys()))
                 all_beams_logprob.extend(
                     [current_beam.cum_logprob + obj.logprob for obj in logprobs.values()]
@@ -243,19 +256,18 @@ async def beam_search(
                         stop_reason=eos_token_id,
                     )
                 )
+            # After processing, set the log probability of the eos condition
+            # to negative infinity.
+            all_beams_logprob[eos_idx] = -np.inf
 
         # Processing non-EOS tokens
         # Get indices of the top beam_width probabilities
-        if minheap is None:
-            raise ImportError("minheap_cpp is not available")
-        next_beams = minheap.MinHeapTuple(beam_width)
+        if all_beams_logprob.size > beam_width:
+            topn_idx = np.argpartition(np.negative(all_beams_logprob), beam_width)[:beam_width]
+        else:
+            topn_idx = np.arange(all_beams_logprob.size)
 
-        effective_eos_id = eos_token_id if not ignore_eos else -1
-        next_beams.push_candidates_striped(
-            all_beams_logprob, all_beams_token_id, logprobs_num, effective_eos_id
-        )
-
-        for score, idx in next_beams.items():
+        for idx in topn_idx:
             current_beam = all_beams[idx // logprobs_num]
             result = output[idx // logprobs_num]
             token_id = int(all_beams_token_id[idx])
@@ -297,7 +309,8 @@ async def beam_search(
         beam_search_decode_time=beam_search_decode_time,
         num_generation_tokens=num_generation_tokens,
     )
-    yield RequestOutput(
+
+    out = RequestOutput(
         request_id=request_id,
         prompt=prompt_text,
         outputs=[
@@ -317,3 +330,4 @@ async def beam_search(
         prompt_logprobs=None,
         metrics=metrics,
     )
+    yield out

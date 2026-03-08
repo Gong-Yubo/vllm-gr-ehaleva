@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from setuptools import setup, Extension
-import pybind11
+
 import numpy
+import pybind11
+from setuptools import Extension, setup
 
 
 def get_ext_modules():

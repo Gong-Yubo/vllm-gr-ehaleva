@@ -11,18 +11,21 @@ try:
 except ImportError:
     from vllm.v1.metrics.stats import RequestStateStats
 
-import pytest
 import os
 import time
-import psutil
-import torch
 from typing import Any
-from vllm.entrypoints.openai.serving_engine import OpenAIServing
-from vllm.entrypoints.openai.serving_models import OpenAIServingModels, BaseModelPath
-from vllm.inputs import TokensPrompt
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.openai.api_server import build_async_engine_client_from_engine_args
+
+import psutil
+import pytest
+import torch
 from transformers import AutoTokenizer
+from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.openai.api_server import (
+    build_async_engine_client_from_engine_args,
+)
+from vllm.entrypoints.openai.serving_engine import OpenAIServing
+from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.inputs import TokensPrompt
 from vllm.outputs import RequestOutput
 
 if not torch.cuda.is_available():

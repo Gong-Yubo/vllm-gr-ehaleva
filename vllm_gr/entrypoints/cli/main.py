@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import sys
-from vllm.entrypoints.cli.main import main as vllm_main
 import logging
+import sys
+
+from vllm.entrypoints.cli.main import main as vllm_main
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,7 @@ def main():
         )
         # Launch vLLM-gr specialized serving path
         from vllm.entrypoints.utils import cli_env_setup
+
         from vllm_gr.patch import run_patch
 
         run_patch()

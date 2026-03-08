@@ -12,7 +12,10 @@ import logging
 from typing import Any, Dict, List, Tuple
 
 from benchmarks.open_one_rec.base_evaluator import BaseEval
-from benchmarks.open_one_rec.tasks.rec_reason.utils import evaluate_reasoning, extract_after_think
+from benchmarks.open_one_rec.tasks.rec_reason.utils import (
+    evaluate_reasoning,
+    extract_after_think,
+)
 
 logger = logging.getLogger(__name__)
 
