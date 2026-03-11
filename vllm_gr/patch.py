@@ -4,6 +4,7 @@
 from vllm_gr.engine.arg_utils import patch_add_cli_args
 from vllm_gr.entrypoints.beam_search_patch import patch_offline_beam_search
 from vllm_gr.entrypoints.openai.beam_search_patch import (
+    patch_batch_and_fork,
     patch_beam_search,
     patch_sampling,
 )
@@ -16,3 +17,4 @@ def run_patch():
     patch_add_cli_args()
     patch_OpenAIServingModels_init()
     patch_offline_beam_search()
+    patch_batch_and_fork()
