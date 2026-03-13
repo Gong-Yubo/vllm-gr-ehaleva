@@ -147,6 +147,11 @@ async def beam_search(
     begin_token = params.begin_token
     end_token = params.end_token
 
+    # All beams from the same logical beam search will share the same priority value
+    # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
+    MICROSECONDS = 1000000
+    priority = int(time.perf_counter() * MICROSECONDS)  # us granularity
+
     include_stop_str_in_output = params.include_stop_str_in_output
     if beam_width == 0:
         raise VLLMValidationError(
@@ -307,6 +312,7 @@ async def beam_search(
                 eos_token_id,
                 lora_request,
                 trace_headers,
+                priority=priority,
             )
         elif use_batch:
             output, new_ids = await _add_batch_step(
@@ -317,6 +323,7 @@ async def beam_search(
                 beam_search_params,
                 use_beam_fork,
                 trace_headers,
+                priority=priority,
             )
             if new_ids:
                 prev_beam_internal_ids = new_ids
