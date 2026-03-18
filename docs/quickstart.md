@@ -56,21 +56,18 @@ To run vllm-gr in a server--client configuration, use two terminals
 
 ### On the first terminal: Run the server
 
-Use vllm-gr directly
 
-```bash
-vllm-gr serve \
-  --model OpenOneRec/OneRec-1.7B \
-  --max-logprobs 1024 \
-  --default-chat-template-kwargs '{"enable_thinking": false}'
-```
 
-Or use vllm serve with the plugin
+Use vllm serve with the plugin
 
 ```bash
 vllm serve --gr \
   --model OpenOneRec/OneRec-1.7B \
   --max-logprobs 1024 \
+  --max_num_seqs 1024 \
+  --max_num_batched_tokens 16384 \
+  --scheduling-policy priority \
+  --attention-backend CUSTOM \
   --default-chat-template-kwargs '{"enable_thinking": false}'
 ```
 
