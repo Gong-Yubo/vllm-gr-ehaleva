@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler for recommendation inference."""
 
-from vllm.v1.core.scheduler import Scheduler
+from vllm.v1.core.sched.scheduler import Scheduler
 
 
 class GRScheduler(Scheduler):

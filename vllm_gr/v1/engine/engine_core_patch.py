@@ -105,7 +105,11 @@ def apply_engine_core_child_patches():
     import vllm.v1.engine as engine_mod
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
-    from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_fork, process_input_sockets
+    from vllm_gr.v1.engine.core import (
+        _cache_beam_request,
+        _handle_beam_fork,
+        process_input_sockets,
+    )
     from vllm_gr.v1.engine.types import BeamForkRequest
 
     # Inject types into vllm.v1.engine module
@@ -126,6 +130,9 @@ def apply_engine_core_child_patches():
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets
+
+    # Apply scheduler patches in the child process
+    apply_scheduler_patch()
 
     logger.debug("Engine-core patches (ADD_BATCH, BEAM_FORK) applied in child process.")
 
@@ -212,3 +219,76 @@ def run_engine_core(*args, **kwargs):
         original_run(*args, **kwargs)
     finally:
         _run_engine_core_active = False
+
+
+def apply_scheduler_patch():
+    """Monkey-patch Scheduler.schedule with the cache computed blocks version."""
+    from functools import wraps
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if getattr(Scheduler, "_patched_for_cache_computed_blocks", False):
+        return
+
+    _original_schedule = Scheduler.schedule
+
+    @wraps(_original_schedule)
+    def patched_schedule(self):
+        # Cache for get_computed_blocks to optimize beam search
+        computed_blocks_cache = {}
+        last_key = None
+        last_res = None
+        block_size = self.cache_config.block_size
+        _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
+
+        def get_cache_computed_blocks(req):
+            # In some cases, the first beam must recompute all blocks if they were previously cleared.
+            # However, later beams can skip this work because the first beam has already performed it.
+            # By applying a threshold, we ensure that only heavily reused blocks—those with many cache hits—are stored in the cache.
+            cache_th = 256
+
+            def is_cache_worthy(r):
+                return r[1] > cache_th
+
+            nonlocal last_key, last_res
+            # get_computed_blocks only accounts for hashes up to the final complete block.
+            # Additionally, when every token is retrieved from the cache, the last token still
+            # needs to be recomputed to produce the logits
+            max_num_blocks = max(0, (req.num_tokens - 1) // block_size)
+            last_hash = req.block_hashes[max_num_blocks - 1] if max_num_blocks > 0 else None
+            key = (req.num_tokens, req.skip_reading_prefix_cache, last_hash)
+
+            if key == last_key and last_res is not None and is_cache_worthy(last_res):
+                res = last_res
+            elif key in computed_blocks_cache:
+                res = computed_blocks_cache[key]
+                last_key = key
+                last_res = res
+            else:
+                res = _original_get_computed_blocks(req)
+                if is_cache_worthy(res):
+                    computed_blocks_cache[key] = res
+                    last_key = key
+                    last_res = res
+
+            if self.kv_cache_manager.log_stats:
+                assert self.kv_cache_manager.prefix_cache_stats is not None
+                self.kv_cache_manager.prefix_cache_stats.record(
+                    num_tokens=req.num_tokens,
+                    num_hits=res[1],
+                    preempted=req.num_preemptions > 0,
+                )
+            return res
+
+        # Temporarily mock the get_computed_blocks method for this schedule pass
+        self.kv_cache_manager.get_computed_blocks = get_cache_computed_blocks
+        try:
+            output = _original_schedule(self)
+        finally:
+            # Restore the original method immediately after
+            self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
+
+        return output
+
+    Scheduler.schedule = patched_schedule
+    setattr(Scheduler, "_patched_for_cache_computed_blocks", True)
+    logger.debug("Scheduler.schedule patched for cache computed blocks.")
