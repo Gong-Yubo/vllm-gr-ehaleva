@@ -9,7 +9,10 @@ import torch
 from vllm.utils.torch_utils import set_random_seed
 
 try:
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend, BeamAttentionImpl
+    from vllm_gr.v1.attention.backends.beam_attn import (
+        BeamAttentionBackend,
+        BeamAttentionImpl,
+    )
 except ImportError:
     pytest.skip(
         "beam_attn backend is not supported.",
@@ -179,7 +182,7 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
         device=inputs.query.device,
     )
 
-    def run_kernel():
+    def run_kernel() -> None:
         flash_attn_varlen_func(
             q=inputs.query,
             k=inputs.key_cache,
@@ -291,7 +294,7 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs) -> torch.Tensor:
         offsets = starts.repeat_interleave(lengths) - cumsum_lengths[:-1].repeat_interleave(lengths)
         prefix_indices = arrange_tensor + offsets
 
-    def run_kernel():
+    def run_kernel() -> None:
         BeamAttentionImpl.cascade_attention(
             output=output,
             query=inputs.query,
@@ -322,16 +325,16 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     return output
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("beam_width", [16, 32])
-@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("soft_cap", [None, 50])
-@pytest.mark.parametrize("fa_version", [2, 3])
-@torch.inference_mode()
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore
+@pytest.mark.parametrize("beam_width", [16, 32])  # type: ignore
+@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)  # type: ignore
+@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore
+@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore
+@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore
+@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore
+@torch.inference_mode()  # type: ignore
 def test_beam_cascade(
     batch_size: int,
     beam_width: int,
@@ -389,15 +392,15 @@ def test_beam_cascade(
     torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", [3])
-@pytest.mark.parametrize("beam_width", [32])
-@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("non_shared_location", ["beginning", "middle", "end"])
-@torch.inference_mode()
+@pytest.mark.parametrize("batch_size", [3])  # type: ignore
+@pytest.mark.parametrize("beam_width", [32])  # type: ignore
+@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)  # type: ignore
+@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore
+@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore
+@pytest.mark.parametrize("non_shared_location", ["beginning", "middle", "end"])  # type: ignore
+@torch.inference_mode()  # type: ignore
 def test_beam_cascade_non_identity_path(
     batch_size: int,
     beam_width: int,

@@ -1,6 +1,11 @@
 default_install_hook_types:
   - pre-commit
   - commit-msg
+default_language_version:
+  python: python3.12
+default_stages:
+  - pre-commit # Run locally
+  - manual # Run in CI
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
@@ -14,6 +19,11 @@ repos:
         args: ["--fix=lf"]
       - id: trailing-whitespace
         args: ["--markdown-linebreak-ext=md"]
+  - repo: https://github.com/pycqa/isort
+    rev: 8.0.1
+    hooks:
+    - id: isort
+      args: ["--profile", "black"]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.14.10
@@ -23,10 +33,25 @@ repos:
     - id: ruff-format
 
   - repo: https://github.com/crate-ci/typos
-    rev: typos-dict-v0.13.13
+    rev: v1.38.1
     hooks:
-      - id: typos
-        # only for staged files
+    - id: typos
+      args: [--force-exclude]
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v21.1.2
+    hooks:
+    - id: clang-format
+      exclude: 'csrc/(moe/topk_softmax_kernels.cu|quantization/gguf/(ggml-common.h|dequantize.cuh|vecdotq.cuh|mmq.cuh|mmvq.cuh))|vllm/third_party/.*'
+      types_or: [c++, cuda]
+      args: [--style=file, --verbose]
+
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.47.0
+    hooks:
+    - id: markdownlint
+      exclude: '.*\.inc\.md'
+
 
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.9
@@ -49,7 +74,89 @@ repos:
       language: system
       verbose: true
       stages: [commit-msg]
+  - repo: local
+    hooks:
+    - id: mypy-3.11 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
+      name: Run mypy for Python 3.11
+      entry: python tools/pre_commit/mypy.py 1 "3.11"
+      <<: &mypy_common
+        language: python
+        types_or: [python, pyi]
+        require_serial: true
+        additional_dependencies: [mypy==1.11.1, regex, types-cachetools, types-setuptools, types-PyYAML, types-requests, types-torch, pydantic]
+    - id: mypy-3.12 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
+      name: Run mypy for Python 3.12
+      entry: python tools/pre_commit/mypy.py 1 "3.12"
+      <<: *mypy_common
+    - id: mypy-3.13 # TODO: Use https://github.com/pre-commit/mirrors-mypy when mypy setup is less awkward
+      name: Run mypy for Python 3.13
+      entry: python tools/pre_commit/mypy.py 1 "3.13"
+      <<: *mypy_common
+    - id: shellcheck
+      name: Lint shell scripts
+      entry: tools/pre_commit/shellcheck.sh
+      language: script
+      types: [shell]
+      require_serial: true
+    - id: png-lint
+      name: Lint PNG exports from excalidraw
+      entry: tools/pre_commit/png-lint.sh
+      language: script
+      types: [png]
+    - id: signoff-commit
+      name: Sign-off Commit
+      entry: bash
+      args:
+        - -c
+        - |
+          if ! grep -q "^Signed-off-by: $(git config user.name) <$(git config user.email)>" "$(git rev-parse --git-path COMMIT_EDITMSG)"; then
+          printf "\nSigned-off-by: $(git config user.name) <$(git config user.email)>\n" >> "$(git rev-parse --git-path COMMIT_EDITMSG)"
+          fi
+      language: system
+      verbose: true
+      stages: [commit-msg]
+    - id: check-spdx-header
+      name: Check SPDX headers
+      entry: python tools/pre_commit/check_spdx_header.py
+      exclude: ^benchmarks/open_one_rec/.*\.py$
+      language: python
+      types: [python]
+    - id: check-filenames
+      name: Check for spaces in all filenames
+      entry: bash
+      args:
+        - -c
+        - 'git ls-files | grep " " && echo "Filenames should not contain spaces!" && exit 1 || exit 0'
+      language: system
+      always_run: true
+      pass_filenames: false
+    - id: enforce-import-regex-instead-of-re
+      name: Enforce import regex as re
+      entry: python tools/pre_commit/enforce_regex_import.py
+      language: python
+      types: [python]
+      pass_filenames: false
+      additional_dependencies: [regex]
+    - id: validate-config
+      name: Validate configuration has default values and that each field has a docstring
+      entry: python tools/pre_commit/validate_config.py
+      language: python
+      additional_dependencies: [regex]
 
+    # Insert new entries above the `suggestion` entry
+      # Keep `suggestion` last
+    - id: run-tests
+      name: Run all tests
+      entry: bash tools/pre_commit/run_tests.sh
+      language: system
+      pass_filenames: false
+      verbose: true
+    - id: check-pickle-imports
+      name: Prevent new pickle/cloudpickle imports
+      entry: python tools/pre_commit/check_pickle_imports.py
+      language: python
+      types: [python]
+      additional_dependencies: [regex]
     # Keep `suggestion` last
     - id: suggestion
       name: Suggestion
@@ -57,11 +164,3 @@ repos:
       language: system
       verbose: true
       pass_filenames: false
-    # Insert new entries above the `suggestion` entry
-
-    - id: check-pickle-imports
-      name: Prevent new pickle/cloudpickle imports
-      entry: python tools/pre_commit/check_pickle_imports.py
-      language: python
-      types: [python]
-      additional_dependencies: [regex]

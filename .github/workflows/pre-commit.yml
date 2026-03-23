@@ -16,11 +16,21 @@ permissions:
 
 jobs:
   pre-commit:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
           cache: 'pip'
+
+      - name: Check for single commit
+        if: github.event_name == 'pull_request'  &&  github.event.pull_request.commits != 1
+        run: |
+          echo "Error: The PR has ${{ github.event.pull_request.commits }} commits. Please squash them into a single commit."
+          exit 1
+      - name: Install optional dependencies
+        run: pip install .[dev]
+
       - uses: pre-commit/action@v3.0.1

@@ -1,7 +1,6 @@
-<!-- markdownlint-disable-next-line MD033 -->
-<p align="center">
+<h1 align="center">
   <img src="docs/assets/vLLM-GR.png" alt="vLLM-GR">
-</p>
+</h1>
 
 <h3 align="center">
 Efficient Generative Recommendation Serving

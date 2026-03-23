@@ -27,7 +27,7 @@ echo "Building wheel with Python: $PYTHON"
 cd "$(dirname "$0")/.."
 
 # Clean previous builds
-rm -rf dist/ build/ *.egg-info
+rm -rf dist/ build/ ./*.egg-info
 
 # Install build dependencies if needed
 "$PYTHON" -m pip install --quiet build wheel

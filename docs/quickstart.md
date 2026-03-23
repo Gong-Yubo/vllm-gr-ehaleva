@@ -34,10 +34,13 @@ pip --version
 3. **Installation**
 
 For standard installation, run
+
 ```bash
 pip install -e .
 ```
+
 Alternatively, for developer mode, run
+
 ```bash
 pip install -e .[dev]
 ```
@@ -55,8 +58,6 @@ python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
 To run vllm-gr in a server--client configuration, use two terminals
 
 ### On the first terminal: Run the server
-
-
 
 Use vllm serve with the plugin
 

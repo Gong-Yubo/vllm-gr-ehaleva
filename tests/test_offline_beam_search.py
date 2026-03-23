@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import multiprocessing
 import os
 import time
 from typing import Any, Dict
@@ -68,13 +71,20 @@ def _run_offline_beam_search(loops: int, use_patch: bool) -> None:
     print(f"Elapsed mean: {(end - start) / max(1, loops):.4f}s")
 
 
-@pytest.mark.slow
-def test_offline_beam_search(loops: int):
+def _run_offline_beam_search_target(loops: int) -> None:
     _run_offline_beam_search(loops, use_patch=False)
 
 
-@pytest.mark.slow
-def test_offline_gr_beam_search(loops: int):
+@pytest.mark.slow  # type: ignore
+def test_offline_beam_search(loops: int) -> None:
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=_run_offline_beam_search_target, args=(loops,))
+    p.start()
+    p.join()
+    assert p.exitcode == 0
+
+
+def _run_offline_gr_beam_search_target(loops: int) -> None:
     before_gpu = torch.cuda.memory_allocated()
     before_host = psutil.Process().memory_info().rss
     _run_offline_beam_search(loops, use_patch=True)
@@ -92,3 +102,12 @@ def test_offline_gr_beam_search(loops: int):
     if loops > 1:
         assert after_host - before_host <= 500 * 1024**2
         assert after_gpu - before_gpu <= 50 * 1024**2
+
+
+@pytest.mark.slow  # type: ignore
+def test_offline_gr_beam_search(loops: int) -> None:
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=_run_offline_gr_beam_search_target, args=(loops,))
+    p.start()
+    p.join()
+    assert p.exitcode == 0

@@ -105,7 +105,11 @@ def apply_engine_core_child_patches():
     import vllm.v1.engine as engine_mod
     from vllm.v1.engine.core import EngineCore, EngineCoreProc
 
-    from vllm_gr.v1.engine.core import _cache_beam_request, _handle_beam_fork, process_input_sockets
+    from vllm_gr.v1.engine.core import (
+        _cache_beam_request,
+        _handle_beam_fork,
+        process_input_sockets,
+    )
     from vllm_gr.v1.engine.types import BeamForkRequest
 
     # Inject types into vllm.v1.engine module

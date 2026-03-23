@@ -1,10 +1,15 @@
-# Installation
+# Beam search example
+
+## Installation
+
 refer to [quickstart.md](../../../docs/quickstart.md) for installation
 
-# running example
+## running example
+
 - This example demonstrates using vllm-gr for executing generative recommendation system based OneRec-1.7B model
 
 - Run vllm-gr server
+
 ```bash
 vllm serve --gr \
     --default-chat-template-kwargs '{"enable_thinking": false}' \
@@ -15,15 +20,15 @@ vllm serve --gr \
 ```
 
 run client (on another terminal)
+
 - the client execute a predefined 120 items prompt and ask for item recommendations.
 - the server would reply with **beam_width** suggested items.
 
 ```bash
 bash ./client.sh [-b beam_width ]
 
+## Expected result
 
-```
-# Expected result
 - sorted recommendations in json format with fields:
     - content: recommended token
 - total execution time
@@ -48,5 +53,6 @@ total time: 1.610658s
 ```
 
 - Example was demonstrated on:
+
     - Host: Intel(R) Xeon(R) Gold 5320T CPU @ 2.30GHz
     - Device: Nvidia RTX A6000 48GB

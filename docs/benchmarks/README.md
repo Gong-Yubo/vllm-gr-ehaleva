@@ -6,9 +6,9 @@ OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchma
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
-  - [Offline Throughput Mode](#mode-1-offline-throughput-mode-simple-local)
-  - [Offline Accuracy Mode](#mode-2-offline-accuracy-mode-simple-local)
-  - [Online, API Server Mode](#mode-3-online-api-server-mode-production-like)
+    - [Offline Throughput Mode](#mode-1-offline-throughput-mode-simple-local)
+    - [Offline Accuracy Mode](#mode-2-offline-accuracy-mode-simple-local)
+    - [Online, API Server Mode](#mode-3-online-api-server-mode-production-like)
 - [Installation](#installation)
 - [Open One Rec Benchmark Dataset](#open-one-rec-benchmark-dataset)
 - [Usage](#usage)
@@ -21,7 +21,7 @@ OneRec Benchmark is a comprehensive Recommendation Instruction-Following benchma
 OneRec is a benchmark suite designed to evaluate generative recommendation models across distinct task types. The most relevant of those are:
 
 | Task Type | Category | Description | Sample Size |
-|-----------|----------|-------------|------------|
+| ----------- | ---------- | ------------- | ------------ |
 | `ad` | Recommendation | Predict ad engagement | 27677 |
 | `product` | Recommendation | Product recommendation reasoning | 27910 |
 | `label_cond` | Recommendation | Conditional label prediction | 34891 |
@@ -55,7 +55,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --task-types video \
   --num-prompts 1000 \
   --max-logprobs 1024 \
-  --output-json results/throughput.json  
+  --output-json results/throughput.json
 ```
 
 **Best for**: Quick testing, development, maximizing throughput
@@ -115,17 +115,21 @@ python -m benchmarks.open_one_rec.one_rec_acc_test \
   --task-type video \
   --num-prompts 100 \
   --result-dir results/acc_test_results
-```
+
+```text
 Note, that for benchmark accuracy results, the test itself sets a default beam width
 
+**Best for**: Production-like testing, distributed deployment, load testing
+```
+
+Note, that for benchmark accuracy results, the test itself sets a default beam width
 
 **Best for**: Production-like testing, distributed deployment, load testing
-
 
 ### Operation Modes Comparison
 
 | Aspect | Throughput Mode | API Server Mode |
-|--------|---|---|
+| -------- | --- | --- |
 | Setup | 1 command | 2 terminals |
 | Latency | Lower | Higher (+HTTP) |
 | Throughput | Higher | Lower |
@@ -148,22 +152,22 @@ You can refer also to [`Quickstart`](../quickstart.md) menu.
 
 1. **Clone the repository**
 
-```bash
-git clone https://github.com/JiusiServe/vllm-gr.git
-cd vllm-gr
-```
+  ```bash
+  git clone https://github.com/JiusiServe/vllm-gr.git
+  cd vllm-gr
+  ```
 
 2. **Installation**
 
-```bash
-pip install -e .
-```
+  ```bash
+  pip install -e .
+  ```
 
 3. **Verify installation**
 
-```bash
-python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
-```
+  ```bash
+  python -c "import benchmarks.open_one_rec; print('✓ Installation successful')"
+  ```
 
 ## Open One Rec Benchmark Dataset
 
@@ -174,9 +178,9 @@ Use your huggingface username to approve this link before you download:
 <https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF>
 
 ```bash
-mkdir -p OpenOneRec  
+mkdir -p OpenOneRec
 cd OpenOneRec
-git lfs install  
+git lfs install
 git clone https://huggingface.co/datasets/OpenOneRec/OpenOneRec-RecIF ./data
 cd -
 ```
@@ -199,7 +203,7 @@ OneRec expects data in **Parquet format** with the following schema:
 Each Parquet file must contain these columns:
 
 | Column | Type | Description |
-|--------|------|-------------|
+| -------- | ------ | ------------- |
 | `messages` | str/list | Chat messages in JSON format or list of dicts |
 | `metadata` | str/dict | JSON metadata containing answer and context |
 
@@ -210,7 +214,7 @@ Each Parquet file must contain these columns:
 #### Core Arguments
 
 | Argument | Type | Default | Description |
-|----------|------|---------|-------------|
+| ---------- | ------ | --------- | ------------- |
 | `--dataset-name` | str | - | Must be `onerec` for OneRec benchmark |
 | `--model` | str | - | Model ID or path to load |
 | `--dataset-path` | str | None | Path to benchmark data directory |
@@ -220,7 +224,7 @@ Each Parquet file must contain these columns:
 #### OneRec Specific Arguments
 
 | Argument | Type | Default | Description |
-|----------|------|---------|-------------|
+| ---------- | ------ | --------- | ------------- |
 | `--task-types` | str | All 6 tasks | Comma-separated list of task types to run |
 | `--use-beam-search` | bool | False | Enable beam search during generation |
 | `--n` | int | 8 | Number of beams for beam search |
@@ -228,7 +232,7 @@ Each Parquet file must contain these columns:
 #### Generation Arguments
 
 | Argument | Type | Default | Description |
-|----------|------|---------|-------------|
+| ---------- | ------ | --------- | ------------- |
 | `--max-tokens` | int | 128 | Maximum tokens to generate |
 | `--temperature` | float | 0.8 | Sampling temperature |
 | `--top-p` | float | 0.95 | Nucleus sampling parameter |
@@ -396,9 +400,8 @@ For all task types listed in the [Task Types](#task-types) section
 the `RecommendationEvaluator` is the default Evaluator
 
 | Evaluator | Tasks | Metrics |
-|-----------|-------|---------|
+| ----------- | ------- | --------- |
 | `RecommendationEvaluator` | ad, product, label_cond, video, interactive | BLEU, ROUGE, BERTScore |
-
 
 ### Running Evaluation
 
@@ -411,7 +414,7 @@ python -m benchmarks.open_one_rec.one_rec_main bench throughput \
   --dataset-name onerec \
   --dataset-path ./data \
   --num-prompts 100 \
-  --output-json results/throughput  
+  --output-json results/throughput
 ```
 
 ### Result Format
@@ -532,7 +535,6 @@ dataset = OneRecDataset(
 print(f'✓ Loaded {len(dataset.data)} samples')
 "
 ```
-
 
 ## License
 
