@@ -3,6 +3,7 @@
 """vllm-gr: High-throughput serving plugin for HSTU generative recommendation models."""
 
 __version__ = "0.1.0"
+__version_tuple__ = (0, 1, 0)
 
 try:
     import torch
