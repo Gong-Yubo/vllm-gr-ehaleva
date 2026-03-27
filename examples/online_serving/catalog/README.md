@@ -21,11 +21,16 @@ Limiting the available items increases accuracy and enables reducing the search 
 
 - Follow [Open One Rec Benchmark Dataset](../../../docs/benchmarks/README.md#open-one-rec-benchmark-dataset) for One Rec Benchmark Dataset retrieval.
 
-- Use `convert_catalog.py` script to convert OpenOneRec catalog to vllm-gr catalog format.
-- OpenOneRec catalog is in `<OpenOneRecFolder>/benchmark_data/sid2pid.json`
+- Use `benchmarks/open_one_rec/tools/convert_catalog.py` to convert OpenOneRec sid2pid.json file to vllm-gr catalog format.
+- For full usage/options, see [OpenOneRec tools README](../../../benchmarks/open_one_rec/tools/README.md).
+- OpenOneRec's list of acceptable SIDs is in `<OpenOneRecFolder>/sid2pid.json`.
+
+Here's an example where `--dataset-path` must point to the directory containing `sid2pid.json`.
 
 ```bash
-python convert_catalog.py ${OpenOneRecFolder}/benchmark_data/sid2pid.json ${MyFolder}/catalog.json
+python benchmarks/open_one_rec/tools/convert_catalog.py \
+    --dataset-path ./data \
+    --output-path ${MyFolder}/catalog.json
 ```
 
 ## Invoking the Server
