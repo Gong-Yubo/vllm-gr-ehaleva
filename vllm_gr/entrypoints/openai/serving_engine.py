@@ -87,6 +87,7 @@ async def _beam_fork_step(
             eos_token_id=eos_token_id,
             lora_request=lora_request,
             trace_headers=trace_headers,
+            priority=priority,
         )
     )
 

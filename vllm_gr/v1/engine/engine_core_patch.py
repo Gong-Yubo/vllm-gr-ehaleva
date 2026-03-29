@@ -11,6 +11,95 @@ from vllm.v1.engine import EngineCoreRequestType
 logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Helper: Pre-compute shared prefix groups for attention beam routing
+# ---------------------------------------------------------------------------
+
+
+def _get_lcp(a: list, b: list, hint: int = 0) -> int:
+    """Find longest common prefix between two hash lists using binary search."""
+    m = min(len(a), len(b))
+    if m == 0:
+        return 0
+
+    start = 0
+    end = m - 1
+
+    if hint > 0:
+        h = min(hint, m)
+        if a[h - 1] == b[h - 1]:
+            if h == m or a[h] != b[h]:
+                return h
+            start = h
+        else:
+            end = h - 2
+
+    if start <= end and a[end] == b[end]:
+        return end + 1
+
+    ans = start
+    low, high = start, end
+    while low <= high:
+        mid = (low + high) // 2
+        if a[mid] == b[mid]:
+            ans = mid + 1
+            low = mid + 1
+        else:
+            high = mid - 1
+    return ans
+
+
+def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: int) -> list:
+    """Group requests by beam priority and find the common prefix depth.
+    This function groups all requests of the same beam priority into a single group,
+    calculating the longest common prefix (LCP) shared by all requests in the group.
+    """
+    if not req_ids:
+        return []
+
+    # The min_group_th defines the minimum number of common blocks required
+    # to justify the overhead of a shared prefix group.
+    # 256 tokens (approx 16 blocks of size 16) is a heuristic for
+    # when the compute savings outweigh the kernel launch overhead.
+    min_group_th = 256 // block_size
+
+    # Group requests by beam group id (priority)
+    beam_groups: dict[int, list[str]] = {}
+    for req_id in req_ids:
+        g = requests[req_id].priority
+        if g not in beam_groups:
+            beam_groups[g] = []
+        beam_groups[g].append(req_id)
+
+    all_groups = []
+    for g, group_req_ids in beam_groups.items():
+        n = len(group_req_ids)
+        if n == 0:
+            continue
+        if n == 1:
+            all_groups.append((0, [group_req_ids[0]]))
+            continue
+
+        # Calculate minimum Longest Common Prefix (LCP) across all adjacent requests in the group
+        min_lcp = float("inf")
+        last_lcp = 0
+        for i in range(n - 1):
+            req1 = requests[group_req_ids[i]]
+            req2 = requests[group_req_ids[i + 1]]
+
+            common_len = _get_lcp(req1.block_hashes, req2.block_hashes, hint=last_lcp)
+
+            min_lcp = common_len if common_len < min_lcp else min_lcp
+            last_lcp = common_len
+
+            if min_lcp < min_group_th:
+                min_lcp = 0
+                break
+        all_groups.append((min_lcp, group_req_ids))
+
+    return all_groups
+
+
+# ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
 # ---------------------------------------------------------------------------
 
@@ -133,6 +222,9 @@ def apply_engine_core_child_patches():
 
     # Apply scheduler patches in the child process
     apply_scheduler_patch()
+
+    # Apply worker patches (e.g., GPUModelRunner)
+    apply_worker_patches()
 
     logger.debug("Engine-core patches (ADD_BATCH, BEAM_FORK) applied in child process.")
 
@@ -279,16 +371,69 @@ def apply_scheduler_patch():
                 )
             return res
 
-        # Temporarily mock the get_computed_blocks method for this schedule pass
+        # Temporarily mock the methods for this schedule pass
         self.kv_cache_manager.get_computed_blocks = get_cache_computed_blocks
         try:
             output = _original_schedule(self)
         finally:
-            # Restore the original method immediately after
+            # Restore the original methods immediately after
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
 
+        req_ids = list(output.num_scheduled_tokens.keys())
+        if req_ids:
+            output.beam_prefix_groups = _compute_beam_prefix_groups(
+                req_ids, self.requests, self.cache_config.block_size
+            )
         return output
 
     Scheduler.schedule = patched_schedule
     setattr(Scheduler, "_patched_for_cache_computed_blocks", True)
     logger.debug("Scheduler.schedule patched for cache computed blocks.")
+
+
+def apply_worker_patches():
+    """Monkey-patch GPUModelRunner to inject beam_prefix_groups into the attention builder."""
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+        from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+    except ImportError:
+        return
+
+    if getattr(GPUModelRunner, "_patched_for_beam_groups", False):
+        return
+
+    _original_execute_model = GPUModelRunner.execute_model
+    _original_build_attention_metadata = GPUModelRunner._build_attention_metadata
+
+    def patched_execute_model(self, scheduler_output, intermediate_tensors=None):
+        beam_groups = getattr(scheduler_output, "beam_prefix_groups", None)
+        self._current_beam_prefix_groups_str = beam_groups
+
+        try:
+            return _original_execute_model(self, scheduler_output, intermediate_tensors)
+        finally:
+            self._current_beam_prefix_groups_str = None
+
+    def patched_build_attention_metadata(self, *args, **kwargs):
+        beam_groups_str = getattr(self, "_current_beam_prefix_groups_str", None)
+        if beam_groups_str is not None:
+            req_id_to_idx = {
+                r_id: i for i, r_id in enumerate(self.input_batch.req_ids) if r_id is not None
+            }
+            translated_groups = []
+            for depth, group_req_ids in beam_groups_str:
+                indices = [req_id_to_idx[r] for r in group_req_ids if r in req_id_to_idx]
+                if indices:
+                    translated_groups.append((depth, indices))
+            CommonAttentionMetadata.beam_prefix_groups = translated_groups
+            try:
+                return _original_build_attention_metadata(self, *args, **kwargs)
+            finally:
+                CommonAttentionMetadata.beam_prefix_groups = None
+        else:
+            return _original_build_attention_metadata(self, *args, **kwargs)
+
+    GPUModelRunner.execute_model = patched_execute_model
+    GPUModelRunner._build_attention_metadata = patched_build_attention_metadata
+    GPUModelRunner._patched_for_beam_groups = True
+    logger.debug("GPUModelRunner patched for beam groups via CommonAttentionMetadata.")
