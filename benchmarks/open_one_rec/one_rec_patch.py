@@ -255,12 +255,26 @@ def _add_dataset_to_parser_choices(parser, dataset_name):
 def _add_onerec_arguments(parser):
     """Helper to add OneRec-specific arguments to parser."""
     onerec_group = parser.add_argument_group("onerec dataset options")
+
+    def _has_option(opt: str) -> bool:
+        for action in parser._actions:
+            if hasattr(action, "option_strings") and opt in action.option_strings:
+                return True
+        return False
+
     onerec_group.add_argument(
         "--task-types",
         type=str,
         default=DEFAULT_TASK_TYPES,
         help="Comma-separated list of task types",
     )
+    if not _has_option("--custom-input-len"):
+        onerec_group.add_argument(
+            "--custom-input-len",
+            type=int,
+            default=None,
+            help="Target prompt token length; prompts are trimmed or repeated to match.",
+        )
 
 
 def _add_beams_arguments(parser):
@@ -296,6 +310,8 @@ def patched_get_samples(args, tokenizer):
             dataset_path=args.dataset_path,
             disable_shuffle=args.disable_shuffle,
             tokenizer=tokenizer,
+            custom_input_len=getattr(args, "custom_input_len", None),
+            sample_size=args.num_prompts,
         )
         return dataset.sample(
             num_requests=args.num_prompts,
@@ -332,6 +348,9 @@ def patched_get_requests(args, tokenizer):
             task_types=args.task_types.split(","),
             model_path=args.model,
             tokenizer=tokenizer,
+            custom_input_len=getattr(args, "custom_input_len", None),
+            sample_size=args.num_prompts,
+            disable_shuffle=getattr(args, "disable_shuffle", False),
         )
         return dataset.sample(
             num_requests=args.num_prompts,
@@ -387,6 +406,8 @@ def _run_offline_beam_search_benchmark(args):
         task_types=args.task_types.split(","),
         model_path=args.model,
         tokenizer=tokenizer,
+        custom_input_len=getattr(args, "custom_input_len", None),
+        sample_size=args.num_prompts,
     )
 
     # Sample requests

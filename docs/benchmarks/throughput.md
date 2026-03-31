@@ -39,11 +39,13 @@ Run the server and client separately for a production‑style setup.
 
 ```bash
 
-  vllm-gr  serve \
+  vllm-gr  serve OpenOneRec/OneRec-1.7B \
   --gr \
-  --model OpenOneRec/OneRec-1.7B \
   --max-logprobs 1024 \
-  --default-chat-template-kwargs '{"enable_thinking": false}'
+  --default-chat-template-kwargs '{"enable_thinking": false}' \
+  --max_num_seqs 1024 \
+  --max_num_batched_tokens 16384 \
+  --scheduling-policy priority
 ```
 
 #### Terminal 2 — Run the throughput benchmark against the server
@@ -82,13 +84,20 @@ python -m benchmarks.open_one_rec.one_rec_main bench serve \
 
 #### Benchmark related parameters
 
-| Argument         | Type | Default | Description                               |
-|------------------|------|---------|-------------------------------------------|
-| `--dataset-name` | str  | -       | Must be `onerec` for OneRec benchmark     |
-| `--dataset-path` | str  | -       | Path to benchmark data directory          |
-| `--num-prompts`  | int  | -       | Number of prompts to sample               |
-| `--task-types`   | str  | -       | Comma-separated list of task types to run |
-| `--output-json`  | str  | -       | Path to save benchmark results as JSON    |
+| Argument             | Type | Default | Description                                             |
+|----------------------|------|---------|---------------------------------------------------------|
+| `--dataset-name`     | str  | -       | Must be `onerec` for OneRec benchmark                   |
+| `--dataset-path`     | str  | -       | Path to benchmark data directory                        |
+| `--num-prompts`      | int  | -       | Number of prompts to sample                             |
+| `--task-types`       | str  | -       | Comma-separated list of task types to run               |
+| `--custom-input-len` | int  | -       | Prompt length; prompts are trimmed or repeated to match |
+| `--output-json`      | str  | -       | Path to save benchmark results as JSON                  |
+
+### OpenOneRec Length Caveats
+
+- For OpenOneRec, effective prompt length comes from each task input after task formatting, not from a strict benchmark-spec template length.
+- `--custom-input-len` normalizes length by trimming or repeating prompt tokens per sample.
+- This can distort semantic content; therefore user-defined prefix length is intended for throughput/latency experiments and is not recommended for accuracy measurement.
 
 #### Beam Search Parameters (Optional)
 
