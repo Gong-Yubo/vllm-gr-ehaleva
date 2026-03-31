@@ -6,6 +6,7 @@ default_language_version:
 default_stages:
   - pre-commit # Run locally
   - manual # Run in CI
+fail_fast: true
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

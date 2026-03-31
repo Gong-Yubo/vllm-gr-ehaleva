@@ -48,8 +48,9 @@ dev = [
 vllm = "vllm_gr.entrypoints.cli.main:main"
 vllm-gr = "vllm_gr.entrypoints.cli.main:main"
 
-[tool.setuptools]
-packages = ["vllm_gr"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vllm_gr*"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]

@@ -1,21 +1,25 @@
-name: pre-commit
-
+name: Pre-commit and Benchmark
 on:
   pull_request:
     branches: [main]
   push:
     branches: [main]
+  issue_comment:
+    types: [created]
   workflow_dispatch: # for manual trigger
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'issue_comment' }}
 
 permissions:
   contents: read
 
 jobs:
   pre-commit:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request && contains(github.event.comment.body, '/retest'))
     runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
@@ -23,14 +27,84 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip'
+
+      - uses: astral-sh/setup-uv@v1
+
+      - name: Cache virtual environment
+        uses: corca-ai/local-cache@v2
+        id: cache-venv
+        with:
+          path: .venv
+          base: /data/actions/cache
+          key: venv-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+
+      - name: Create virtual environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+            uv venv --seed .venv
+
+      - name: Set up virtual environment
+        run: |
+            echo "${{ github.workspace }}/.venv/bin" >> "$GITHUB_PATH"
+            echo "VIRTUAL_ENV=${{ github.workspace }}/.venv" >> "$GITHUB_ENV"
 
       - name: Check for single commit
         if: github.event_name == 'pull_request'  &&  github.event.pull_request.commits != 1
         run: |
           echo "Error: The PR has ${{ github.event.pull_request.commits }} commits. Please squash them into a single commit."
           exit 1
-      - name: Install optional dependencies
-        run: pip install .[dev]
+
+      - name: Install dependencies
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          # Install all dependencies and the package concurrently (fast)
+          uv pip install .[dev]
+
+      - name: Install vllm-gr
+        run: |
+          uv pip install --reinstall --no-deps .
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v46
 
       - uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --files ${{ steps.changed-files.outputs.all_changed_files }}
+
+      - name: Cache OpenOneRec dataset
+        uses: corca-ai/local-cache@v2
+        id: cache-dataset
+        with:
+          path: OpenOneRec
+          base: /data/actions/cache
+          key: dataset-openonerec-${{ runner.os }}
+
+      - name: Download OpenOneRec dataset
+        if: steps.cache-dataset.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "Error: HF_TOKEN secret is not set. The OpenOneRec dataset is gated and requires a Hugging Face token."
+            exit 1
+          fi
+          uv tool install hf
+          mkdir -p OpenOneRec
+          hf download OpenOneRec/OpenOneRec-RecIF --token "$HF_TOKEN" --local-dir ./OpenOneRec --repo-type=dataset
+
+
+      - name: Build Catalog
+        run: |
+          mkdir -p generated_data
+          python ./benchmarks/open_one_rec/tools/create_task_catalog.py \
+            -t video \
+            -d ./OpenOneRec/benchmark_data \
+            -o generated_data/video_catalog.json
+
+      - name: Execute benchmark test and verify KPI
+        env:
+          DATASET_PATH: ${{ github.workspace }}/OpenOneRec/benchmark_data
+          CATALOG_PATH: ${{ github.workspace }}/generated_data/video_catalog.json
+        run: |
+          ./tests/system/run_benchmark_and_verify.sh
