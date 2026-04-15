@@ -346,9 +346,13 @@ def apply_scheduler_patch():
             # Additionally, when every token is retrieved from the cache, the last token still
             # needs to be recomputed to produce the logits
             max_num_blocks = max(0, (req.num_tokens - 1) // block_size)
-            last_hash = req.block_hashes[max_num_blocks - 1] if max_num_blocks > 0 else None
+            hash_idx = min(max_num_blocks - 1, len(req.block_hashes) - 1)
+            last_hash = req.block_hashes[hash_idx] if hash_idx >= 0 else None
+            if last_hash is None:
+                last_hash = req.request_id
             key = (req.num_tokens, req.skip_reading_prefix_cache, last_hash)
 
+            served_from_sw_cache = True
             if key == last_key and last_res is not None and is_cache_worthy(last_res):
                 res = last_res
             elif key in computed_blocks_cache:
@@ -357,21 +361,22 @@ def apply_scheduler_patch():
                 last_res = res
             else:
                 res = _original_get_computed_blocks(req)
+                served_from_sw_cache = False
                 if is_cache_worthy(res):
                     computed_blocks_cache[key] = res
                     last_key = key
                     last_res = res
 
-            if self.kv_cache_manager.log_stats:
-                assert self.kv_cache_manager.prefix_cache_stats is not None
-                self.kv_cache_manager.prefix_cache_stats.record(
-                    num_tokens=req.num_tokens,
-                    num_hits=res[1],
-                    preempted=req.num_preemptions > 0,
-                )
+            if served_from_sw_cache and self.kv_cache_manager.log_stats:
+                if self.kv_cache_manager.prefix_cache_stats is not None:
+                    self.kv_cache_manager.prefix_cache_stats.record(
+                        num_tokens=req.num_tokens,
+                        num_hits=res[1],
+                        preempted=req.num_preemptions > 0,
+                    )
             return res
 
-        # Temporarily mock the methods for this schedule pass
+        # Temporarily mock the get_computed_blocks method for this schedule pass
         self.kv_cache_manager.get_computed_blocks = get_cache_computed_blocks
         try:
             output = _original_schedule(self)
@@ -395,7 +400,7 @@ def apply_worker_patches():
     """Monkey-patch GPUModelRunner to inject beam_prefix_groups into the attention builder."""
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-        from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+        from vllm_gr.v1.attention.backends.beam_attn import BEAM_PREFIX_GROUPS_VAR
     except ImportError:
         return
 
@@ -425,15 +430,16 @@ def apply_worker_patches():
                 indices = [req_id_to_idx[r] for r in group_req_ids if r in req_id_to_idx]
                 if indices:
                     translated_groups.append((depth, indices))
-            CommonAttentionMetadata.beam_prefix_groups = translated_groups
+
+            token = BEAM_PREFIX_GROUPS_VAR.set(translated_groups)
             try:
                 return _original_build_attention_metadata(self, *args, **kwargs)
             finally:
-                CommonAttentionMetadata.beam_prefix_groups = None
+                BEAM_PREFIX_GROUPS_VAR.reset(token)
         else:
             return _original_build_attention_metadata(self, *args, **kwargs)
 
     GPUModelRunner.execute_model = patched_execute_model
     GPUModelRunner._build_attention_metadata = patched_build_attention_metadata
     GPUModelRunner._patched_for_beam_groups = True
-    logger.debug("GPUModelRunner patched for beam groups via CommonAttentionMetadata.")
+    logger.debug("GPUModelRunner patched for beam groups via ContextVar.")

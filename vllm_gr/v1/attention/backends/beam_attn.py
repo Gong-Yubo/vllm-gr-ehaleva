@@ -3,6 +3,7 @@
 """Graph Reuse Attention (Beam Attn) - Optimized attention with shared KV cache buffer separation."""
 
 import copy
+import contextvars
 from dataclasses import dataclass
 from itertools import compress
 from typing import ClassVar
@@ -61,103 +62,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
-
-
-@triton.jit
-def _compute_lcp_kernel(
-    BlockTable,  # [num_seqs, max_blocks]
-    SeqLens,  # [num_seqs]
-    LcpOut,  # [num_seqs - 1]
-    stride_bt_seq,
-    max_blocks,
-    block_size: tl.constexpr,
-    VEC_LOAD_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    # 1. Determine the maximum possible matching blocks (limit)
-    len1 = tl.load(SeqLens + pid)
-    len2 = tl.load(SeqLens + pid + 1)
-
-    blocks1 = len1 // block_size
-    blocks2 = len2 // block_size
-    limit = tl.minimum(blocks1, blocks2)
-    limit = tl.minimum(limit, max_blocks)
-
-    # 2. Setup initial block pointers (avoids recalculating inside the loop)
-    offs = tl.arange(0, VEC_LOAD_SIZE)
-    ptr1 = BlockTable + pid * stride_bt_seq + offs
-    ptr2 = BlockTable + (pid + 1) * stride_bt_seq + offs
-
-    lcp = 0
-    off = 0  # Separate loop counter to avoid 'break'
-
-    # 3. Main comparison loop
-    while off < limit:
-        remaining = limit - off
-
-        # FAST PATH: Unmasked loads when we have a full VEC_LOAD_SIZE remaining
-        if remaining >= VEC_LOAD_SIZE:
-            b1 = tl.load(ptr1)
-            b2 = tl.load(ptr2)
-        # SLOW PATH: Masked loads only at the tail boundary
-        else:
-            mask = offs < remaining
-            b1 = tl.load(ptr1, mask=mask, other=-1)
-            b2 = tl.load(ptr2, mask=mask, other=-2)
-
-        # Check for mismatches
-        neq = b1 != b2
-        mismatch_indices = tl.where(neq, offs, VEC_LOAD_SIZE)
-        first_mismatch = tl.min(mismatch_indices, axis=0)
-
-        # Always accumulate the match count
-        lcp += first_mismatch
-
-        # If a mismatch is found within this block, terminate naturally
-        if first_mismatch < VEC_LOAD_SIZE:
-            off = limit  # break
-        else:
-            # All matched, move to the next block
-            off += VEC_LOAD_SIZE
-            ptr1 += VEC_LOAD_SIZE
-            ptr2 += VEC_LOAD_SIZE
-
-    # 4. Write output
-    tl.store(LcpOut + pid, lcp)
-
-
-def _compute_lcp_triton(
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    num_seqs, max_blocks = block_table.shape
-    if num_seqs <= 1:
-        return torch.empty(0, device=block_table.device, dtype=torch.int32)
-
-    lcp_out = torch.empty(num_seqs - 1, device=block_table.device, dtype=torch.int32)
-
-    VEC_LOAD_SIZE = 256
-    grid = (num_seqs - 1,)
-
-    # Ensure memory is contiguous to maximize memory throughput
-    if not block_table.is_contiguous():
-        block_table = block_table.contiguous()
-
-    _compute_lcp_kernel[grid](
-        block_table,
-        seq_lens,
-        lcp_out,
-        block_table.stride(0),
-        max_blocks,
-        block_size=block_size,
-        VEC_LOAD_SIZE=VEC_LOAD_SIZE,
-        num_warps=4,
-    )
-
-    return lcp_out
-
+BEAM_PREFIX_GROUPS_VAR = contextvars.ContextVar("beam_prefix_groups", default=None)
 
 @register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
@@ -334,135 +239,6 @@ class BeamAttentionBackend(AttentionBackend):
 
         return None
 
-    @staticmethod
-    def prefix_partition(
-        num_reqs: int,
-        block_size: int,
-        block_table_device: torch.Tensor | None = None,
-        seq_lens: torch.Tensor | None = None,
-        threshold: int = 4,
-        min_blocks_for_sharing: int = 16,
-        device_lcp: bool = True,
-    ) -> list[tuple[int, list[int]]]:
-        """
-        Computes prefix-sharing depth between consecutive requests and groups them
-        sequentially. A new group is created whenever the prefix-sharing depth
-        changes relative to the previous request.
-
-        Returns:
-            List of tuples: (shared_prefix_depth, [request_ids])
-        """
-
-        if block_table_device is None or seq_lens is None:
-            return []
-
-        n = num_reqs
-        if n == 0:
-            return []
-        if n == 1:
-            return [(0, [0])]
-
-        lcp_adj = []
-        if device_lcp:
-            # GPU-based LCP calculation using Triton kernel
-            lcp_adj_gpu = _compute_lcp_triton(block_table_device, seq_lens, block_size)
-            # Move result to CPU
-            lcp_adj = lcp_adj_gpu.cpu().tolist()
-            # Apply min_blocks_for_sharing filter
-            lcp_adj = [val if val >= min_blocks_for_sharing else 0 for val in lcp_adj]
-        else:
-            # Move to CPU for grouping logic
-            block_table_cpu = block_table_device.cpu().numpy()
-            seq_lens_cpu = seq_lens.cpu().numpy()
-            # Build prefix block lists
-            prefixes = []
-            for i in range(n):
-                block_count = seq_lens_cpu[i] // block_size
-                if block_count > 0:
-                    prefix = tuple(block_table_cpu[i][:block_count].tolist())
-                else:
-                    prefix = tuple()
-                prefixes.append(prefix)
-
-            # Helper: compute LCP between two requests using binary search
-            def lcp(i, j, start_k=0):
-                a = prefixes[i]
-                b = prefixes[j]
-                m = min(len(a), len(b))
-                if start_k >= m:
-                    return m
-                low, high = start_k, m - 1
-                # Optimization: if the last elements match, the entire prefix matches
-                if a[high] == b[high]:
-                    return m
-                ans = start_k
-                while low <= high:
-                    mid = (low + high) // 2
-                    if a[mid] == b[mid]:
-                        ans = mid + 1
-                        low = mid + 1
-                    else:
-                        high = mid - 1
-                return ans if ans >= min_blocks_for_sharing else 0
-
-            # 2. Pre-calculate neighbor bonds
-            # lcp_adj[i] is the bond between request_ids[i] and request_ids[i+1]
-            lcp_adj = [lcp(i, i + 1) for i in range(n - 1)]
-
-        def is_positive_start(idx):
-            if idx >= n - 1:
-                return False
-            bond_now = lcp_adj[idx]
-            if bond_now == 0:
-                return False
-
-            # Stealing Rule: Only split if the next bond is STRONGER than current + threshold
-            if idx + 1 < n - 1:
-                if lcp_adj[idx + 1] > bond_now + threshold:
-                    return False
-            return True
-
-        results = []
-        i = 0
-        while i < n:
-            if is_positive_start(i):
-                initial_bond = lcp_adj[i]
-                group = [i, i + 1]
-                running_min_lcp = initial_bond
-                curr = i + 1
-
-                while curr < n - 1:
-                    next_neighbor_bond = lcp_adj[curr]
-                    # The shared prefix of the WHOLE group if we add the next item
-                    potential_min = min(running_min_lcp, next_neighbor_bond)
-
-                    # Rule: The group's shared prefix must not drop more than 'threshold'
-                    # from the bond that started the group.
-                    if (initial_bond - potential_min) <= threshold and potential_min > 0:
-                        # Check for stealing (is the NEXT bond much better?)
-                        if curr + 1 < n - 1 and lcp_adj[curr + 1] > next_neighbor_bond + threshold:
-                            break
-
-                        running_min_lcp = potential_min
-                        group.append(curr + 1)
-                        curr += 1
-                    else:
-                        break
-
-                results.append((running_min_lcp, group))
-                i = curr + 1
-            else:
-                # Zero Group Logic
-                group = [i]
-                curr = i
-                while curr < n - 1 and not is_positive_start(curr + 1):
-                    group.append(curr + 1)
-                    curr += 1
-                results.append((0, group))
-                i = curr + 1
-        return results
-
-
 @dataclass
 class BeamAttentionMetadata:
     """Metadata for Beam (Graph Reuse) Attention.
@@ -578,7 +354,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self._update_aot_schedule(fast_build)
         max_num_splits = self._get_max_num_splits(common_attn_metadata.num_actual_tokens)
 
-        beam_prefix_groups = getattr(common_attn_metadata, "beam_prefix_groups", None)
+        beam_prefix_groups = BEAM_PREFIX_GROUPS_VAR.get()
 
         if beam_prefix_groups is None:
             return self._build_standard_metadata(common_attn_metadata, max_num_splits)
@@ -923,16 +699,23 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             common_meta.seq_lens - (shift_amounts * self.block_size), min=0
         )
 
-        # Calculate suffix KV lengths on CPU (used for max length without sync)
-        suffix_kv_lens_cpu = torch.clamp(
-            common_meta._seq_lens_cpu - (shift_amounts_cpu * self.block_size), min=0
-        )
+        seq_lens_cpu = getattr(common_meta, "_seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            # Calculate suffix KV lengths on CPU (used for max length without sync)
+            suffix_kv_lens_cpu = torch.clamp(
+                seq_lens_cpu - (shift_amounts_cpu * self.block_size), min=0
+            )
+            suffix_kv_max_len = (
+                int(suffix_kv_lens_cpu.max().item()) if suffix_kv_lens_cpu.numel() > 0 else 0
+            )
+        else:
+            # Fallback to GPU tensor (will cause a host-device sync)
+            suffix_kv_max_len = (
+                int(suffix_kv_lens.max().item()) if suffix_kv_lens.numel() > 0 else 0
+            )
 
         # Max lengths
         suffix_query_max_len = common_meta.max_query_len
-        suffix_kv_max_len = (
-            int(suffix_kv_lens_cpu.max().item()) if suffix_kv_lens_cpu.numel() > 0 else 0
-        )
         max_suffix_blocks = (suffix_kv_max_len + self.block_size - 1) // self.block_size
 
         # Create Suffix Block Table by shifting
