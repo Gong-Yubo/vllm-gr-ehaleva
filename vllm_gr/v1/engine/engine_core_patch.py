@@ -48,19 +48,10 @@ def _get_lcp(a: list, b: list, hint: int = 0) -> int:
     return ans
 
 
-def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: int) -> list:
-    """Group requests by beam priority and find the common prefix depth.
-    This function groups all requests of the same beam priority into a single group,
-    calculating the longest common prefix (LCP) shared by all requests in the group.
-    """
+def _compute_beam_prefix_groups(req_ids: list[str], requests: dict) -> list:
+    """Group requests by beam priority and return shared prefix length in tokens."""
     if not req_ids:
         return []
-
-    # The min_group_th defines the minimum number of common blocks required
-    # to justify the overhead of a shared prefix group.
-    # 256 tokens (approx 16 blocks of size 16) is a heuristic for
-    # when the compute savings outweigh the kernel launch overhead.
-    min_group_th = 256 // block_size
 
     # Group requests by beam group id (priority)
     beam_groups: dict[int, list[str]] = {}
@@ -73,28 +64,15 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
     all_groups = []
     for g, group_req_ids in beam_groups.items():
         n = len(group_req_ids)
-        if n == 0:
+        if n <= 1:
+            if n == 1:
+                all_groups.append((0, [group_req_ids[0]]))
             continue
-        if n == 1:
-            all_groups.append((0, [group_req_ids[0]]))
-            continue
 
-        # Calculate minimum Longest Common Prefix (LCP) across all adjacent requests in the group
-        min_lcp = float("inf")
-        last_lcp = 0
-        for i in range(n - 1):
-            req1 = requests[group_req_ids[i]]
-            req2 = requests[group_req_ids[i + 1]]
-
-            common_len = _get_lcp(req1.block_hashes, req2.block_hashes, hint=last_lcp)
-
-            min_lcp = common_len if common_len < min_lcp else min_lcp
-            last_lcp = common_len
-
-            if min_lcp < min_group_th:
-                min_lcp = 0
-                break
-        all_groups.append((min_lcp, group_req_ids))
+        # PBSC: We assume that the last 2 tokens are not shared and all others are shared
+        req = requests[group_req_ids[0]]
+        t_prefix = max(0, req.num_tokens - 2)
+        all_groups.append((t_prefix, group_req_ids))
 
     return all_groups
 
@@ -386,9 +364,64 @@ def apply_scheduler_patch():
 
         req_ids = list(output.num_scheduled_tokens.keys())
         if req_ids:
-            output.beam_prefix_groups = _compute_beam_prefix_groups(
-                req_ids, self.requests, self.cache_config.block_size
-            )
+            beam_groups = _compute_beam_prefix_groups(req_ids, self.requests)
+            output.beam_prefix_groups = beam_groups
+            
+            # PBSC Tensor Shaping: Modify num_scheduled_tokens to ensure 
+            # Leader computes the tail and Children only compute new tokens
+            new_num_scheduled_tokens = {}
+            for t_prefix, group_req_ids in beam_groups:
+                if len(group_req_ids) == 1:
+                    new_num_scheduled_tokens[group_req_ids[0]] = output.num_scheduled_tokens[group_req_ids[0]]
+                    continue
+
+                leader_id = group_req_ids[0]
+                req = self.requests[leader_id]
+                
+                t_block_aligned = (t_prefix // block_size) * block_size
+                
+                # Leader computes everything after the block-aligned prefix
+                leader_compute_len = req.num_tokens - t_block_aligned
+                new_num_scheduled_tokens[leader_id] = leader_compute_len
+                
+                # Children compute everything after the token-aligned prefix (tail is broadcasted)
+                child_compute_len = req.num_tokens - t_prefix
+                for child_id in group_req_ids[1:]:
+                    new_num_scheduled_tokens[child_id] = child_compute_len
+
+            # Rebuild dictionary to keep Leader first, then Children (for contiguous 1D tensor shape)
+            ordered_num_scheduled = {}
+            for _, group_req_ids in beam_groups:
+                for req_id in group_req_ids:
+                    if req_id in new_num_scheduled_tokens:
+                        ordered_num_scheduled[req_id] = new_num_scheduled_tokens[req_id]
+            
+            # Add any requests that were not in groups (just in case)
+            for req_id, num in output.num_scheduled_tokens.items():
+                if req_id not in ordered_num_scheduled:
+                    ordered_num_scheduled[req_id] = num
+                    
+            output.num_scheduled_tokens = ordered_num_scheduled
+            output.total_num_scheduled_tokens = sum(ordered_num_scheduled.values())
+
+            # PBSC: Update num_computed_tokens for children so GPUModelRunner
+            # generates correct Position IDs and slot mappings.
+            child_prefix_map = {}
+            for t_prefix, group_req_ids in beam_groups:
+                if len(group_req_ids) > 1:
+                    for child_id in group_req_ids[1:]:
+                        child_prefix_map[child_id] = t_prefix
+
+            for req_data in output.scheduled_new_reqs:
+                if req_data.req_id in child_prefix_map:
+                    req_data.num_computed_tokens = child_prefix_map[req_data.req_id]
+                    
+            if hasattr(output, "scheduled_cached_reqs"):
+                req_data = output.scheduled_cached_reqs
+                for i, req_id in enumerate(req_data.req_ids):
+                    if req_id in child_prefix_map:
+                        req_data.num_computed_tokens[i] = child_prefix_map[req_id]
+
         return output
 
     Scheduler.schedule = patched_schedule

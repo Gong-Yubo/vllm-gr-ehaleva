@@ -281,6 +281,10 @@ class BeamAttentionMetadata:
     group_first_reqs: torch.Tensor | None = None
     suffix_col_indices: torch.Tensor | None = None
 
+    # PBSC KV Broadcast metadata
+    pbsc_src_slots: torch.Tensor | None = None
+    pbsc_dst_slots: torch.Tensor | None = None
+
     causal: bool = True
     use_cascade_attention: bool = True
 
@@ -558,6 +562,41 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        # Compute PBSC Broadcast Slots
+        src_slots_list = []
+        dst_slots_list = []
+
+        for t_shared, req_indices in shared_groups:
+            t_block_aligned = (t_shared // self.block_size) * self.block_size
+            tail_len = t_shared - t_block_aligned
+            if tail_len == 0 or len(req_indices) <= 1:
+                continue
+
+            leader_idx = req_indices[0]
+            
+            # Generate token indices for the tail
+            tail_indices = torch.arange(t_block_aligned, t_shared, device=self.device)
+            block_indices = tail_indices // self.block_size
+            block_offsets = tail_indices % self.block_size
+
+            # Leader's physical slots for the tail
+            leader_blocks = common_meta.block_table_tensor[leader_idx, block_indices]
+            leader_slots = leader_blocks * self.block_size + block_offsets
+
+            for child_idx in req_indices[1:]:
+                child_blocks = common_meta.block_table_tensor[child_idx, block_indices]
+                child_slots = child_blocks * self.block_size + block_offsets
+                
+                src_slots_list.append(leader_slots)
+                dst_slots_list.append(child_slots)
+                
+        if src_slots_list:
+            pbsc_src_slots = torch.cat(src_slots_list)
+            pbsc_dst_slots = torch.cat(dst_slots_list)
+        else:
+            pbsc_src_slots = None
+            pbsc_dst_slots = None
+
         return BeamAttentionMetadata(
             num_actual_tokens=common_meta.num_actual_tokens,
             max_query_len=common_meta.max_query_len,
@@ -582,6 +621,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_indices_is_identity=prefix_indices_is_identity,
             group_first_reqs=group_first_reqs,
             suffix_col_indices=suffix_col_indices,
+            pbsc_src_slots=pbsc_src_slots,
+            pbsc_dst_slots=pbsc_dst_slots,
             causal=common_meta.causal,
             use_cascade_attention=True,
             max_num_splits=max_num_splits,
@@ -589,10 +630,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
     def _create_prefix_metadata(self, common_meta: CommonAttentionMetadata, shared_groups: list):
         """Constructs metadata for the shared prefix pass."""
-        group_depths, group_req_ids_list = zip(*shared_groups) if shared_groups else ([], [])
+        group_prefix_tokens, group_req_ids_list = zip(*shared_groups) if shared_groups else ([], [])
 
-        # Calculate lengths
-        group_depths_tensor = torch.tensor(group_depths, dtype=torch.int32)
+        # Convert token depths to block depths for cascade attention prefix
+        group_prefix_tokens_tensor = torch.tensor(group_prefix_tokens, dtype=torch.int32)
+        group_depths_tensor = group_prefix_tokens_tensor // self.block_size
+        
         prefix_kv_lens_cpu = group_depths_tensor * self.block_size
         prefix_kv_max_len = (
             int(prefix_kv_lens_cpu.max().item()) if prefix_kv_lens_cpu.numel() > 0 else 0
@@ -1086,6 +1129,19 @@ class BeamAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+            
+            # -------------------------------------------------------------
+            # PBSC KV Hook: Broadcast Leader's Tail Tokens to Children
+            # -------------------------------------------------------------
+            if getattr(attn_metadata, "pbsc_src_slots", None) is not None:
+                src_slots = attn_metadata.pbsc_src_slots
+                dst_slots = attn_metadata.pbsc_dst_slots
+                
+                k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
+                v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
+                
+                k_flat[dst_slots] = k_flat[src_slots]
+                v_flat[dst_slots] = v_flat[src_slots]
 
         # Handle FP8 quantization if needed
         if self.kv_cache_dtype.startswith("fp8"):
