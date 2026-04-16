@@ -10,6 +10,7 @@ from vllm.beam_search import BeamSearchSequence
 from vllm.entrypoints.openai.protocol import VLLMValidationError
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
+from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MultiModalDataDict
@@ -19,6 +20,21 @@ from vllm.utils import random_uuid
 
 from vllm_gr.v1.engine.types import BeamForkRequest
 from vllm_gr.v1.metrics.stats import RequestStateStats
+
+logger = init_logger(__name__)
+
+_dp_rank_counter = 0
+_dp_rank_lock = asyncio.Lock()
+
+
+# return rank for next beam search request in a round-robin manner across the data parallel ranks
+async def _next_data_parallel_rank(data_parallel_size: int) -> int:
+    global _dp_rank_counter
+
+    async with _dp_rank_lock:
+        rank = _dp_rank_counter % data_parallel_size
+        _dp_rank_counter += 1
+        return rank
 
 
 async def _collect_beam_result(q):
@@ -46,6 +62,7 @@ async def _beam_fork_step(
     lora_request,
     trace_headers,
     priority=0,
+    data_parallel_rank: int | None = None,
 ):
     """BEAM_FORK path: fork parent beams into children (steps 1+).
 
@@ -71,6 +88,7 @@ async def _beam_fork_step(
             lora_request=lora_request,
             trace_headers=trace_headers,
             priority=priority,
+            data_parallel_rank=data_parallel_rank,
         )
         queues.append(q)
 
@@ -87,6 +105,8 @@ async def _beam_fork_step(
             eos_token_id=eos_token_id,
             lora_request=lora_request,
             trace_headers=trace_headers,
+            data_parallel_rank=data_parallel_rank,
+            priority=priority,
         )
     )
 
@@ -103,6 +123,7 @@ async def _add_batch_step(
     use_beam_fork,
     trace_headers,
     priority=0,
+    data_parallel_rank: int | None = None,
 ):
     """ADD_BATCH path: prepare and batch-send requests (step 0).
 
@@ -119,6 +140,7 @@ async def _add_batch_step(
             lora_request=lora_req,
             trace_headers=trace_headers,
             priority=priority,
+            data_parallel_rank=data_parallel_rank,
         )
         queues.append(q)
         engine_core_requests.append(ec_req)
@@ -151,6 +173,18 @@ async def beam_search(
     # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
     MICROSECONDS = 1000000
     priority = int(time.perf_counter() * MICROSECONDS)  # us granularity
+    rank = None
+    if (
+        hasattr(self.engine_client, "vllm_config")
+        and self.engine_client.vllm_config.parallel_config is not None
+    ):
+        data_parallel_size = self.engine_client.vllm_config.parallel_config.data_parallel_size
+        if data_parallel_size is not None and data_parallel_size > 1:
+            # In DP mode, we assign ranks to beam search requests in a round-robin manner.
+            rank = await _next_data_parallel_rank(data_parallel_size)
+            logger.debug(
+                f"rank for beam search: {rank} out of data_parallel_size: {data_parallel_size}"
+            )
 
     include_stop_str_in_output = params.include_stop_str_in_output
     if beam_width == 0:
@@ -313,6 +347,7 @@ async def beam_search(
                 lora_request,
                 trace_headers,
                 priority=priority,
+                data_parallel_rank=rank,
             )
         elif use_batch:
             output, new_ids = await _add_batch_step(
@@ -324,6 +359,7 @@ async def beam_search(
                 use_beam_fork,
                 trace_headers,
                 priority=priority,
+                data_parallel_rank=rank,
             )
             if new_ids:
                 prev_beam_internal_ids = new_ids
@@ -451,6 +487,7 @@ async def beam_search(
                 token_ids=[],
                 abort_ids=prev_beam_internal_ids,
                 sampling_params=beam_search_params,
+                data_parallel_rank=rank,
             )
         )
 

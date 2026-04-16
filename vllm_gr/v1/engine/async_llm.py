@@ -139,6 +139,7 @@ def register_beam_output_fn(
     lora_request=None,
     trace_headers=None,
     priority=0,
+    data_parallel_rank: int | None = None,
 ):
     """Register output queue for a beam fork child (no ZMQ send).
 
@@ -157,7 +158,7 @@ def register_beam_output_fn(
         arrival_time=time.time(),
         lora_request=lora_request,
         cache_salt=None,
-        data_parallel_rank=None,
+        data_parallel_rank=data_parallel_rank,
         trace_headers=trace_headers,
         priority=priority,
     )

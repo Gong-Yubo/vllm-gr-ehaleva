@@ -874,6 +874,7 @@ def _make_serving_self(
     input_proc.tokenizer = tokenizer
 
     engine_client = MagicMock()
+    engine_client.vllm_config = SimpleNamespace(parallel_config=None)
     if not has_prepare_request:
         del engine_client.prepare_request
     if not has_beam_fork:
@@ -882,6 +883,7 @@ def _make_serving_self(
     mock_self = MagicMock()
     mock_self.input_processor = input_proc
     mock_self.engine_client = engine_client
+    mock_self.models = SimpleNamespace(catalog=None)
     return mock_self
 
 
@@ -991,7 +993,7 @@ class TestBeamSearchOrchestration:
         mock_output = MagicMock()
         mock_output.finished = True
         mock_output.outputs = [MagicMock(finish_reason="length", logprobs=None)]
-        mock_queue.get_nowait.return_value = mock_output
+        mock_queue.get = AsyncMock(return_value=mock_output)
 
         prompt = {"prompt_token_ids": [10, 20]}
         params = _make_beam_search_params(beam_width=1, max_tokens=1)
@@ -1038,7 +1040,7 @@ class TestBeamSearchOrchestration:
                 logprobs=[{50: Logprob(logprob=-0.5)}],
             )
         ]
-        mock_queue.get_nowait.return_value = step0_output
+        mock_queue.get = AsyncMock(return_value=step0_output)
 
         # Step 1: beam_fork path.
         fork_queue = MagicMock()
@@ -1048,7 +1050,7 @@ class TestBeamSearchOrchestration:
         step1_output = MagicMock()
         step1_output.finished = True
         step1_output.outputs = [MagicMock(finish_reason="length", logprobs=None)]
-        fork_queue.get_nowait.return_value = step1_output
+        fork_queue.get = AsyncMock(return_value=step1_output)
 
         prompt = {"prompt_token_ids": [10, 20]}
         params = _make_beam_search_params(beam_width=1, max_tokens=2)
@@ -1058,10 +1060,9 @@ class TestBeamSearchOrchestration:
         except Exception:
             pass
 
-        # After step 0, step 1 should call register_beam_output and beam_fork.
-        # (Only if fork_info was set, which requires minheap to work.)
-        # If minheap fails, beam_fork won't be called. So we check step 0 worked.
         ec.prepare_request.assert_called()
+        ec.register_beam_output.assert_called()
+        ec.beam_fork.assert_awaited()
 
     # 5.10
     def test_beam_fork_abort_ids(self) -> None:
