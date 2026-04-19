@@ -48,31 +48,51 @@ def _get_lcp(a: list, b: list, hint: int = 0) -> int:
     return ans
 
 
-def _compute_beam_prefix_groups(req_ids: list[str], requests: dict) -> list:
-    """Group requests by beam priority and return shared prefix length in tokens."""
+def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: int) -> list:
+    """Group requests by beam priority and find the common prefix length in tokens."""
     if not req_ids:
         return []
 
     # Group requests by beam group id (priority)
     beam_groups: dict[int, list[str]] = {}
     for req_id in req_ids:
-        g = requests[req_id].priority
-        if g not in beam_groups:
-            beam_groups[g] = []
-        beam_groups[g].append(req_id)
+        priority = requests[req_id].priority
+        if priority not in beam_groups:
+            beam_groups[priority] = []
+        beam_groups[priority].append(req_id)
 
     all_groups = []
-    for g, group_req_ids in beam_groups.items():
-        n = len(group_req_ids)
-        if n <= 1:
-            if n == 1:
-                all_groups.append((0, [group_req_ids[0]]))
+    for _, group_req_ids in beam_groups.items():
+        if len(group_req_ids) <= 1:
+            if group_req_ids:
+                all_groups.append((0, group_req_ids))
             continue
 
-        # PBSC: We assume that the last 2 tokens are not shared and all others are shared
-        req = requests[group_req_ids[0]]
-        t_prefix = max(0, req.num_tokens - 2)
-        all_groups.append((t_prefix, group_req_ids))
+        # Find the longest common prefix (LCP) for the group.
+        first_req = requests[group_req_ids[0]]
+        lcp_tokens = first_req.num_tokens
+
+        for i in range(1, len(group_req_ids)):
+            other_req = requests[group_req_ids[i]]
+
+            # Use block hashes for a fast block-aligned LCP
+            num_common_blocks = _get_lcp(first_req.block_hashes, other_req.block_hashes)
+
+            # Refine to token-level LCP by checking inside the first differing block
+            pairwise_lcp = num_common_blocks * block_size
+            limit = min(lcp_tokens, other_req.num_tokens)
+
+            first_tokens = first_req._all_token_ids
+            other_tokens = other_req._all_token_ids
+
+            while pairwise_lcp < limit and first_tokens[pairwise_lcp] == other_tokens[pairwise_lcp]:
+                pairwise_lcp += 1
+
+            lcp_tokens = min(lcp_tokens, pairwise_lcp)
+            if lcp_tokens == 0:
+                break
+
+        all_groups.append((lcp_tokens, group_req_ids))
 
     return all_groups
 
@@ -364,7 +384,9 @@ def apply_scheduler_patch():
 
         req_ids = list(output.num_scheduled_tokens.keys())
         if req_ids:
-            beam_groups = _compute_beam_prefix_groups(req_ids, self.requests)
+            beam_groups = _compute_beam_prefix_groups(
+                req_ids, self.requests, self.cache_config.block_size
+            )
             output.beam_prefix_groups = beam_groups
             
             # PBSC Tensor Shaping: Modify num_scheduled_tokens to ensure 
