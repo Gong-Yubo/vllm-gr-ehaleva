@@ -387,29 +387,98 @@ def apply_scheduler_patch():
             beam_groups = _compute_beam_prefix_groups(
                 req_ids, self.requests, self.cache_config.block_size
             )
-            output.beam_prefix_groups = beam_groups
             
             # PBSC Tensor Shaping: Modify num_scheduled_tokens to ensure 
             # Leader computes the tail and Children only compute new tokens
+            new_beam_groups = []
             new_num_scheduled_tokens = {}
+            
+            # PBSC Statistics
+            pbsc_stats_groups_total = 0
+            pbsc_stats_groups_active = 0
+            pbsc_stats_children_total = 0
+            pbsc_stats_children_valid = 0
+            pbsc_stats_tokens_saved = 0
+
             for t_prefix, group_req_ids in beam_groups:
-                if len(group_req_ids) == 1:
-                    new_num_scheduled_tokens[group_req_ids[0]] = output.num_scheduled_tokens[group_req_ids[0]]
+                if len(group_req_ids) <= 1:
                     continue
 
+                pbsc_stats_groups_total += 1
+                pbsc_stats_children_total += len(group_req_ids) - 1
+
                 leader_id = group_req_ids[0]
-                req = self.requests[leader_id]
+                leader_req = self.requests[leader_id]
                 
+                t_cache_hit = leader_req.num_tokens - output.num_scheduled_tokens[leader_id]
+                
+                # If the shared prefix is already entirely in the KV cache,
+                # there is no shared tail to compute in this step (normal decode).
+                if t_cache_hit >= t_prefix:
+                    continue
+
+                # PBSC requires children to have the exact same prefix cached as the leader.
+                # If a child has a cache miss (e.g. from preemption), it must recompute 
+                # those missing blocks on its own, because the leader won't broadcast them.
+                valid_children = []
+                for child_id in group_req_ids[1:]:
+                    child_req = self.requests[child_id]
+                    child_cache_hit = child_req.num_tokens - output.num_scheduled_tokens[child_id]
+                    if child_cache_hit == t_cache_hit:
+                        valid_children.append(child_id)
+                
+                if not valid_children:
+                    continue
+                
+                group_req_ids = [leader_id] + valid_children
+
                 t_block_aligned = (t_prefix // block_size) * block_size
+
+                # If the cache hit missed full blocks we thought were shared,
+                # restrict the sharing to what is actually cached.
+                if t_block_aligned > t_cache_hit:
+                    t_prefix = min(t_prefix, t_cache_hit)
+                    
+                if t_prefix == 0:
+                    continue
+
+                # PBSC Safety Check: Active tail sharing is only for highly overlapping beams.
+                # If the unshared part is large, these are likely unrelated requests.
+                child_compute_len_estimate = leader_req.num_tokens - t_prefix
+                if child_compute_len_estimate > block_size:
+                    continue
+
+                new_beam_groups.append((t_prefix, group_req_ids))
                 
-                # Leader computes everything after the block-aligned prefix
-                leader_compute_len = req.num_tokens - t_block_aligned
+                # Leader computes its scheduled tokens (from t_cache_hit to num_tokens)
+                leader_compute_len = leader_req.num_tokens - t_cache_hit
                 new_num_scheduled_tokens[leader_id] = leader_compute_len
                 
                 # Children compute everything after the token-aligned prefix (tail is broadcasted)
-                child_compute_len = req.num_tokens - t_prefix
-                for child_id in group_req_ids[1:]:
+                for child_id in valid_children:
+                    child_req = self.requests[child_id]
+                    child_compute_len = child_req.num_tokens - t_prefix
                     new_num_scheduled_tokens[child_id] = child_compute_len
+                    
+                    # A child normally computes from its cache hit to its total length.
+                    # With PBSC, it only computes from t_prefix to its total length.
+                    normal_child_compute = child_req.num_tokens - t_cache_hit
+                    pbsc_stats_tokens_saved += max(0, normal_child_compute - child_compute_len)
+                    
+                pbsc_stats_groups_active += 1
+                pbsc_stats_children_valid += len(valid_children)
+
+            if pbsc_stats_groups_total > 0:
+                logger.info(
+                    "[PBSC Stats] Groups Active: %d / %d | Valid Children: %d / %d (%.1f%%) | Tokens Compute Saved: %d",
+                    pbsc_stats_groups_active, pbsc_stats_groups_total,
+                    pbsc_stats_children_valid, pbsc_stats_children_total,
+                    (pbsc_stats_children_valid / pbsc_stats_children_total * 100) if pbsc_stats_children_total > 0 else 0,
+                    pbsc_stats_tokens_saved
+                )
+
+            beam_groups = new_beam_groups
+            output.beam_prefix_groups = beam_groups
 
             # Rebuild dictionary to keep Leader first, then Children (for contiguous 1D tensor shape)
             ordered_num_scheduled = {}
