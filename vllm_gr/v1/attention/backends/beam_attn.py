@@ -63,6 +63,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 BEAM_PREFIX_GROUPS_VAR = contextvars.ContextVar("beam_prefix_groups", default=None)
+PBSC_SHAPED_GROUPS_VAR = contextvars.ContextVar("pbsc_shaped_groups", default=None)
 
 @register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
@@ -566,29 +567,31 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         src_slots_list = []
         dst_slots_list = []
 
-        for t_shared, req_indices in shared_groups:
-            t_block_aligned = (t_shared // self.block_size) * self.block_size
-            tail_len = t_shared - t_block_aligned
-            if tail_len == 0 or len(req_indices) <= 1:
-                continue
+        pbsc_groups = PBSC_SHAPED_GROUPS_VAR.get()
+        if pbsc_groups is not None:
+            for t_shared, req_indices in pbsc_groups:
+                t_block_aligned = (t_shared // self.block_size) * self.block_size
+                tail_len = t_shared - t_block_aligned
+                if tail_len == 0 or len(req_indices) <= 1:
+                    continue
 
-            leader_idx = req_indices[0]
-            
-            # Generate token indices for the tail
-            tail_indices = torch.arange(t_block_aligned, t_shared, device=self.device)
-            block_indices = tail_indices // self.block_size
-            block_offsets = tail_indices % self.block_size
-
-            # Leader's physical slots for the tail
-            leader_blocks = common_meta.block_table_tensor[leader_idx, block_indices]
-            leader_slots = leader_blocks * self.block_size + block_offsets
-
-            for child_idx in req_indices[1:]:
-                child_blocks = common_meta.block_table_tensor[child_idx, block_indices]
-                child_slots = child_blocks * self.block_size + block_offsets
+                leader_idx = req_indices[0]
                 
-                src_slots_list.append(leader_slots)
-                dst_slots_list.append(child_slots)
+                # Generate token indices for the tail
+                tail_indices = torch.arange(t_block_aligned, t_shared, device=self.device)
+                block_indices = tail_indices // self.block_size
+                block_offsets = tail_indices % self.block_size
+
+                # Leader's physical slots for the tail
+                leader_blocks = common_meta.block_table_tensor[leader_idx, block_indices]
+                leader_slots = leader_blocks * self.block_size + block_offsets
+
+                for child_idx in req_indices[1:]:
+                    child_blocks = common_meta.block_table_tensor[child_idx, block_indices]
+                    child_slots = child_blocks * self.block_size + block_offsets
+                    
+                    src_slots_list.append(leader_slots)
+                    dst_slots_list.append(child_slots)
                 
         if src_slots_list:
             pbsc_src_slots = torch.cat(src_slots_list)
