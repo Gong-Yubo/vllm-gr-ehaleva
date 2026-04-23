@@ -417,7 +417,7 @@ def apply_scheduler_patch():
                     # it doesn't need PBSC tail sharing.
                     if cache_hit >= orig_t_prefix:
                         drop_fully_cached += 1
-                        logger.info("[PBSC info] Subgroup skipped: tokens=%d, schedule=%d cache_hit=%d, orig_t_prefix=%d)", req.num_tokens, output.num_scheduled_tokens[req_id], cache_hit, orig_t_prefix)
+                        logger.debug("[PBSC debug] Subgroup skipped: tokens=%d, schedule=%d cache_hit=%d, orig_t_prefix=%d)", req.num_tokens, output.num_scheduled_tokens[req_id], cache_hit, orig_t_prefix)
                         continue
                         
                     if cache_hit not in cache_hit_groups:
@@ -440,7 +440,7 @@ def apply_scheduler_patch():
                         
                     if t_prefix == 0:
                         drop_no_prefix += len(valid_children)
-                        logger.info("[PBSC info] Subgroup skipped: t_prefix became 0 (orig_t_prefix=%d, t_cache_hit=%d)", orig_t_prefix, t_cache_hit)
+                        logger.debug("[PBSC debug] Subgroup skipped: t_prefix became 0 (orig_t_prefix=%d, t_cache_hit=%d)", orig_t_prefix, t_cache_hit)
                         continue
 
                     # PBSC Safety Check: Active tail sharing is only for highly overlapping beams.
@@ -448,7 +448,7 @@ def apply_scheduler_patch():
                     child_compute_len_estimate = leader_req.num_tokens - t_prefix
                     if child_compute_len_estimate > block_size:
                         drop_tail_too_long += len(valid_children)
-                        logger.info("[PBSC info] Subgroup skipped: tail too long (unshared=%d > block_size=%d)", child_compute_len_estimate, block_size)
+                        logger.debug("[PBSC debug] Subgroup skipped: tail too long (unshared=%d > block_size=%d)", child_compute_len_estimate, block_size)
                         continue
 
                     pbsc_shaped_groups.append((t_prefix, sub_group_req_ids))
@@ -474,7 +474,7 @@ def apply_scheduler_patch():
                     pbsc_stats_children_valid += len(valid_children)
 
             if pbsc_stats_groups_total > 0:
-                logger.info(
+                logger.debug(
                     "[PBSC Stats] Groups Active: %d / %d | Valid Children: %d / %d (%.1f%%) | Tokens Compute Saved: %d | Drops (Cached: %d, NoPrefix: %d, TailTooLong: %d)",
                     pbsc_stats_groups_active, pbsc_stats_groups_total,
                     pbsc_stats_children_valid, pbsc_stats_children_total,
