@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
+import os
+import torch 
 
 logger = init_logger(__name__)
 
@@ -71,12 +73,14 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
         # Find the longest common prefix (LCP) for the group.
         first_req = requests[group_req_ids[0]]
         lcp_tokens = first_req.num_tokens
-
+        prev_num_common_blocks = 0
         for i in range(1, len(group_req_ids)):
             other_req = requests[group_req_ids[i]]
 
             # Use block hashes for a fast block-aligned LCP
-            num_common_blocks = _get_lcp(first_req.block_hashes, other_req.block_hashes)
+            num_common_blocks = _get_lcp(first_req.block_hashes, other_req.block_hashes, hint=prev_num_common_blocks)
+            prev_num_common_blocks = num_common_blocks
+
 
             # Refine to token-level LCP by checking inside the first differing block
             pairwise_lcp = num_common_blocks * block_size
@@ -85,8 +89,13 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
             first_tokens = first_req._all_token_ids
             other_tokens = other_req._all_token_ids
 
-            while pairwise_lcp < limit and first_tokens[pairwise_lcp] == other_tokens[pairwise_lcp]:
-                pairwise_lcp += 1
+            # while limit > pairwise_lcp and first_tokens[limit - 1] != other_tokens[limit - 1]:
+            #     limit -= 1
+            # pairwise_lcp = limit
+
+            while limit > pairwise_lcp and first_tokens[limit - 1] != other_tokens[limit - 1]:
+                limit -= 1
+            pairwise_lcp = limit
 
             lcp_tokens = min(lcp_tokens, pairwise_lcp)
             if lcp_tokens == 0:
@@ -377,17 +386,24 @@ def apply_scheduler_patch():
         # Temporarily mock the get_computed_blocks method for this schedule pass
         self.kv_cache_manager.get_computed_blocks = get_cache_computed_blocks
         try:
+            torch.cuda.nvtx.range_push("Scheduler.schedule")
             output = _original_schedule(self)
+            torch.cuda.nvtx.range_pop()
         finally:
             # Restore the original methods immediately after
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
 
         req_ids = list(output.num_scheduled_tokens.keys())
         if req_ids:
+            torch.cuda.nvtx.range_push("_compute_beam_prefix_groups")
             beam_groups = _compute_beam_prefix_groups(
                 req_ids, self.requests, self.cache_config.block_size
             )
-            
+            torch.cuda.nvtx.range_pop()
+
+
+            torch.cuda.nvtx.range_push("PBSC")
+
             new_num_scheduled_tokens = {}
             
             # PBSC Statistics
@@ -404,7 +420,12 @@ def apply_scheduler_patch():
 
            
             pbsc_shaped_groups = []
+            
+            enable_pbsc = os.environ.get("VLLM_GR_ENABLE_PBSC", "1") == "1"
+            
             for orig_t_prefix, group_req_ids in beam_groups:
+                if not enable_pbsc:
+                    break
                 if len(group_req_ids) <= 1:
                     continue
                 t_block_aligned = (orig_t_prefix // block_size) * block_size
@@ -518,7 +539,8 @@ def apply_scheduler_patch():
                 for i, req_id in enumerate(req_data.req_ids):
                     if req_id in child_prefix_map:
                         req_data.num_computed_tokens[i] = child_prefix_map[req_id]
-
+        
+            torch.cuda.nvtx.range_pop()
         return output
 
     Scheduler.schedule = patched_schedule
@@ -556,8 +578,10 @@ def apply_worker_patches():
         beam_groups_str = getattr(self, "_current_beam_prefix_groups_str", None)
         pbsc_groups_str = getattr(self, "_current_pbsc_shaped_groups_str", None)
         
+
         tokens_to_reset = []
         if beam_groups_str is not None or pbsc_groups_str is not None:
+            torch.cuda.nvtx.range_push("patched_build_attention_metadata")
             req_id_to_idx = {
                 r_id: i for i, r_id in enumerate(self.input_batch.req_ids) if r_id is not None
             }
@@ -570,7 +594,7 @@ def apply_worker_patches():
                 translated_pbsc = [(d, [req_id_to_idx[r] for r in g if r in req_id_to_idx]) for d, g in pbsc_groups_str]
                 translated_pbsc = [(d, g) for d, g in translated_pbsc if g]
                 tokens_to_reset.append((PBSC_SHAPED_GROUPS_VAR, PBSC_SHAPED_GROUPS_VAR.set(translated_pbsc)))
-
+            torch.cuda.nvtx.range_pop()
             try:
                 return _original_build_attention_metadata(self, *args, **kwargs)
             finally:

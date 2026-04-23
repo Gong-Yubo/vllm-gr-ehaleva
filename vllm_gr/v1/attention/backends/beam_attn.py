@@ -355,6 +355,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         Inherits cascade_attention parameters and adds Beam-specific optimizations.
         """
+        torch.cuda.nvtx.range_push("BeamAttentionMetadataBuilder.build")
         # 1. Setup AOT Schedule and Cuda Graph parameters
         self._update_aot_schedule(fast_build)
         max_num_splits = self._get_max_num_splits(common_attn_metadata.num_actual_tokens)
@@ -362,7 +363,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         beam_prefix_groups = BEAM_PREFIX_GROUPS_VAR.get()
 
         if beam_prefix_groups is None:
-            return self._build_standard_metadata(common_attn_metadata, max_num_splits)
+            meta = self._build_standard_metadata(common_attn_metadata, max_num_splits)
+            torch.cuda.nvtx.range_pop()
+            return meta
 
         common_prefix_groups = beam_prefix_groups
         # 3. Filter groups that have actual shared blocks
@@ -376,9 +379,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         # 5. Build Metadata (Shared vs Standard)
         if not shared_groups:
-            return self._build_standard_metadata(common_attn_metadata, max_num_splits)
+            meta = self._build_standard_metadata(common_attn_metadata, max_num_splits)
+            torch.cuda.nvtx.range_pop()
+            return meta
 
-        return self._build_shared_metadata(common_attn_metadata, shared_groups, max_num_splits)
+        meta = self._build_shared_metadata(common_attn_metadata, shared_groups, max_num_splits)
+        torch.cuda.nvtx.range_pop()
+        return meta
 
     def _update_aot_schedule(self, fast_build: bool):
         """Updates AOT schedule flags and sliding window configs."""
@@ -512,6 +519,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
     ) -> BeamAttentionMetadata:
         """Builds metadata for split attention (shared prefix + suffix)."""
 
+        torch.cuda.nvtx.range_push("_create_prefix_metadata")
         # 1. Prepare Prefix Metadata
         (
             prefix_block_table,
@@ -525,7 +533,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_indices_is_identity,
             group_first_reqs,
         ) = self._create_prefix_metadata(common_meta, shared_groups)
-
+        torch.cuda.nvtx.range_pop()
+        
+        torch.cuda.nvtx.range_push("_create_suffix_metadata")
         # 2. Prepare Suffix Metadata
         (
             suffix_block_table,
@@ -534,6 +544,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_kv_max_len,
             suffix_col_indices,
         ) = self._create_suffix_metadata(common_meta, shift_amounts, shift_amounts_cpu)
+        torch.cuda.nvtx.range_pop()
+        
 
         # 3. Create Schedulers
         prefix_scheduler_metadata = self._get_schedule(
@@ -563,6 +575,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        torch.cuda.nvtx.range_push("_create_pbsc_metadata")
         # Compute PBSC Broadcast Slots
         src_slots_list = []
         dst_slots_list = []
@@ -572,11 +585,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             for t_shared, req_indices in pbsc_groups:
                 t_block_aligned = (t_shared // self.block_size) * self.block_size
                 tail_len = t_shared - t_block_aligned
-                if tail_len == 0 or len(req_indices) <= 1:
+                num_children = len(req_indices) - 1
+                if tail_len == 0 or num_children == 0:
                     continue
 
                 leader_idx = req_indices[0]
-                
+
                 # Generate token indices for the tail
                 tail_indices = torch.arange(t_block_aligned, t_shared, device=self.device)
                 block_indices = tail_indices // self.block_size
@@ -586,19 +600,21 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 leader_blocks = common_meta.block_table_tensor[leader_idx, block_indices]
                 leader_slots = leader_blocks * self.block_size + block_offsets
 
-                for child_idx in req_indices[1:]:
-                    child_blocks = common_meta.block_table_tensor[child_idx, block_indices]
-                    child_slots = child_blocks * self.block_size + block_offsets
-                    
-                    src_slots_list.append(leader_slots)
-                    dst_slots_list.append(child_slots)
-                
+                # Vectorized computation for all children in the group
+                child_indices = req_indices[1:]
+                child_blocks_all = common_meta.block_table_tensor[child_indices, :][:, block_indices]
+                child_slots_all = child_blocks_all * self.block_size + block_offsets.unsqueeze(0)
+
+                src_slots_list.append(leader_slots.expand(num_children, -1).flatten())
+                dst_slots_list.append(child_slots_all.flatten())
+
         if src_slots_list:
             pbsc_src_slots = torch.cat(src_slots_list)
             pbsc_dst_slots = torch.cat(dst_slots_list)
         else:
             pbsc_src_slots = None
             pbsc_dst_slots = None
+        torch.cuda.nvtx.range_pop()
 
         return BeamAttentionMetadata(
             num_actual_tokens=common_meta.num_actual_tokens,
@@ -658,7 +674,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         starts_cpu = common_meta.query_start_loc_cpu[flat_req_ids_tensor_cpu]
         ends_cpu = common_meta.query_start_loc_cpu[flat_req_ids_tensor_cpu + 1]
         lengths_cpu = ends_cpu - starts_cpu
-
+        
         cumsum_lengths_cpu = torch.zeros(lengths_cpu.numel() + 1, dtype=torch.long)
         torch.cumsum(lengths_cpu, dim=0, out=cumsum_lengths_cpu[1:])
 
@@ -1137,6 +1153,7 @@ class BeamAttentionImpl(AttentionImpl):
             # PBSC KV Hook: Broadcast Leader's Tail Tokens to Children
             # -------------------------------------------------------------
             if getattr(attn_metadata, "pbsc_src_slots", None) is not None:
+                torch.cuda.nvtx.range_push("pbsc_src_slots copy")
                 src_slots = attn_metadata.pbsc_src_slots
                 dst_slots = attn_metadata.pbsc_dst_slots
                 
@@ -1145,6 +1162,7 @@ class BeamAttentionImpl(AttentionImpl):
                 
                 k_flat[dst_slots] = k_flat[src_slots]
                 v_flat[dst_slots] = v_flat[src_slots]
+                torch.cuda.nvtx.range_pop()
 
         # Handle FP8 quantization if needed
         if self.kv_cache_dtype.startswith("fp8"):
