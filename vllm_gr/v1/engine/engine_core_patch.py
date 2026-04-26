@@ -89,10 +89,6 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
             first_tokens = first_req._all_token_ids
             other_tokens = other_req._all_token_ids
 
-            # while limit > pairwise_lcp and first_tokens[limit - 1] != other_tokens[limit - 1]:
-            #     limit -= 1
-            # pairwise_lcp = limit
-
             while limit > pairwise_lcp and first_tokens[limit - 1] != other_tokens[limit - 1]:
                 limit -= 1
             pairwise_lcp = limit

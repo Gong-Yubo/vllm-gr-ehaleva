@@ -65,6 +65,37 @@ logger = init_logger(__name__)
 BEAM_PREFIX_GROUPS_VAR = contextvars.ContextVar("beam_prefix_groups", default=None)
 PBSC_SHAPED_GROUPS_VAR = contextvars.ContextVar("pbsc_shaped_groups", default=None)
 
+@triton.jit
+def _pbsc_kv_copy_kernel(
+    k_ptr, v_ptr,
+    src_slots_ptr, dst_slots_ptr,
+    stride_tok,
+    n_slots, n_elements_per_slot,
+    BLOCK_ELEMENTS: tl.constexpr
+):
+    pid_slot = tl.program_id(0)
+    pid_elem = tl.program_id(1)
+
+    if pid_slot >= n_slots:
+        return
+
+    src_slot = tl.load(src_slots_ptr + pid_slot)
+    dst_slot = tl.load(dst_slots_ptr + pid_slot)
+
+    offsets = pid_elem * BLOCK_ELEMENTS + tl.arange(0, BLOCK_ELEMENTS)
+    mask = offsets < n_elements_per_slot
+
+    k_src = k_ptr + src_slot * stride_tok + offsets
+    v_src = v_ptr + src_slot * stride_tok + offsets
+    k_dst = k_ptr + dst_slot * stride_tok + offsets
+    v_dst = v_ptr + dst_slot * stride_tok + offsets
+
+    k_vals = tl.load(k_src, mask=mask)
+    v_vals = tl.load(v_src, mask=mask)
+
+    tl.store(k_dst, k_vals, mask=mask)
+    tl.store(v_dst, v_vals, mask=mask)
+
 @register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
     """Beam (Graph Reuse) Attention Backend.
@@ -285,6 +316,7 @@ class BeamAttentionMetadata:
     # PBSC KV Broadcast metadata
     pbsc_src_slots: torch.Tensor | None = None
     pbsc_dst_slots: torch.Tensor | None = None
+    pbsc_num_slots: int = 0
 
     causal: bool = True
     use_cascade_attention: bool = True
@@ -576,7 +608,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             scheduler_metadata = self.scheduler_metadata[:n]
 
         torch.cuda.nvtx.range_push("_create_pbsc_metadata")
-        pbsc_src_slots, pbsc_dst_slots = self._create_pbsc_metadata(common_meta)
+        pbsc_src_slots, pbsc_dst_slots, pbsc_num_slots = self._create_pbsc_metadata(common_meta)
         torch.cuda.nvtx.range_pop()
 
         return BeamAttentionMetadata(
@@ -605,6 +637,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_col_indices=suffix_col_indices,
             pbsc_src_slots=pbsc_src_slots,
             pbsc_dst_slots=pbsc_dst_slots,
+            pbsc_num_slots=pbsc_num_slots,
             causal=common_meta.causal,
             use_cascade_attention=True,
             max_num_splits=max_num_splits,
@@ -715,8 +748,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
     def _create_pbsc_metadata(self, common_meta: CommonAttentionMetadata):
         """Constructs metadata for PBSC KV cache broadcast."""
         pbsc_groups = PBSC_SHAPED_GROUPS_VAR.get()
-        if pbsc_groups is None:
-            return None, None
+        if not pbsc_groups:
+            return None, None, 0
 
         all_leader_reqs = []
         all_child_reqs = []
@@ -738,12 +771,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                     all_token_indices.extend(tokens)
                     
         if not all_leader_reqs:
-            return None, None
+            return None, None, 0
             
         # Transfer to GPU asynchronously avoiding pageable H2D copies
-        leaders_tensor = torch.tensor(all_leader_reqs, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
-        children_tensor = torch.tensor(all_child_reqs, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
-        tokens_tensor = torch.tensor(all_token_indices, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
+        leaders_tensor = torch.tensor(all_leader_reqs, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        children_tensor = torch.tensor(all_child_reqs, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        tokens_tensor = torch.tensor(all_token_indices, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
 
         # Vectorized block math
         block_indices = tokens_tensor // self.block_size
@@ -751,12 +784,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         # Read physical blocks for both leaders and children simultaneously
         leader_blocks = common_meta.block_table_tensor[leaders_tensor, block_indices]
-        pbsc_src_slots = leader_blocks.long() * self.block_size + block_offsets
+        pbsc_src_slots = leader_blocks * self.block_size + block_offsets
 
         child_blocks = common_meta.block_table_tensor[children_tensor, block_indices]
-        pbsc_dst_slots = child_blocks.long() * self.block_size + block_offsets
+        pbsc_dst_slots = child_blocks * self.block_size + block_offsets
         
-        return pbsc_src_slots, pbsc_dst_slots
+        return pbsc_src_slots, pbsc_dst_slots, len(all_leader_reqs)
 
     def _create_suffix_metadata(
         self,
@@ -1165,12 +1198,20 @@ class BeamAttentionImpl(AttentionImpl):
                 torch.cuda.nvtx.range_push("pbsc_src_slots copy")
                 src_slots = attn_metadata.pbsc_src_slots
                 dst_slots = attn_metadata.pbsc_dst_slots
+                n_slots = attn_metadata.pbsc_num_slots
                 
-                k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
-                v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
+                n_elements_per_slot = self.num_kv_heads * self.head_size
+                k_flat = key_cache.view(-1, n_elements_per_slot)
+                v_flat = value_cache.view(-1, n_elements_per_slot)
                 
-                k_flat[dst_slots] = k_flat[src_slots]
-                v_flat[dst_slots] = v_flat[src_slots]
+                BLOCK_ELEMENTS = 256
+                grid = (n_slots, triton.cdiv(n_elements_per_slot, BLOCK_ELEMENTS))
+                
+                _pbsc_kv_copy_kernel[grid](
+                    k_flat, v_flat, src_slots, dst_slots,
+                    k_flat.stride(0), n_slots, n_elements_per_slot,
+                    BLOCK_ELEMENTS=BLOCK_ELEMENTS
+                )
                 torch.cuda.nvtx.range_pop()
 
         # Handle FP8 quantization if needed
