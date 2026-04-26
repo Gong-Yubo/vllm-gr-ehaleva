@@ -576,44 +576,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             scheduler_metadata = self.scheduler_metadata[:n]
 
         torch.cuda.nvtx.range_push("_create_pbsc_metadata")
-        # Compute PBSC Broadcast Slots
-        src_slots_list = []
-        dst_slots_list = []
-
-        pbsc_groups = PBSC_SHAPED_GROUPS_VAR.get()
-        if pbsc_groups is not None:
-            for t_shared, req_indices in pbsc_groups:
-                t_block_aligned = (t_shared // self.block_size) * self.block_size
-                tail_len = t_shared - t_block_aligned
-                num_children = len(req_indices) - 1
-                if tail_len == 0 or num_children == 0:
-                    continue
-
-                leader_idx = req_indices[0]
-
-                # Generate token indices for the tail
-                tail_indices = torch.arange(t_block_aligned, t_shared, device=self.device)
-                block_indices = tail_indices // self.block_size
-                block_offsets = tail_indices % self.block_size
-
-                # Leader's physical slots for the tail
-                leader_blocks = common_meta.block_table_tensor[leader_idx, block_indices]
-                leader_slots = leader_blocks * self.block_size + block_offsets
-
-                # Vectorized computation for all children in the group
-                child_indices = req_indices[1:]
-                child_blocks_all = common_meta.block_table_tensor[child_indices, :][:, block_indices]
-                child_slots_all = child_blocks_all * self.block_size + block_offsets.unsqueeze(0)
-
-                src_slots_list.append(leader_slots.expand(num_children, -1).flatten())
-                dst_slots_list.append(child_slots_all.flatten())
-
-        if src_slots_list:
-            pbsc_src_slots = torch.cat(src_slots_list)
-            pbsc_dst_slots = torch.cat(dst_slots_list)
-        else:
-            pbsc_src_slots = None
-            pbsc_dst_slots = None
+        pbsc_src_slots, pbsc_dst_slots = self._create_pbsc_metadata(common_meta)
         torch.cuda.nvtx.range_pop()
 
         return BeamAttentionMetadata(
@@ -748,6 +711,52 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_indices_is_identity,
             group_first_reqs_tensor,
         )
+
+    def _create_pbsc_metadata(self, common_meta: CommonAttentionMetadata):
+        """Constructs metadata for PBSC KV cache broadcast."""
+        pbsc_groups = PBSC_SHAPED_GROUPS_VAR.get()
+        if pbsc_groups is None:
+            return None, None
+
+        all_leader_reqs = []
+        all_child_reqs = []
+        all_token_indices = []
+
+        for t_shared, req_indices in pbsc_groups:
+            t_block_aligned = (t_shared // self.block_size) * self.block_size
+            tail_len = t_shared - t_block_aligned
+            num_children = len(req_indices) - 1
+            
+            if tail_len > 0 and num_children > 0:
+                leader_idx = req_indices[0]
+                tokens = list(range(t_block_aligned, t_shared))
+                leader_list = [leader_idx] * tail_len
+                
+                for child_idx in req_indices[1:]:
+                    all_leader_reqs.extend(leader_list)
+                    all_child_reqs.extend([child_idx] * tail_len)
+                    all_token_indices.extend(tokens)
+                    
+        if not all_leader_reqs:
+            return None, None
+            
+        # Transfer to GPU asynchronously avoiding pageable H2D copies
+        leaders_tensor = torch.tensor(all_leader_reqs, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
+        children_tensor = torch.tensor(all_child_reqs, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
+        tokens_tensor = torch.tensor(all_token_indices, dtype=torch.long, pin_memory=True).to(self.device, non_blocking=True)
+
+        # Vectorized block math
+        block_indices = tokens_tensor // self.block_size
+        block_offsets = tokens_tensor % self.block_size
+
+        # Read physical blocks for both leaders and children simultaneously
+        leader_blocks = common_meta.block_table_tensor[leaders_tensor, block_indices]
+        pbsc_src_slots = leader_blocks.long() * self.block_size + block_offsets
+
+        child_blocks = common_meta.block_table_tensor[children_tensor, block_indices]
+        pbsc_dst_slots = child_blocks.long() * self.block_size + block_offsets
+        
+        return pbsc_src_slots, pbsc_dst_slots
 
     def _create_suffix_metadata(
         self,

@@ -106,6 +106,149 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
     return all_groups
 
 
+def _apply_pbsc_routing(output, beam_groups: list, requests: dict, block_size: int) -> None:
+    """Applies Partial-Block Shared Compute (PBSC) routing logic to the scheduled requests."""
+    torch.cuda.nvtx.range_push("PBSC")
+
+    new_num_scheduled_tokens = {}
+    
+    # PBSC Statistics
+    pbsc_stats_groups_total = 0
+    pbsc_stats_groups_active = 0
+    pbsc_stats_children_total = 0
+    pbsc_stats_children_valid = 0
+    pbsc_stats_tokens_saved = 0
+    
+    # PBSC Drop Reasons
+    drop_fully_cached = 0
+    drop_no_prefix = 0
+    drop_tail_too_long = 0
+
+   
+    pbsc_shaped_groups = []
+    
+    enable_pbsc = os.environ.get("VLLM_GR_ENABLE_PBSC", "1") == "1"
+    
+    for orig_t_prefix, group_req_ids in beam_groups:
+        if not enable_pbsc:
+            break
+        if len(group_req_ids) <= 1:
+            continue
+        t_block_aligned = (orig_t_prefix // block_size) * block_size
+        # 2. Sub-group by exact cache_hit for PBSC tensor shaping
+        cache_hit_groups = {}
+        for req_id in group_req_ids:
+            req = requests[req_id]
+            cache_hit = req.num_tokens - output.num_scheduled_tokens[req_id]
+            # If the request already has the entire shared prefix in cache,
+            # it doesn't need PBSC tail sharing.
+            if cache_hit >= orig_t_prefix:
+                drop_fully_cached += 1
+                logger.debug("[PBSC debug] Subgroup skipped: tokens=%d, schedule=%d cache_hit=%d, orig_t_prefix=%d)", req.num_tokens, output.num_scheduled_tokens[req_id], cache_hit, orig_t_prefix)
+                continue
+                
+            if cache_hit not in cache_hit_groups:
+                cache_hit_groups[cache_hit] = []
+            cache_hit_groups[cache_hit].append(req_id)
+
+        for t_cache_hit, sub_group_req_ids in cache_hit_groups.items():
+            if len(sub_group_req_ids) <= 1:
+                continue
+
+            t_prefix = orig_t_prefix
+            leader_id = sub_group_req_ids[0]
+            leader_req = requests[leader_id]
+            valid_children = sub_group_req_ids[1:]
+
+            # If the cache hit missed full blocks we thought were shared,
+            # restrict the sharing to what is actually cached.
+            if t_block_aligned > t_cache_hit:
+                t_prefix = min(t_prefix, t_cache_hit)
+                
+            if t_prefix == 0:
+                drop_no_prefix += len(valid_children)
+                logger.debug("[PBSC debug] Subgroup skipped: t_prefix became 0 (orig_t_prefix=%d, t_cache_hit=%d)", orig_t_prefix, t_cache_hit)
+                continue
+
+            # PBSC Safety Check: Active tail sharing is only for highly overlapping beams.
+            # If the unshared part is large, these are likely unrelated requests.
+            child_compute_len_estimate = leader_req.num_tokens - t_prefix
+            if child_compute_len_estimate > block_size:
+                drop_tail_too_long += len(valid_children)
+                logger.debug("[PBSC debug] Subgroup skipped: tail too long (unshared=%d > block_size=%d)", child_compute_len_estimate, block_size)
+                continue
+
+            pbsc_shaped_groups.append((t_prefix, sub_group_req_ids))
+            pbsc_stats_groups_total += 1
+            pbsc_stats_children_total += len(valid_children)
+            
+            # Leader computes its scheduled tokens (from t_cache_hit to num_tokens)
+            leader_compute_len = leader_req.num_tokens - t_cache_hit
+            new_num_scheduled_tokens[leader_id] = leader_compute_len
+            
+            # Children compute everything after the token-aligned prefix (tail is broadcasted)
+            for child_id in valid_children:
+                child_req = requests[child_id]
+                child_compute_len = child_req.num_tokens - t_prefix
+                new_num_scheduled_tokens[child_id] = child_compute_len
+                
+                # A child normally computes from its cache hit to its total length.
+                # With PBSC, it only computes from t_prefix to its total length.
+                normal_child_compute = child_req.num_tokens - t_cache_hit
+                pbsc_stats_tokens_saved += max(0, normal_child_compute - child_compute_len)
+                
+            pbsc_stats_groups_active += 1
+            pbsc_stats_children_valid += len(valid_children)
+
+    if pbsc_stats_groups_total > 0:
+        logger.debug(
+            "[PBSC Stats] Groups Active: %d / %d | Valid Children: %d / %d (%.1f%%) | Tokens Compute Saved: %d | Drops (Cached: %d, NoPrefix: %d, TailTooLong: %d)",
+            pbsc_stats_groups_active, pbsc_stats_groups_total,
+            pbsc_stats_children_valid, pbsc_stats_children_total,
+            (pbsc_stats_children_valid / pbsc_stats_children_total * 100) if pbsc_stats_children_total > 0 else 0,
+            pbsc_stats_tokens_saved,
+            drop_fully_cached, drop_no_prefix, drop_tail_too_long
+        )
+
+    output.beam_prefix_groups = beam_groups
+    output.pbsc_shaped_groups = pbsc_shaped_groups
+
+    # Rebuild dictionary to keep Leader first, then Children (for contiguous 1D tensor shape)
+    ordered_num_scheduled = {}
+    for _, pbsc_group in pbsc_shaped_groups:
+        for req_id in pbsc_group:
+            if req_id in new_num_scheduled_tokens:
+                ordered_num_scheduled[req_id] = new_num_scheduled_tokens[req_id]
+    
+    # Add any requests that were not in groups (just in case)
+    for req_id, num in output.num_scheduled_tokens.items():
+        if req_id not in ordered_num_scheduled:
+            ordered_num_scheduled[req_id] = num
+            
+    output.num_scheduled_tokens = ordered_num_scheduled
+    output.total_num_scheduled_tokens = sum(ordered_num_scheduled.values())
+
+    # PBSC: Update num_computed_tokens for children so GPUModelRunner
+    # generates correct Position IDs and slot mappings.
+    child_prefix_map = {}
+    for t_prefix, pbsc_group in pbsc_shaped_groups:
+        for child_id in pbsc_group[1:]:
+            if child_id in new_num_scheduled_tokens:
+                child_prefix_map[child_id] = t_prefix
+
+    for req_data in output.scheduled_new_reqs:
+        if req_data.req_id in child_prefix_map:
+            req_data.num_computed_tokens = child_prefix_map[req_data.req_id]
+            
+    if hasattr(output, "scheduled_cached_reqs"):
+        req_data = output.scheduled_cached_reqs
+        for i, req_id in enumerate(req_data.req_ids):
+            if req_id in child_prefix_map:
+                req_data.num_computed_tokens[i] = child_prefix_map[req_id]
+
+    torch.cuda.nvtx.range_pop()
+
+
 # ---------------------------------------------------------------------------
 # EngineCore.__init__ wrapper
 # ---------------------------------------------------------------------------
@@ -401,146 +544,8 @@ def apply_scheduler_patch():
             )
             torch.cuda.nvtx.range_pop()
 
+            _apply_pbsc_routing(output, beam_groups, self.requests, self.cache_config.block_size)
 
-            torch.cuda.nvtx.range_push("PBSC")
-
-            new_num_scheduled_tokens = {}
-            
-            # PBSC Statistics
-            pbsc_stats_groups_total = 0
-            pbsc_stats_groups_active = 0
-            pbsc_stats_children_total = 0
-            pbsc_stats_children_valid = 0
-            pbsc_stats_tokens_saved = 0
-            
-            # PBSC Drop Reasons
-            drop_fully_cached = 0
-            drop_no_prefix = 0
-            drop_tail_too_long = 0
-
-           
-            pbsc_shaped_groups = []
-            
-            enable_pbsc = os.environ.get("VLLM_GR_ENABLE_PBSC", "1") == "1"
-            
-            for orig_t_prefix, group_req_ids in beam_groups:
-                if not enable_pbsc:
-                    break
-                if len(group_req_ids) <= 1:
-                    continue
-                t_block_aligned = (orig_t_prefix // block_size) * block_size
-                # 2. Sub-group by exact cache_hit for PBSC tensor shaping
-                cache_hit_groups = {}
-                for req_id in group_req_ids:
-                    req = self.requests[req_id]
-                    cache_hit = req.num_tokens - output.num_scheduled_tokens[req_id]
-                    # If the request already has the entire shared prefix in cache,
-                    # it doesn't need PBSC tail sharing.
-                    if cache_hit >= orig_t_prefix:
-                        drop_fully_cached += 1
-                        logger.debug("[PBSC debug] Subgroup skipped: tokens=%d, schedule=%d cache_hit=%d, orig_t_prefix=%d)", req.num_tokens, output.num_scheduled_tokens[req_id], cache_hit, orig_t_prefix)
-                        continue
-                        
-                    if cache_hit not in cache_hit_groups:
-                        cache_hit_groups[cache_hit] = []
-                    cache_hit_groups[cache_hit].append(req_id)
-
-                for t_cache_hit, sub_group_req_ids in cache_hit_groups.items():
-                    if len(sub_group_req_ids) <= 1:
-                        continue
-
-                    t_prefix = orig_t_prefix
-                    leader_id = sub_group_req_ids[0]
-                    leader_req = self.requests[leader_id]
-                    valid_children = sub_group_req_ids[1:]
-
-                    # If the cache hit missed full blocks we thought were shared,
-                    # restrict the sharing to what is actually cached.
-                    if t_block_aligned > t_cache_hit:
-                        t_prefix = min(t_prefix, t_cache_hit)
-                        
-                    if t_prefix == 0:
-                        drop_no_prefix += len(valid_children)
-                        logger.debug("[PBSC debug] Subgroup skipped: t_prefix became 0 (orig_t_prefix=%d, t_cache_hit=%d)", orig_t_prefix, t_cache_hit)
-                        continue
-
-                    # PBSC Safety Check: Active tail sharing is only for highly overlapping beams.
-                    # If the unshared part is large, these are likely unrelated requests.
-                    child_compute_len_estimate = leader_req.num_tokens - t_prefix
-                    if child_compute_len_estimate > block_size:
-                        drop_tail_too_long += len(valid_children)
-                        logger.debug("[PBSC debug] Subgroup skipped: tail too long (unshared=%d > block_size=%d)", child_compute_len_estimate, block_size)
-                        continue
-
-                    pbsc_shaped_groups.append((t_prefix, sub_group_req_ids))
-                    pbsc_stats_groups_total += 1
-                    pbsc_stats_children_total += len(valid_children)
-                    
-                    # Leader computes its scheduled tokens (from t_cache_hit to num_tokens)
-                    leader_compute_len = leader_req.num_tokens - t_cache_hit
-                    new_num_scheduled_tokens[leader_id] = leader_compute_len
-                    
-                    # Children compute everything after the token-aligned prefix (tail is broadcasted)
-                    for child_id in valid_children:
-                        child_req = self.requests[child_id]
-                        child_compute_len = child_req.num_tokens - t_prefix
-                        new_num_scheduled_tokens[child_id] = child_compute_len
-                        
-                        # A child normally computes from its cache hit to its total length.
-                        # With PBSC, it only computes from t_prefix to its total length.
-                        normal_child_compute = child_req.num_tokens - t_cache_hit
-                        pbsc_stats_tokens_saved += max(0, normal_child_compute - child_compute_len)
-                        
-                    pbsc_stats_groups_active += 1
-                    pbsc_stats_children_valid += len(valid_children)
-
-            if pbsc_stats_groups_total > 0:
-                logger.debug(
-                    "[PBSC Stats] Groups Active: %d / %d | Valid Children: %d / %d (%.1f%%) | Tokens Compute Saved: %d | Drops (Cached: %d, NoPrefix: %d, TailTooLong: %d)",
-                    pbsc_stats_groups_active, pbsc_stats_groups_total,
-                    pbsc_stats_children_valid, pbsc_stats_children_total,
-                    (pbsc_stats_children_valid / pbsc_stats_children_total * 100) if pbsc_stats_children_total > 0 else 0,
-                    pbsc_stats_tokens_saved,
-                    drop_fully_cached, drop_no_prefix, drop_tail_too_long
-                )
-
-            output.beam_prefix_groups = beam_groups
-            output.pbsc_shaped_groups = pbsc_shaped_groups
-
-            # Rebuild dictionary to keep Leader first, then Children (for contiguous 1D tensor shape)
-            ordered_num_scheduled = {}
-            for _, pbsc_group in pbsc_shaped_groups:
-                for req_id in pbsc_group:
-                    if req_id in new_num_scheduled_tokens:
-                        ordered_num_scheduled[req_id] = new_num_scheduled_tokens[req_id]
-            
-            # Add any requests that were not in groups (just in case)
-            for req_id, num in output.num_scheduled_tokens.items():
-                if req_id not in ordered_num_scheduled:
-                    ordered_num_scheduled[req_id] = num
-                    
-            output.num_scheduled_tokens = ordered_num_scheduled
-            output.total_num_scheduled_tokens = sum(ordered_num_scheduled.values())
-
-            # PBSC: Update num_computed_tokens for children so GPUModelRunner
-            # generates correct Position IDs and slot mappings.
-            child_prefix_map = {}
-            for t_prefix, pbsc_group in pbsc_shaped_groups:
-                for child_id in pbsc_group[1:]:
-                    if child_id in new_num_scheduled_tokens:
-                        child_prefix_map[child_id] = t_prefix
-
-            for req_data in output.scheduled_new_reqs:
-                if req_data.req_id in child_prefix_map:
-                    req_data.num_computed_tokens = child_prefix_map[req_data.req_id]
-                    
-            if hasattr(output, "scheduled_cached_reqs"):
-                req_data = output.scheduled_cached_reqs
-                for i, req_id in enumerate(req_data.req_ids):
-                    if req_id in child_prefix_map:
-                        req_data.num_computed_tokens[i] = child_prefix_map[req_id]
-        
-            torch.cuda.nvtx.range_pop()
         return output
 
     Scheduler.schedule = patched_schedule
