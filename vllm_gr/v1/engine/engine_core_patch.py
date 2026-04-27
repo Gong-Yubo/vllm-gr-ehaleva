@@ -8,7 +8,6 @@ from __future__ import annotations
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
 import os
-import torch 
 
 logger = init_logger(__name__)
 
@@ -104,7 +103,6 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
 
 def _apply_pbsc_routing(output, beam_groups: list, requests: dict, block_size: int) -> None:
     """Applies Partial-Block Shared Compute (PBSC) routing logic to the scheduled requests."""
-    torch.cuda.nvtx.range_push("PBSC")
 
     new_num_scheduled_tokens = {}
     
@@ -241,8 +239,6 @@ def _apply_pbsc_routing(output, beam_groups: list, requests: dict, block_size: i
         for i, req_id in enumerate(req_data.req_ids):
             if req_id in child_prefix_map:
                 req_data.num_computed_tokens[i] = child_prefix_map[req_id]
-
-    torch.cuda.nvtx.range_pop()
 
 
 # ---------------------------------------------------------------------------
@@ -525,21 +521,16 @@ def apply_scheduler_patch():
         # Temporarily mock the get_computed_blocks method for this schedule pass
         self.kv_cache_manager.get_computed_blocks = get_cache_computed_blocks
         try:
-            torch.cuda.nvtx.range_push("Scheduler.schedule")
             output = _original_schedule(self)
-            torch.cuda.nvtx.range_pop()
         finally:
             # Restore the original methods immediately after
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
 
         req_ids = list(output.num_scheduled_tokens.keys())
         if req_ids:
-            torch.cuda.nvtx.range_push("_compute_beam_prefix_groups")
             beam_groups = _compute_beam_prefix_groups(
                 req_ids, self.requests, self.cache_config.block_size
             )
-            torch.cuda.nvtx.range_pop()
-
             _apply_pbsc_routing(output, beam_groups, self.requests, self.cache_config.block_size)
 
         return output
@@ -582,7 +573,6 @@ def apply_worker_patches():
 
         tokens_to_reset = []
         if beam_groups_str is not None or pbsc_groups_str is not None:
-            torch.cuda.nvtx.range_push("patched_build_attention_metadata")
             req_id_to_idx = {
                 r_id: i for i, r_id in enumerate(self.input_batch.req_ids) if r_id is not None
             }
@@ -595,7 +585,6 @@ def apply_worker_patches():
                 translated_pbsc = [(d, [req_id_to_idx[r] for r in g if r in req_id_to_idx]) for d, g in pbsc_groups_str]
                 translated_pbsc = [(d, g) for d, g in translated_pbsc if g]
                 tokens_to_reset.append((PBSC_SHAPED_GROUPS_VAR, PBSC_SHAPED_GROUPS_VAR.set(translated_pbsc)))
-            torch.cuda.nvtx.range_pop()
             try:
                 return _original_build_attention_metadata(self, *args, **kwargs)
             finally:

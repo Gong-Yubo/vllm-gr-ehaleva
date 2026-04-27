@@ -387,7 +387,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         Inherits cascade_attention parameters and adds Beam-specific optimizations.
         """
-        torch.cuda.nvtx.range_push("BeamAttentionMetadataBuilder.build")
         # 1. Setup AOT Schedule and Cuda Graph parameters
         self._update_aot_schedule(fast_build)
         max_num_splits = self._get_max_num_splits(common_attn_metadata.num_actual_tokens)
@@ -396,7 +395,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         if beam_prefix_groups is None:
             meta = self._build_standard_metadata(common_attn_metadata, max_num_splits)
-            torch.cuda.nvtx.range_pop()
             return meta
 
         common_prefix_groups = beam_prefix_groups
@@ -412,11 +410,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         # 5. Build Metadata (Shared vs Standard)
         if not shared_groups:
             meta = self._build_standard_metadata(common_attn_metadata, max_num_splits)
-            torch.cuda.nvtx.range_pop()
             return meta
 
         meta = self._build_shared_metadata(common_attn_metadata, shared_groups, max_num_splits)
-        torch.cuda.nvtx.range_pop()
         return meta
 
     def _update_aot_schedule(self, fast_build: bool):
@@ -551,7 +547,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
     ) -> BeamAttentionMetadata:
         """Builds metadata for split attention (shared prefix + suffix)."""
 
-        torch.cuda.nvtx.range_push("_create_prefix_metadata")
         # 1. Prepare Prefix Metadata
         (
             prefix_block_table,
@@ -565,9 +560,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_indices_is_identity,
             group_first_reqs,
         ) = self._create_prefix_metadata(common_meta, shared_groups)
-        torch.cuda.nvtx.range_pop()
-        
-        torch.cuda.nvtx.range_push("_create_suffix_metadata")
+
         # 2. Prepare Suffix Metadata
         (
             suffix_block_table,
@@ -575,9 +568,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_query_max_len,
             suffix_kv_max_len,
             suffix_col_indices,
-        ) = self._create_suffix_metadata(common_meta, shift_amounts, shift_amounts_cpu)
-        torch.cuda.nvtx.range_pop()
-        
+        ) = self._create_suffix_metadata(common_meta, shift_amounts, shift_amounts_cpu)        
 
         # 3. Create Schedulers
         prefix_scheduler_metadata = self._get_schedule(
@@ -607,9 +598,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
-        torch.cuda.nvtx.range_push("_create_pbsc_metadata")
         pbsc_src_slots, pbsc_dst_slots, pbsc_num_slots = self._create_pbsc_metadata(common_meta)
-        torch.cuda.nvtx.range_pop()
 
         return BeamAttentionMetadata(
             num_actual_tokens=common_meta.num_actual_tokens,
@@ -1195,24 +1184,28 @@ class BeamAttentionImpl(AttentionImpl):
             # PBSC KV Hook: Broadcast Leader's Tail Tokens to Children
             # -------------------------------------------------------------
             if getattr(attn_metadata, "pbsc_src_slots", None) is not None:
-                torch.cuda.nvtx.range_push("pbsc_src_slots copy")
                 src_slots = attn_metadata.pbsc_src_slots
                 dst_slots = attn_metadata.pbsc_dst_slots
-                n_slots = attn_metadata.pbsc_num_slots
+                # n_slots = attn_metadata.pbsc_num_slots
                 
-                n_elements_per_slot = self.num_kv_heads * self.head_size
-                k_flat = key_cache.view(-1, n_elements_per_slot)
-                v_flat = value_cache.view(-1, n_elements_per_slot)
+                # n_elements_per_slot = self.num_kv_heads * self.head_size
+                # k_flat = key_cache.view(-1, n_elements_per_slot)
+                # v_flat = value_cache.view(-1, n_elements_per_slot)
                 
-                BLOCK_ELEMENTS = 256
-                grid = (n_slots, triton.cdiv(n_elements_per_slot, BLOCK_ELEMENTS))
+                # BLOCK_ELEMENTS = 256
+                # grid = (n_slots, triton.cdiv(n_elements_per_slot, BLOCK_ELEMENTS))
                 
-                _pbsc_kv_copy_kernel[grid](
-                    k_flat, v_flat, src_slots, dst_slots,
-                    k_flat.stride(0), n_slots, n_elements_per_slot,
-                    BLOCK_ELEMENTS=BLOCK_ELEMENTS
-                )
-                torch.cuda.nvtx.range_pop()
+                # _pbsc_kv_copy_kernel[grid](
+                #     k_flat, v_flat, src_slots, dst_slots,
+                #     k_flat.stride(0), n_slots, n_elements_per_slot,
+                #     BLOCK_ELEMENTS=BLOCK_ELEMENTS
+                # )
+                
+                k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
+                v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
+                
+                k_flat[dst_slots] = k_flat[src_slots]
+                v_flat[dst_slots] = v_flat[src_slots]
 
         # Handle FP8 quantization if needed
         if self.kv_cache_dtype.startswith("fp8"):
