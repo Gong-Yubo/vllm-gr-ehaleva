@@ -65,8 +65,8 @@ def _make_dp_client_mock(
     mock_self.core_engines = engines
 
     # get_core_engine_for_request returns engine based on data_parallel_rank.
-    def _get_engine(request):
-        rank = getattr(request, "data_parallel_rank", None)
+    def _get_engine(request: Any) -> str:
+        rank: int | None = getattr(request, "data_parallel_rank", None)
         idx = rank if rank is not None else 0
         chosen = engines[idx]
         mock_self.reqs_in_flight[request.request_id] = chosen
@@ -160,7 +160,7 @@ class TestRankSelection:
         ) as mock_add_batch:
             mock_add_batch.return_value = ([mock_output], ["req-1-beam-0"])
 
-            async def _run():
+            async def _run() -> None:
                 async for _ in beam_search(mock_self, prompt, "req-1", params):
                     pass
 
@@ -218,7 +218,7 @@ class TestRankSelection:
                 ["req-1-beam-0"],
             )
 
-            async def _run():
+            async def _run() -> None:
                 async for _ in beam_search(mock_self, prompt, "req-1", params):
                     pass
 

@@ -10,7 +10,6 @@ from vllm.utils.torch_utils import set_random_seed
 
 try:
     from vllm_gr.v1.attention.backends.beam_attn import (
-        BeamAttentionBackend,
         BeamAttentionImpl,
     )
 except ImportError:
@@ -206,19 +205,47 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     return output
 
 
+def get_prefix_groups(block_tables: torch.Tensor) -> list[tuple[int, list[int]]]:
+    """
+    Group sequences by their longest common prefix of block indices.
+    """
+    block_tables_cpu = block_tables.cpu().tolist()
+
+    groups_dict: dict[int, list[tuple[int, list[int]]]] = {}
+    for i, blocks in enumerate(block_tables_cpu):
+        first_block = blocks[0] if blocks else -1
+        if first_block not in groups_dict:
+            groups_dict[first_block] = []
+        groups_dict[first_block].append((i, blocks))
+
+    res = []
+    for first_block, seqs in groups_dict.items():
+        if len(seqs) == 1:
+            res.append((0, [seqs[0][0]]))
+            continue
+
+        min_lcp = len(seqs[0][1])
+        for i in range(1, len(seqs)):
+            lcp = 0
+            for b1, b2 in zip(seqs[0][1], seqs[i][1]):
+                if b1 == b2:
+                    lcp += 1
+                else:
+                    break
+            min_lcp = min(min_lcp, lcp)
+
+        res.append((min_lcp, [s[0] for s in seqs]))
+
+    # Sort groups by the first request id to maintain deterministic order
+    res.sort(key=lambda x: x[1][0])
+    return res
+
+
 def run_cascade_beam_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     output = torch.empty_like(inputs.query)
 
-    # Use prefix_partition to determine groups
-    groups = BeamAttentionBackend.prefix_partition(
-        num_reqs=inputs.num_seqs,
-        block_size=inputs.block_size,
-        block_table_device=inputs.block_tables,
-        seq_lens=inputs.seq_lens,
-        threshold=0,
-        min_blocks_for_sharing=0,
-        device_lcp=True,
-    )
+    # Dynamically determine groups from block tables
+    groups = get_prefix_groups(inputs.block_tables)
 
     # Filter for actual sharing
     shared_groups = [g for g in groups if g[0] > 0]
