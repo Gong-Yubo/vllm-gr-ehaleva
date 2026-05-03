@@ -127,7 +127,15 @@ async def _add_requests_batch_fn(
         use_batch_message: If True, always send as ADD_BATCH (needed for
             beam cache). If False, send individual ADD messages.
     """
+    import time
+    if not hasattr(self, "_total_add_requests_batch_time"):
+        self._total_add_requests_batch_time = 0.0
+        
+    start_time = time.perf_counter()
     await self.engine_core.add_requests_async(requests, force_batch=use_batch_message)
+    cur_time = time.perf_counter() - start_time
+    self._total_add_requests_batch_time += cur_time
+    logger.info("AsyncLLM._add_requests_batch_fn took %.2f ms (Total: %.2f ms)", cur_time * 1000, self._total_add_requests_batch_time * 1000)
 
 
 def register_beam_output_fn(
@@ -173,4 +181,12 @@ def register_beam_output_fn(
 
 async def beam_fork_fn(self, fork_request: BeamForkRequest) -> None:
     """Send BEAM_FORK to EngineCore."""
+    import time
+    if not hasattr(self, "_total_beam_fork_time"):
+        self._total_beam_fork_time = 0.0
+        
+    start_time = time.perf_counter()
     await self.engine_core.beam_fork_async(fork_request)
+    cur_time = time.perf_counter() - start_time
+    self._total_beam_fork_time += cur_time
+    logger.info("AsyncLLM.beam_fork_fn took %.2f ms (Total: %.2f ms)", cur_time * 1000, self._total_beam_fork_time * 1000)

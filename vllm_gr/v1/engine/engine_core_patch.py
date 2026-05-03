@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequestType
-import os
 
 logger = init_logger(__name__)
 
@@ -121,7 +120,7 @@ def _apply_pbsc_routing(output, beam_groups: list, requests: dict, block_size: i
    
     pbsc_shaped_groups = []
     
-    enable_pbsc = os.environ.get("VLLM_GR_ENABLE_PBSC", "1") == "1"
+    enable_pbsc = True
     
     for orig_t_prefix, group_req_ids in beam_groups:
         if not enable_pbsc:
@@ -346,6 +345,20 @@ def apply_engine_core_child_patches():
     # Inject types into vllm.v1.engine module
     engine_mod.BeamForkRequest = BeamForkRequest
 
+    if hasattr(EngineCore, "step_with_batch_queue"):
+        _original_engine_core_step = EngineCore.step_with_batch_queue
+        def patched_engine_core_step_with_batch_queue(self, *args, **kwargs):
+            import time
+            if not hasattr(self, "_total_step_with_batch_queue_time"):
+                self._total_step_with_batch_queue_time = 0.0
+            start_time = time.perf_counter()
+            res = _original_engine_core_step(self, *args, **kwargs)
+            cur_time = time.perf_counter() - start_time
+            self._total_step_with_batch_queue_time += cur_time
+            logger.info("EngineCore.step_with_batch_queue took %.2f ms (Total: %.2f ms)", cur_time * 1000, self._total_step_with_batch_queue_time * 1000)
+            return res
+        EngineCore.step_with_batch_queue = patched_engine_core_step_with_batch_queue
+
     # Add new enum members: ADD_BATCH, BEAM_FORK
     _add_enum_member("ADD_BATCH", b"\x05")
     _add_enum_member("BEAM_FORK", b"\x06")
@@ -520,8 +533,16 @@ def apply_scheduler_patch():
 
         # Temporarily mock the get_computed_blocks method for this schedule pass
         self.kv_cache_manager.get_computed_blocks = get_cache_computed_blocks
+        import time
+        if not hasattr(self, "_total_schedule_time"):
+            self._total_schedule_time = 0.0
+
+        start_time = time.perf_counter()
         try:
             output = _original_schedule(self)
+            cur_time = time.perf_counter() - start_time
+            self._total_schedule_time += cur_time
+            logger.info("Scheduler.schedule took %.2f ms (Total: %.2f ms) [nested inside EngineCore.step]", cur_time * 1000, self._total_schedule_time * 1000)
         finally:
             # Restore the original methods immediately after
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
@@ -553,15 +574,28 @@ def apply_worker_patches():
 
     _original_execute_model = GPUModelRunner.execute_model
     _original_build_attention_metadata = GPUModelRunner._build_attention_metadata
+    _original_model_forward = GPUModelRunner._model_forward
+    _original_prepare_inputs = GPUModelRunner._prepare_inputs
 
     def patched_execute_model(self, scheduler_output, intermediate_tensors=None):
+        import time
+        import torch
+        
+        if not hasattr(self, "_total_execute_model_time"):
+            self._total_execute_model_time = 0.0
+
         beam_groups = getattr(scheduler_output, "beam_prefix_groups", None)
         pbsc_groups = getattr(scheduler_output, "pbsc_shaped_groups", None)
         self._current_beam_prefix_groups_str = beam_groups
         self._current_pbsc_shaped_groups_str = pbsc_groups
 
+        start_time = time.perf_counter()
         try:
-            return _original_execute_model(self, scheduler_output, intermediate_tensors)
+            res = _original_execute_model(self, scheduler_output, intermediate_tensors)
+            cur_time = time.perf_counter() - start_time
+            self._total_execute_model_time += cur_time
+            logger.info("GPUModelRunner.execute_model took %.2f ms (Total: %.2f ms) [nested inside EngineCore.step]", cur_time * 1000, self._total_execute_model_time * 1000)
+            return res
         finally:
             self._current_beam_prefix_groups_str = None
             self._current_pbsc_shaped_groups_str = None
@@ -593,7 +627,75 @@ def apply_worker_patches():
         else:
             return _original_build_attention_metadata(self, *args, **kwargs)
 
+    def patched_model_forward(
+        self,
+        input_ids=None,
+        positions=None,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        **model_kwargs,
+    ):
+        import time
+        import torch
+        
+        if not hasattr(self, "_total_model_forward_time"):
+            self._total_model_forward_time = 0.0
+
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("Strict Mode: Either input_ids or inputs_embeds must be provided to _model_forward.")
+        if positions is None:
+            raise ValueError("Strict Mode: positions tensor must be provided to _model_forward.")
+            
+        start_time = time.perf_counter()
+        res = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **model_kwargs,
+        )
+        torch.cuda.synchronize()
+        cur_time = time.perf_counter() - start_time
+        self._total_model_forward_time += cur_time
+        logger.info("GPUModelRunner._model_forward took %.2f ms (Total: %.2f ms) [nested inside execute_model]", cur_time * 1000, self._total_model_forward_time * 1000)
+        return res
+
+    def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        import time
+        import torch
+        
+        if not hasattr(self, "_total_prepare_inputs_time"):
+            self._total_prepare_inputs_time = 0.0
+            
+        start_time = time.perf_counter()
+        res = _original_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
+        # torch.cuda.synchronize()
+        cur_time = time.perf_counter() - start_time
+        self._total_prepare_inputs_time += cur_time
+        logger.info("GPUModelRunner._prepare_inputs took %.2f ms (Total: %.2f ms) [nested inside execute_model]", cur_time * 1000, self._total_prepare_inputs_time * 1000)
+        return res
+
+    _original_sample_tokens = getattr(GPUModelRunner, "sample_tokens", None)
+    if _original_sample_tokens:
+        def patched_sample_tokens(self, *args, **kwargs):
+            import time
+            import torch
+            
+            if not hasattr(self, "_total_sample_tokens_time"):
+                self._total_sample_tokens_time = 0.0
+                
+            start_time = time.perf_counter()
+            res = _original_sample_tokens(self, *args, **kwargs)
+            torch.cuda.synchronize()
+            cur_time = time.perf_counter() - start_time
+            self._total_sample_tokens_time += cur_time
+            logger.info("GPUModelRunner.sample_tokens took %.2f ms (Total: %.2f ms) [nested inside EngineCore.step]", cur_time * 1000, self._total_sample_tokens_time * 1000)
+            return res
+        GPUModelRunner.sample_tokens = patched_sample_tokens
+
     GPUModelRunner.execute_model = patched_execute_model
     GPUModelRunner._build_attention_metadata = patched_build_attention_metadata
+    GPUModelRunner._model_forward = patched_model_forward
+    GPUModelRunner._prepare_inputs = patched_prepare_inputs
     GPUModelRunner._patched_for_beam_groups = True
     logger.debug("GPUModelRunner patched for beam groups via ContextVar.")
