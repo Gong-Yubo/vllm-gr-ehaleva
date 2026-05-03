@@ -19,8 +19,6 @@ logger = init_logger(__name__)
 # _cache_beam_request / _handle_beam_fork  (ported from source core.py)
 # ---------------------------------------------------------------------------
 
-total_handle_beam_fork_time = 0.0
-total_decode_beam_fork_time = 0.0
 
 def _cache_beam_request(self, request) -> None:
     """Cache Request state for later beam forking.
@@ -45,9 +43,6 @@ def _handle_beam_fork(self, fork_req) -> None:
 
     Thread-safe: uses beam_cache_lock to prevent data races.
     """
-    global total_handle_beam_fork_time
-    import time
-    start_time = time.perf_counter()
     from vllm.v1.request import Request
 
     for parent_id, child_id, token_id in zip(
@@ -111,10 +106,6 @@ def _handle_beam_fork(self, fork_req) -> None:
     with self.beam_cache_lock:
         for pid in set(fork_req.parent_ids) | set(fork_req.abort_ids):
             self.beam_cache.pop(pid, None)
-            
-    cur_time = time.perf_counter() - start_time
-    total_handle_beam_fork_time += cur_time
-    logger.info("EngineCore._handle_beam_fork took %.2f ms (Total: %.2f ms)", cur_time * 1000, total_handle_beam_fork_time * 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -207,14 +198,7 @@ def process_input_sockets(
                     continue
 
                 elif request_type == EngineCoreRequestType.BEAM_FORK:
-                    global total_decode_beam_fork_time
-                    import time
-                    dec_start = time.perf_counter()
                     fork_req: BeamForkRequest = beam_fork_decoder.decode(data_frames)
-                    dec_cur = time.perf_counter() - dec_start
-                    total_decode_beam_fork_time += dec_cur
-                    logger.info("EngineCoreProc decoding BEAM_FORK took %.2f ms (Total: %.2f ms)", dec_cur * 1000, total_decode_beam_fork_time * 1000)
-
                     self._handle_beam_fork(fork_req)
                     continue
 

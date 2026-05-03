@@ -51,18 +51,3 @@ def apply_batch_fork_patches():
     AsyncLLM._add_requests_batch = _add_requests_batch_fn
     AsyncLLM.register_beam_output = register_beam_output_fn
     AsyncLLM.beam_fork = beam_fork_fn
-
-    _original_process_outputs = OutputProcessor.process_outputs
-
-    def patched_process_outputs(self, engine_core_outputs, engine_core_timestamp=None, iteration_stats=None):
-        import time
-        if not hasattr(self, "_total_process_outputs_time"):
-            self._total_process_outputs_time = 0.0
-        start_time = time.perf_counter()
-        res = _original_process_outputs(self, engine_core_outputs, engine_core_timestamp, iteration_stats)
-        cur_time = time.perf_counter() - start_time
-        self._total_process_outputs_time += cur_time
-        logger.info("OutputProcessor.process_outputs took %.2f ms (Total: %.2f ms) [Frontend]", cur_time * 1000, self._total_process_outputs_time * 1000)
-        return res
-
-    OutputProcessor.process_outputs = patched_process_outputs

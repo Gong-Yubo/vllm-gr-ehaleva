@@ -20,11 +20,6 @@ from vllm.utils import random_uuid
 from vllm_gr.v1.engine.types import BeamForkRequest
 from vllm_gr.v1.metrics.stats import RequestStateStats
 
-total_postprocess_time = 0.0
-total_engine_step_time = 0.0
-total_gather_beam_results_time = 0.0
-total_engine_client_beam_fork_time = 0.0
-
 
 async def _collect_beam_result(q):
     """Drain output queue until finished."""
@@ -36,15 +31,8 @@ async def _collect_beam_result(q):
 
 async def _gather_beam_results(queues):
     """Gather results from multiple output queues."""
-    global total_gather_beam_results_time
-    import time
-    start_time = time.perf_counter()
     tasks = [asyncio.create_task(_collect_beam_result(q)) for q in queues]
-    res = list(await asyncio.gather(*tasks))
-    cur_time = time.perf_counter() - start_time
-    total_gather_beam_results_time += cur_time
-    print(f"  _gather_beam_results took {cur_time * 1000:.2f} ms (Total: {total_gather_beam_results_time * 1000:.2f} ms)")
-    return res
+    return list(await asyncio.gather(*tasks))
 
 
 async def _beam_fork_step(
@@ -89,10 +77,6 @@ async def _beam_fork_step(
     used = set(parent_ids)
     abort_ids = [pid for pid in prev_beam_internal_ids if pid not in used]
 
-    global total_engine_client_beam_fork_time
-    import time
-    start_time = time.perf_counter()
-
     await engine_client.beam_fork(
         BeamForkRequest(
             parent_ids=parent_ids,
@@ -106,10 +90,6 @@ async def _beam_fork_step(
             priority=priority,
         )
     )
-
-    cur_time = time.perf_counter() - start_time
-    total_engine_client_beam_fork_time += cur_time
-    print(f"  engine_client.beam_fork took {cur_time * 1000:.2f} ms (Total: {total_engine_client_beam_fork_time * 1000:.2f} ms)")
 
     output = await _gather_beam_results(queues)
     return output, child_ids
@@ -159,8 +139,6 @@ async def beam_search(
     lora_request: LoRARequest | None = None,
     trace_headers: Mapping[str, str] | None = None,
 ) -> AsyncGenerator[RequestOutput, None]:
-    global total_postprocess_time
-    global total_engine_step_time
     generation_time: float = 0.0
     num_generation_tokens: int = 0
     beam_width = params.beam_width
@@ -323,7 +301,6 @@ async def beam_search(
             )
 
         gen_start = time.perf_counter()
-        engine_step_start = time.perf_counter()
 
         if use_beam_fork and fork_info is not None:
             output, prev_beam_internal_ids = await _beam_fork_step(
@@ -358,11 +335,6 @@ async def beam_search(
                 value=use_batch,
             )
 
-        engine_step_time = time.perf_counter() - engine_step_start
-        total_engine_step_time += engine_step_time
-        print(f"Engine await step took {engine_step_time * 1000:.2f} ms (Total: {total_engine_step_time * 1000:.2f} ms)")
-
-        postprocess_start = time.perf_counter()
         valid_tokens_sets = None
         if catalog_task is not None:
             valid_tokens_sets = await catalog_task
@@ -470,10 +442,6 @@ async def beam_search(
             fork_info = [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
 
         all_beams = new_beams
-
-        postprocess_time = time.perf_counter() - postprocess_start
-        total_postprocess_time += postprocess_time
-    print(f"Beam search post-process took {postprocess_time * 1000:.2f} ms (Total: {total_postprocess_time * 1000:.2f} ms)")
 
     # Cleanup: remove remaining beam cache entries.
     if use_beam_fork and prev_beam_internal_ids:

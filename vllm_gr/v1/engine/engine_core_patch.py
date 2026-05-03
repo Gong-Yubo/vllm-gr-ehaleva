@@ -345,20 +345,6 @@ def apply_engine_core_child_patches():
     # Inject types into vllm.v1.engine module
     engine_mod.BeamForkRequest = BeamForkRequest
 
-    if hasattr(EngineCore, "step_with_batch_queue"):
-        _original_engine_core_step = EngineCore.step_with_batch_queue
-        def patched_engine_core_step_with_batch_queue(self, *args, **kwargs):
-            import time
-            if not hasattr(self, "_total_step_with_batch_queue_time"):
-                self._total_step_with_batch_queue_time = 0.0
-            start_time = time.perf_counter()
-            res = _original_engine_core_step(self, *args, **kwargs)
-            cur_time = time.perf_counter() - start_time
-            self._total_step_with_batch_queue_time += cur_time
-            logger.info("EngineCore.step_with_batch_queue took %.2f ms (Total: %.2f ms)", cur_time * 1000, self._total_step_with_batch_queue_time * 1000)
-            return res
-        EngineCore.step_with_batch_queue = patched_engine_core_step_with_batch_queue
-
     # Add new enum members: ADD_BATCH, BEAM_FORK
     _add_enum_member("ADD_BATCH", b"\x05")
     _add_enum_member("BEAM_FORK", b"\x06")
@@ -533,16 +519,8 @@ def apply_scheduler_patch():
 
         # Temporarily mock the get_computed_blocks method for this schedule pass
         self.kv_cache_manager.get_computed_blocks = get_cache_computed_blocks
-        import time
-        if not hasattr(self, "_total_schedule_time"):
-            self._total_schedule_time = 0.0
-
-        start_time = time.perf_counter()
         try:
             output = _original_schedule(self)
-            cur_time = time.perf_counter() - start_time
-            self._total_schedule_time += cur_time
-            logger.info("Scheduler.schedule took %.2f ms (Total: %.2f ms) [nested inside EngineCore.step]", cur_time * 1000, self._total_schedule_time * 1000)
         finally:
             # Restore the original methods immediately after
             self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
@@ -566,6 +544,7 @@ def apply_worker_patches():
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
         from vllm_gr.v1.attention.backends.beam_attn import BEAM_PREFIX_GROUPS_VAR, PBSC_SHAPED_GROUPS_VAR
+        from vllm.v1.worker.gpu_input_batch import InputBatch
     except ImportError:
         return
 
@@ -574,28 +553,15 @@ def apply_worker_patches():
 
     _original_execute_model = GPUModelRunner.execute_model
     _original_build_attention_metadata = GPUModelRunner._build_attention_metadata
-    _original_model_forward = GPUModelRunner._model_forward
-    _original_prepare_inputs = GPUModelRunner._prepare_inputs
 
     def patched_execute_model(self, scheduler_output, intermediate_tensors=None):
-        import time
-        import torch
-        
-        if not hasattr(self, "_total_execute_model_time"):
-            self._total_execute_model_time = 0.0
-
         beam_groups = getattr(scheduler_output, "beam_prefix_groups", None)
         pbsc_groups = getattr(scheduler_output, "pbsc_shaped_groups", None)
         self._current_beam_prefix_groups_str = beam_groups
         self._current_pbsc_shaped_groups_str = pbsc_groups
 
-        start_time = time.perf_counter()
         try:
-            res = _original_execute_model(self, scheduler_output, intermediate_tensors)
-            cur_time = time.perf_counter() - start_time
-            self._total_execute_model_time += cur_time
-            logger.info("GPUModelRunner.execute_model took %.2f ms (Total: %.2f ms) [nested inside EngineCore.step]", cur_time * 1000, self._total_execute_model_time * 1000)
-            return res
+            return _original_execute_model(self, scheduler_output, intermediate_tensors)
         finally:
             self._current_beam_prefix_groups_str = None
             self._current_pbsc_shaped_groups_str = None
@@ -627,75 +593,153 @@ def apply_worker_patches():
         else:
             return _original_build_attention_metadata(self, *args, **kwargs)
 
-    def patched_model_forward(
-        self,
-        input_ids=None,
-        positions=None,
-        intermediate_tensors=None,
-        inputs_embeds=None,
-        **model_kwargs,
-    ):
-        import time
-        import torch
-        
-        if not hasattr(self, "_total_model_forward_time"):
-            self._total_model_forward_time = 0.0
+    if not getattr(InputBatch, "_patched_for_fast_beam_add", False):        
 
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("Strict Mode: Either input_ids or inputs_embeds must be provided to _model_forward.")
-        if positions is None:
-            raise ValueError("Strict Mode: positions tensor must be provided to _model_forward.")
-            
-        start_time = time.perf_counter()
-        res = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
-        torch.cuda.synchronize()
-        cur_time = time.perf_counter() - start_time
-        self._total_model_forward_time += cur_time
-        logger.info("GPUModelRunner._model_forward took %.2f ms (Total: %.2f ms) [nested inside execute_model]", cur_time * 1000, self._total_model_forward_time * 1000)
-        return res
-
-    def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
-        import time
-        import torch
-        
-        if not hasattr(self, "_total_prepare_inputs_time"):
-            self._total_prepare_inputs_time = 0.0
-            
-        start_time = time.perf_counter()
-        res = _original_prepare_inputs(self, scheduler_output, num_scheduled_tokens)
-        # torch.cuda.synchronize()
-        cur_time = time.perf_counter() - start_time
-        self._total_prepare_inputs_time += cur_time
-        logger.info("GPUModelRunner._prepare_inputs took %.2f ms (Total: %.2f ms) [nested inside execute_model]", cur_time * 1000, self._total_prepare_inputs_time * 1000)
-        return res
-
-    _original_sample_tokens = getattr(GPUModelRunner, "sample_tokens", None)
-    if _original_sample_tokens:
-        def patched_sample_tokens(self, *args, **kwargs):
-            import time
+        def patched_add_request(self, request, *args, **kwargs):
             import torch
-            
-            if not hasattr(self, "_total_sample_tokens_time"):
-                self._total_sample_tokens_time = 0.0
-                
-            start_time = time.perf_counter()
-            res = _original_sample_tokens(self, *args, **kwargs)
-            torch.cuda.synchronize()
-            cur_time = time.perf_counter() - start_time
-            self._total_sample_tokens_time += cur_time
-            logger.info("GPUModelRunner.sample_tokens took %.2f ms (Total: %.2f ms) [nested inside EngineCore.step]", cur_time * 1000, self._total_sample_tokens_time * 1000)
-            return res
-        GPUModelRunner.sample_tokens = patched_sample_tokens
+            from vllm.utils import length_from_prompt_token_ids_or_embeds
+            from vllm.sampling_params import SamplingType
 
+            req_index = self._register_add_request(request)
+
+            req_id = request.req_id
+            if req_index == len(self._req_ids):
+                self._req_ids.append(req_id)
+                self.req_output_token_ids.append(request.output_token_ids)
+                self.spec_token_ids.append([])
+            else:
+                self._req_ids[req_index] = req_id
+                self.req_output_token_ids[req_index] = request.output_token_ids
+                self.spec_token_ids[req_index].clear()
+
+            self.req_id_to_index[req_id] = req_index
+
+            # Copy the prompt token ids and output token ids.
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                request.prompt_token_ids, request.prompt_embeds
+            )
+            self.num_prompt_tokens[req_index] = num_prompt_tokens
+            start_idx = num_prompt_tokens
+            end_idx = start_idx + len(request.output_token_ids)
+            
+            if request.prompt_token_ids is not None:
+                # --- OPTIMIZED FAST PREFIX COPY ---
+                last_list = getattr(self, "_last_prompt_token_ids_list", None)
+                last_idx = getattr(self, "_last_prompt_token_ids_index", None)
+                
+                l = len(request.prompt_token_ids)
+                diverge_idx = -1
+                
+                # Check for prefix sharing with the last added request
+                if last_list is not None and last_idx is not None and len(last_list) == l:
+                    diverge_idx = l - 1
+                    # If the divergence point is deeper than 16 tokens, it will give up and default to the slow path,
+                    # In vllm GR, usally the decode steps is not more than 5 tokens
+                    diverge_limit = 5
+                    while diverge_idx >= 0 and request.prompt_token_ids[diverge_idx] != last_list[diverge_idx]:
+                        diverge_idx -= 1
+                        if (l - 1) - diverge_idx > diverge_limit:
+                            diverge_idx = -1
+                            break
+                
+                if diverge_idx > 0:
+                    # Copy shared prefix efficiently from previously populated numpy row
+                    self.token_ids_cpu[req_index, :diverge_idx+1] = self.token_ids_cpu[last_idx, :diverge_idx+1]
+                    # Process the divergent tail
+                    if diverge_idx + 1 < l:
+                        self.token_ids_cpu[req_index, diverge_idx+1:l] = request.prompt_token_ids[diverge_idx+1:]
+                else:
+                    # Fallback to slow Python-to-NumPy conversion
+                    self.token_ids_cpu[req_index, :l] = request.prompt_token_ids
+                
+                self.is_token_ids[req_index, :l] = True
+                
+                # Cache this list state for the next sibling request
+                self._last_prompt_token_ids_list = request.prompt_token_ids
+                self._last_prompt_token_ids_index = req_index
+                # --- END OPTIMIZED ---
+            else:
+                self.is_token_ids[req_index, :num_prompt_tokens] = False
+                
+            if request.prompt_embeds is not None:
+                self.req_prompt_embeds[req_index] = request.prompt_embeds
+            self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
+            self.is_token_ids[req_index, start_idx:end_idx] = True
+            self.num_tokens_no_spec[req_index] = request.num_tokens
+
+            self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+            self.block_table.add_row(request.block_ids, req_index)
+
+            if sampling_params := request.sampling_params:
+                if sampling_params.sampling_type == SamplingType.GREEDY:
+                    self.temperature_cpu[req_index] = 0.0
+                    self.greedy_reqs.add(req_id)
+                else:
+                    self.temperature_cpu[req_index] = sampling_params.temperature
+                    self.random_reqs.add(req_id)
+
+                self.top_p_cpu[req_index] = sampling_params.top_p
+                if sampling_params.top_p < 1:
+                    self.top_p_reqs.add(req_id)
+                top_k = sampling_params.top_k
+                if 0 < top_k < self.vocab_size:
+                    self.top_k_reqs.add(req_id)
+                else:
+                    top_k = self.vocab_size
+                self.top_k_cpu[req_index] = top_k
+                self.frequency_penalties_cpu[req_index] = sampling_params.frequency_penalty
+                if sampling_params.frequency_penalty != 0.0:
+                    self.frequency_penalties_reqs.add(req_id)
+                self.presence_penalties_cpu[req_index] = sampling_params.presence_penalty
+                if sampling_params.presence_penalty != 0.0:
+                    self.presence_penalties_reqs.add(req_id)
+                self.repetition_penalties_cpu[req_index] = sampling_params.repetition_penalty
+                if sampling_params.repetition_penalty != 1.0:
+                    self.repetition_penalties_reqs.add(req_id)
+
+                if request.generator is not None:
+                    self.generators[req_index] = request.generator
+
+                if sampling_params.logprobs is not None:
+                    self.num_logprobs[req_id] = (
+                        self.vocab_size if sampling_params.logprobs == -1 else sampling_params.logprobs
+                    )
+
+                if sampling_params.allowed_token_ids:
+                    self.has_allowed_token_ids.add(req_id)
+                    if self.allowed_token_ids_mask_cpu_tensor is None:
+                        self.allowed_token_ids_mask = torch.zeros(self.max_num_reqs, self.vocab_size, dtype=torch.bool, device=self.device)
+                        self.allowed_token_ids_mask_cpu_tensor = torch.zeros(self.max_num_reqs, self.vocab_size, dtype=torch.bool, device="cpu")
+                    self.allowed_token_ids_mask_cpu_tensor[req_index] = True
+                    self.allowed_token_ids_mask_cpu_tensor[req_index][sampling_params.allowed_token_ids] = False
+
+                if sampling_params.bad_words_token_ids:
+                    self.bad_words_token_ids[req_index] = sampling_params.bad_words_token_ids
+            elif pooling_params := request.pooling_params:
+                pooling_states = request.pooling_states
+                assert pooling_states is not None
+                self.pooling_params[req_id] = pooling_params
+                self.pooling_states[req_id] = pooling_states
+                self.logits_processing_needs_token_ids[req_index] = pooling_params.requires_token_ids
+            else:
+                raise NotImplementedError("Unrecognized request type")
+
+            self.num_accepted_tokens_cpu[req_index] = 1
+
+            if request.lora_request:
+                lora_id = request.lora_request.lora_int_id
+                if lora_id not in self.lora_id_to_request_ids:
+                    self.lora_id_to_request_ids[lora_id] = set()
+                self.request_lora_mapping[req_index] = lora_id
+                self.lora_id_to_request_ids[lora_id].add(request.req_id)
+                self.lora_id_to_lora_request[lora_id] = request.lora_request
+            else:
+                self.request_lora_mapping[req_index] = 0
+            return req_index
+
+    InputBatch.add_request = patched_add_request
+    InputBatch._patched_for_fast_beam_add = True
     GPUModelRunner.execute_model = patched_execute_model
     GPUModelRunner._build_attention_metadata = patched_build_attention_metadata
-    GPUModelRunner._model_forward = patched_model_forward
-    GPUModelRunner._prepare_inputs = patched_prepare_inputs
     GPUModelRunner._patched_for_beam_groups = True
     logger.debug("GPUModelRunner patched for beam groups via ContextVar.")
