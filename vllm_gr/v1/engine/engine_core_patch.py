@@ -100,7 +100,7 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
     return all_groups
 
 
-def _apply_pbsc_routing(output, beam_groups: list, requests: dict, block_size: int) -> None:
+def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: dict, block_size: int) -> None:
     """Applies Partial-Block Shared Compute (PBSC) routing logic to the scheduled requests."""
 
     new_num_scheduled_tokens = {}
@@ -120,7 +120,6 @@ def _apply_pbsc_routing(output, beam_groups: list, requests: dict, block_size: i
    
     pbsc_shaped_groups = []
     
-    enable_pbsc = True
     
     for orig_t_prefix, group_req_ids in beam_groups:
         if not enable_pbsc:
@@ -466,6 +465,7 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
+        enable_pbsc = True
         # Cache for get_computed_blocks to optimize beam search
         computed_blocks_cache = {}
         last_key = None
@@ -530,7 +530,7 @@ def apply_scheduler_patch():
             beam_groups = _compute_beam_prefix_groups(
                 req_ids, self.requests, self.cache_config.block_size
             )
-            _apply_pbsc_routing(output, beam_groups, self.requests, self.cache_config.block_size)
+            _apply_pbsc_routing(enable_pbsc, output, beam_groups, self.requests, self.cache_config.block_size)
 
         return output
 
@@ -633,9 +633,9 @@ def apply_worker_patches():
                 # Check for prefix sharing with the last added request
                 if last_list is not None and last_idx is not None and len(last_list) == l:
                     diverge_idx = l - 1
-                    # If the divergence point is deeper than 16 tokens, it will give up and default to the slow path,
-                    # In vllm GR, usally the decode steps is not more than 5 tokens
-                    diverge_limit = 5
+                    # If the divergence point is deeper than 4 tokens, it will give up and default to the slow path,
+                    # In vllm GR, usally the decode steps is not more than a few tokens
+                    diverge_limit = 16
                     while diverge_idx >= 0 and request.prompt_token_ids[diverge_idx] != last_list[diverge_idx]:
                         diverge_idx -= 1
                         if (l - 1) - diverge_idx > diverge_limit:
