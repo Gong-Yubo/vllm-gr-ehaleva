@@ -455,6 +455,7 @@ def run_engine_core(*args, **kwargs):
 
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule with the cache computed blocks version."""
+    import torch
     from functools import wraps
     from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -465,13 +466,40 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
-        enable_pbsc = True
         # Cache for get_computed_blocks to optimize beam search
         computed_blocks_cache = {}
         last_key = None
         last_res = None
         block_size = self.cache_config.block_size
         _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
+        
+        # Evaluate once per scheduler instance based on actual model configs
+        if not hasattr(self, "_enable_pbsc"):
+            attn_backend = "NONE"
+
+            # 1. Check vllm_config for CLI arguments
+            if hasattr(self, "vllm_config"):
+                # Supports --attention-config.backend
+                if hasattr(self.vllm_config, "attention_config") and hasattr(self.vllm_config.attention_config, "backend"):
+                    attn_backend = getattr(self.vllm_config.attention_config, "backend")
+                # Supports --attention-backend (sometimes mapped directly to vllm_config or model_config)
+                if not attn_backend or "NONE" in str(attn_backend).upper():
+                    attn_backend = getattr(self.vllm_config, "attention_backend", "NONE")
+                if not attn_backend or "NONE" in str(attn_backend).upper():
+                    if hasattr(self.vllm_config, "model_config"):
+                        attn_backend = getattr(self.vllm_config.model_config, "attn_backend", "NONE")
+
+            # 2. Fallback to environment variables
+            if not attn_backend or "NONE" in str(attn_backend).upper():
+                try:
+                    from vllm.envs import VLLM_ATTENTION_BACKEND
+                    attn_backend = str(VLLM_ATTENTION_BACKEND)
+                except ImportError:
+                    import os
+                    attn_backend = os.environ.get("VLLM_ATTENTION_BACKEND", "NONE")
+                    
+            self._enable_pbsc = torch.cuda.is_available() and "CUSTOM" in str(attn_backend).upper()
+        enable_pbsc = self._enable_pbsc
 
         def get_cache_computed_blocks(req):
             # In some cases, the first beam must recompute all blocks if they were previously cleared.
@@ -626,21 +654,36 @@ def apply_worker_patches():
                 # --- OPTIMIZED FAST PREFIX COPY ---
                 last_list = getattr(self, "_last_prompt_token_ids_list", None)
                 last_idx = getattr(self, "_last_prompt_token_ids_index", None)
+                last_req_id = getattr(self, "_last_req_id", None)
+                last_priority = getattr(self, "_last_priority", None)
+                
+                curr_priority = getattr(request, "priority", None)
                 
                 l = len(request.prompt_token_ids)
                 diverge_idx = -1
                 
                 # Check for prefix sharing with the last added request
-                if last_list is not None and last_idx is not None and len(last_list) == l:
-                    diverge_idx = l - 1
-                    # If the divergence point is deeper than 4 tokens, it will give up and default to the slow path,
-                    # In vllm GR, usally the decode steps is not more than a few tokens
-                    diverge_limit = 16
-                    while diverge_idx >= 0 and request.prompt_token_ids[diverge_idx] != last_list[diverge_idx]:
-                        diverge_idx -= 1
-                        if (l - 1) - diverge_idx > diverge_limit:
-                            diverge_idx = -1
-                            break
+                if last_list is not None and last_idx is not None and last_req_id is not None and len(last_list) == l:
+                    is_same_beam_group = False
+                    
+                    if curr_priority is not None and last_priority is not None:
+                        is_same_beam_group = (curr_priority == last_priority)
+                    else:
+                        # Fallback heuristic
+                        if '-beam-' in req_id and '-beam-' in last_req_id:
+                            if req_id.rsplit('-beam-', 1)[0] == last_req_id.rsplit('-beam-', 1)[0]:
+                                is_same_beam_group = True
+                                
+                    if is_same_beam_group:
+                        diverge_idx = l - 1
+                        # If the divergence point is deeper than 4 tokens, it will give up and default to the slow path,
+                        # In vllm GR, usally the decode steps is not more than a few tokens
+                        diverge_limit = 16
+                        while diverge_idx >= 0 and request.prompt_token_ids[diverge_idx] != last_list[diverge_idx]:
+                            diverge_idx -= 1
+                            if (l - 1) - diverge_idx > diverge_limit:
+                                diverge_idx = -1
+                                break
                 
                 if diverge_idx > 0:
                     # Copy shared prefix efficiently from previously populated numpy row
@@ -657,6 +700,8 @@ def apply_worker_patches():
                 # Cache this list state for the next sibling request
                 self._last_prompt_token_ids_list = request.prompt_token_ids
                 self._last_prompt_token_ids_index = req_index
+                self._last_req_id = req_id
+                self._last_priority = curr_priority
                 # --- END OPTIMIZED ---
             else:
                 self.is_token_ids[req_index, :num_prompt_tokens] = False
