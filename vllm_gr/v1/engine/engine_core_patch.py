@@ -588,6 +588,13 @@ def apply_worker_patches():
         self._current_beam_prefix_groups_str = beam_groups
         self._current_pbsc_shaped_groups_str = pbsc_groups
 
+        # Clear fast prefix copy cache to prevent cross-step stale index usage
+        if hasattr(self, "input_batch"):
+            self.input_batch._last_prompt_token_ids_list = None
+            self.input_batch._last_prompt_token_ids_index = None
+            self.input_batch._last_req_id = None
+            self.input_batch._last_priority = None
+
         try:
             return _original_execute_model(self, scheduler_output, intermediate_tensors)
         finally:
@@ -705,6 +712,10 @@ def apply_worker_patches():
                 # --- END OPTIMIZED ---
             else:
                 self.is_token_ids[req_index, :num_prompt_tokens] = False
+                self._last_prompt_token_ids_list = None
+                self._last_prompt_token_ids_index = None
+                self._last_req_id = None
+                self._last_priority = None
                 
             if request.prompt_embeds is not None:
                 self.req_prompt_embeds[req_index] = request.prompt_embeds
