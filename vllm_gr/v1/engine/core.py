@@ -57,7 +57,7 @@ def _handle_beam_fork(self, fork_req) -> None:
                     fork_req.client_index,
                     EngineCoreOutputs(
                         engine_index=self.engine_index,
-                        finished_requests={child_id},
+                        finished_requests=[child_id],
                         outputs=[
                             EngineCoreOutput(
                                 request_id=child_id,

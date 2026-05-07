@@ -87,8 +87,10 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
             first_tokens = first_req._all_token_ids
             other_tokens = other_req._all_token_ids
 
-            while limit > pairwise_lcp and first_tokens[limit - 1] != other_tokens[limit - 1]:
-                limit -= 1
+            for i in range(pairwise_lcp, limit):
+                if first_tokens[i] != other_tokens[i]:
+                    limit = i
+                    break
             pairwise_lcp = limit
 
             lcp_tokens = min(lcp_tokens, pairwise_lcp)
@@ -177,18 +179,24 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
             # Leader computes its scheduled tokens (from t_cache_hit to num_tokens)
             leader_compute_len = leader_req.num_tokens - t_cache_hit
             new_num_scheduled_tokens[leader_id] = leader_compute_len
-            
+
+            # For children, the tokens from t_cache_hit to t_prefix are computed by the leader
+            # and will be broadcasted. So, children only need to compute tokens from t_prefix onwards.
+            tokens_reused_from_leader = t_prefix - t_cache_hit
+
             # Children compute everything after the token-aligned prefix (tail is broadcasted)
             for child_id in valid_children:
                 child_req = requests[child_id]
-                child_compute_len = child_req.num_tokens - t_prefix
-                new_num_scheduled_tokens[child_id] = child_compute_len
-                
-                # A child normally computes from its cache hit to its total length.
-                # With PBSC, it only computes from t_prefix to its total length.
+
+                # The number of tokens a child would normally compute.
                 normal_child_compute = child_req.num_tokens - t_cache_hit
-                pbsc_stats_tokens_saved += max(0, normal_child_compute - child_compute_len)
-                
+                # With PBSC, the child's computation is reduced by the number of tokens reused from the leader.
+                # This simplifies to: child_req.num_tokens - t_prefix
+                child_compute_len = normal_child_compute - tokens_reused_from_leader
+                new_num_scheduled_tokens[child_id] = child_compute_len
+
+                pbsc_stats_tokens_saved += max(0, tokens_reused_from_leader)
+
             pbsc_stats_groups_active += 1
             pbsc_stats_children_valid += len(valid_children)
 
@@ -234,6 +242,8 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
             
     if hasattr(output, "scheduled_cached_reqs"):
         req_data = output.scheduled_cached_reqs
+        if isinstance(req_data.num_computed_tokens, tuple):
+            req_data.num_computed_tokens = list(req_data.num_computed_tokens)
         for i, req_id in enumerate(req_data.req_ids):
             if req_id in child_prefix_map:
                 req_data.num_computed_tokens[i] = child_prefix_map[req_id]
@@ -662,8 +672,7 @@ def apply_worker_patches():
                 last_list = getattr(self, "_last_prompt_token_ids_list", None)
                 last_idx = getattr(self, "_last_prompt_token_ids_index", None)
                 last_req_id = getattr(self, "_last_req_id", None)
-                last_priority = getattr(self, "_last_priority", None)
-                
+                last_priority = getattr(self, "_last_priority", None)                
                 curr_priority = getattr(request, "priority", None)
                 
                 l = len(request.prompt_token_ids)
@@ -673,8 +682,8 @@ def apply_worker_patches():
                 if last_list is not None and last_idx is not None and last_req_id is not None and len(last_list) == l:
                     is_same_beam_group = False
                     
-                    if curr_priority is not None and last_priority is not None:
-                        is_same_beam_group = (curr_priority == last_priority)
+                    if curr_priority is not None and last_priority is not None and curr_priority == last_priority and curr_priority != 0:
+                        is_same_beam_group = True
                     else:
                         # Fallback heuristic
                         if '-beam-' in req_id and '-beam-' in last_req_id:
@@ -682,17 +691,24 @@ def apply_worker_patches():
                                 is_same_beam_group = True
                                 
                     if is_same_beam_group:
-                        diverge_idx = l - 1
-                        # If the divergence point is deeper than 4 tokens, it will give up and default to the slow path,
-                        # In vllm GR, usally the decode steps is not more than a few tokens
                         diverge_limit = 16
-                        while diverge_idx >= 0 and request.prompt_token_ids[diverge_idx] != last_list[diverge_idx]:
-                            diverge_idx -= 1
-                            if (l - 1) - diverge_idx > diverge_limit:
-                                diverge_idx = -1
-                                break
+                        start_check = max(0, l - diverge_limit)
+                        
+                        # Fast C-level slice comparison for the bulk of the shared prompt.
+                        # This safely guarantees the entire prefix matches and avoids false positives.
+                        if request.prompt_token_ids[:start_check] == last_list[:start_check]:
+                            diverge_idx = start_check - 1
+                            # Scan forward to find the exact first divergence point
+                            for i in range(start_check, l):
+                                if request.prompt_token_ids[i] == last_list[i]:
+                                    diverge_idx = i
+                                else:
+                                    break                           
+                        else:
+                            # They don't share the expected prefix, fallback to full copy
+                            diverge_idx = -1
                 
-                if diverge_idx > 0:
+                if diverge_idx >= 0:
                     # Copy shared prefix efficiently from previously populated numpy row
                     self.token_ids_cpu[req_index, :diverge_idx+1] = self.token_ids_cpu[last_idx, :diverge_idx+1]
                     # Process the divergent tail

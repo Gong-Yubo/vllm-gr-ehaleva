@@ -740,10 +740,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         # Read physical blocks for both leaders and children simultaneously
         leader_blocks = common_meta.block_table_tensor[leaders_tensor, block_indices]
-        pbsc_src_slots = leader_blocks * self.block_size + block_offsets
+        pbsc_src_slots = (leader_blocks * self.block_size + block_offsets).to(torch.int64)
 
         child_blocks = common_meta.block_table_tensor[children_tensor, block_indices]
-        pbsc_dst_slots = child_blocks * self.block_size + block_offsets
+        pbsc_dst_slots = (child_blocks * self.block_size + block_offsets).to(torch.int64)
         
         return pbsc_src_slots, pbsc_dst_slots
 
@@ -1153,20 +1153,6 @@ class BeamAttentionImpl(AttentionImpl):
             if getattr(attn_metadata, "pbsc_src_slots", None) is not None:
                 src_slots = attn_metadata.pbsc_src_slots
                 dst_slots = attn_metadata.pbsc_dst_slots
-                # n_slots = attn_metadata.pbsc_num_slots
-                
-                # n_elements_per_slot = self.num_kv_heads * self.head_size
-                # k_flat = key_cache.view(-1, n_elements_per_slot)
-                # v_flat = value_cache.view(-1, n_elements_per_slot)
-                
-                # BLOCK_ELEMENTS = 256
-                # grid = (n_slots, triton.cdiv(n_elements_per_slot, BLOCK_ELEMENTS))
-                
-                # _pbsc_kv_copy_kernel[grid](
-                #     k_flat, v_flat, src_slots, dst_slots,
-                #     k_flat.stride(0), n_slots, n_elements_per_slot,
-                #     BLOCK_ELEMENTS=BLOCK_ELEMENTS
-                # )
                 
                 k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
                 v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
