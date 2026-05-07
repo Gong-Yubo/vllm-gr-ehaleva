@@ -72,3 +72,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+
+[tool.typos.default.extend-identifiers]
+CANN = "CANN"
+cann = "cann"
