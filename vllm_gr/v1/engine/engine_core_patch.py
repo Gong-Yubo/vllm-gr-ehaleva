@@ -133,7 +133,8 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
         cache_hit_groups = {}
         for req_id in group_req_ids:
             req = requests[req_id]
-            cache_hit = req.num_tokens - output.num_scheduled_tokens[req_id]
+            # Use actual computed tokens to correctly handle chunked prefill
+            cache_hit = getattr(req, "num_computed_tokens", 0)
             # If the request already has the entire shared prefix in cache,
             # it doesn't need PBSC tail sharing.
             if cache_hit >= orig_t_prefix:
@@ -149,19 +150,24 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
             if len(sub_group_req_ids) <= 1:
                 continue
 
-            t_prefix = orig_t_prefix
             leader_id = sub_group_req_ids[0]
             leader_req = requests[leader_id]
             valid_children = sub_group_req_ids[1:]
+
+            # Safely cap t_prefix to what is actually scheduled/allocated this step to avoid OOB Seg Faults
+            min_scheduled = output.num_scheduled_tokens[leader_id]
+            for child_id in valid_children:
+                min_scheduled = min(min_scheduled, output.num_scheduled_tokens[child_id])
+            t_prefix = min(orig_t_prefix, t_cache_hit + min_scheduled)
 
             # If the cache hit missed full blocks we thought were shared,
             # restrict the sharing to what is actually cached.
             if t_block_aligned > t_cache_hit:
                 t_prefix = min(t_prefix, t_cache_hit)
                 
-            if t_prefix == 0:
+            if t_prefix <= t_cache_hit:
                 drop_no_prefix += len(valid_children)
-                logger.debug("[PBSC debug] Subgroup skipped: t_prefix became 0 (orig_t_prefix=%d, t_cache_hit=%d)", orig_t_prefix, t_cache_hit)
+                logger.debug("[PBSC debug] Subgroup skipped: t_prefix became <= t_cache_hit (orig_t_prefix=%d, t_cache_hit=%d)", orig_t_prefix, t_cache_hit)
                 continue
 
             # PBSC Safety Check: Active tail sharing is only for highly overlapping beams.
@@ -176,26 +182,19 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
             pbsc_stats_groups_total += 1
             pbsc_stats_children_total += len(valid_children)
             
-            # Leader computes its scheduled tokens (from t_cache_hit to num_tokens)
-            leader_compute_len = leader_req.num_tokens - t_cache_hit
-            new_num_scheduled_tokens[leader_id] = leader_compute_len
+            # Leader computes exactly what the scheduler told it to (respects chunking)
+            leader_scheduled = output.num_scheduled_tokens[leader_id]
+            new_num_scheduled_tokens[leader_id] = leader_scheduled
 
-            # For children, the tokens from t_cache_hit to t_prefix are computed by the leader
-            # and will be broadcasted. So, children only need to compute tokens from t_prefix onwards.
             tokens_reused_from_leader = t_prefix - t_cache_hit
 
             # Children compute everything after the token-aligned prefix (tail is broadcasted)
             for child_id in valid_children:
-                child_req = requests[child_id]
-
-                # The number of tokens a child would normally compute.
-                normal_child_compute = child_req.num_tokens - t_cache_hit
-                # With PBSC, the child's computation is reduced by the number of tokens reused from the leader.
-                # This simplifies to: child_req.num_tokens - t_prefix
-                child_compute_len = normal_child_compute - tokens_reused_from_leader
+                child_scheduled = output.num_scheduled_tokens[child_id]
+                child_compute_len = max(0, child_scheduled - tokens_reused_from_leader)
                 new_num_scheduled_tokens[child_id] = child_compute_len
 
-                pbsc_stats_tokens_saved += max(0, tokens_reused_from_leader)
+                pbsc_stats_tokens_saved += max(0, child_scheduled - child_compute_len)
 
             pbsc_stats_groups_active += 1
             pbsc_stats_children_valid += len(valid_children)
