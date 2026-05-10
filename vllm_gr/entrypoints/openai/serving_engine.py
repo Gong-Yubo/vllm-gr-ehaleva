@@ -352,6 +352,18 @@ async def beam_search(
 
             # check for error finish reason and abort beam search
             if result.outputs[0].finish_reason == "error":
+                # Clean up beam cache before returning to avoid leak.
+                if use_beam_fork and prev_beam_internal_ids:
+                    await self.engine_client.beam_fork(
+                        BeamForkRequest(
+                            parent_ids=[],
+                            child_ids=[],
+                            token_ids=[],
+                            abort_ids=prev_beam_internal_ids,
+                            sampling_params=beam_search_params,
+                            data_parallel_rank=rank,
+                        )
+                    )
                 # yield error output and terminate beam search
                 yield RequestOutput(
                     request_id=request_id,

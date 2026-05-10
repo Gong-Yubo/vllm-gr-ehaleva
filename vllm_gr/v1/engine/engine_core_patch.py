@@ -55,12 +55,8 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
 
     # Group requests by beam group id (priority)
     beam_groups: dict[int, list[str]] = {}
-    cnt = 0
     for req_id in req_ids:
         priority = requests[req_id].priority
-        if priority == 0:
-            priority = cnt
-            cnt += 1
         if priority not in beam_groups:
             beam_groups[priority] = []
         beam_groups[priority].append(req_id)
@@ -135,18 +131,12 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
         t_block_aligned = (orig_t_prefix // block_size) * block_size
         # 2. Sub-group by exact cache_hit for PBSC tensor shaping
         cache_hit_groups = {}
-        cnt = 0
         for req_id in group_req_ids:
             req = requests[req_id]
             # vLLM updates req.num_computed_tokens during schedule(). 
             # By subtracting the schedule, we get the exact number of tokens 
-            # that were in the KV cache BEFORE this step, preventing OOB errors.
             cache_hit = req.num_computed_tokens - output.num_scheduled_tokens[req_id]
-            # cache_hit = cache_hit // block_size * block_size
-            if(cnt % 128 == 0):
-                print(f"token num = {req.num_tokens} req.num_computed_tokens {req.num_computed_tokens}, output.num_scheduled_tokens[req_id]={output.num_scheduled_tokens[req_id]}")                
-                print(f"CACH HIT {cache_hit}, orig_t_prefix={orig_t_prefix}, req_id={req_id}")
-            cnt += 1
+           
             # If the request already has the entire shared prefix in cache,
             # it doesn't need PBSC tail sharing.
             if cache_hit >= orig_t_prefix:
