@@ -1029,15 +1029,17 @@ class TestBeamSearchOrchestration:
         ec.prepare_request.return_value = (mock_queue, mock_ec_req)
         ec._add_requests_batch = AsyncMock()
 
-        # Step 0 output with logprobs.
-        from vllm.logprobs import Logprob
+        # Step 0 output with logprobs (FlatLogprobs format).
+        from vllm.logprobs import FlatLogprobs
 
+        step0_lp = FlatLogprobs()
+        step0_lp.append_fast([50], [-0.5], [None], [None])
         step0_output = MagicMock()
         step0_output.finished = True
         step0_output.outputs = [
             MagicMock(
                 finish_reason="length",
-                logprobs=[{50: Logprob(logprob=-0.5)}],
+                logprobs=step0_lp,
             )
         ]
         mock_queue.get = AsyncMock(return_value=step0_output)
@@ -1246,6 +1248,64 @@ class TestBeamSearchOrchestration:
         assert best_beams[2].cum_logprob == pytest.approx(-2.0)
 
     # 5.20
+    def test_error_early_return_cleans_beam_cache(self) -> None:
+        """When a beam result has finish_reason='error', the error path
+        should send a cleanup beam_fork with abort_ids before returning."""
+        from vllm.logprobs import FlatLogprobs
+
+        from vllm_gr.entrypoints.openai.serving_engine import beam_search
+
+        mock_self = _make_serving_self(has_prepare_request=True, has_beam_fork=True)
+        ec = mock_self.engine_client
+
+        # Step 0: prepare_request → ADD_BATCH, produces 1 beam.
+        mock_queue = MagicMock()
+        mock_ec_req = MagicMock()
+        mock_ec_req.request_id = "batch-0-beam-0"
+        ec.prepare_request.return_value = (mock_queue, mock_ec_req)
+        ec._add_requests_batch = AsyncMock()
+
+        step0_lp = FlatLogprobs()
+        step0_lp.append_fast([50], [-0.5], [None], [None])
+        step0_output = MagicMock()
+        step0_output.finished = True
+        step0_output.outputs = [
+            MagicMock(
+                finish_reason="length",
+                logprobs=step0_lp,
+            )
+        ]
+        mock_queue.get = AsyncMock(return_value=step0_output)
+
+        # Step 1: beam_fork returns error → should trigger cleanup.
+        fork_queue = MagicMock()
+        ec.register_beam_output.return_value = fork_queue
+        ec.beam_fork = AsyncMock()
+
+        step1_output = MagicMock()
+        step1_output.finished = True
+        step1_output.outputs = [MagicMock(finish_reason="error", logprobs=None)]
+        fork_queue.get = AsyncMock(return_value=step1_output)
+
+        prompt = {"prompt_token_ids": [10, 20]}
+        params = _make_beam_search_params(beam_width=1, max_tokens=2)
+
+        results = asyncio.run(_collect_beam_search(beam_search(mock_self, prompt, "req-1", params)))
+
+        # Should yield exactly one error RequestOutput.
+        assert len(results) == 1
+        assert results[0].outputs[0].finish_reason == "error"
+
+        # beam_fork should have been called twice: once for the BEAM_FORK
+        # step itself and once for the error-path cleanup.
+        assert ec.beam_fork.await_count == 2
+        cleanup_call = ec.beam_fork.call_args_list[-1]
+        cleanup_req = cleanup_call.args[0]
+        assert cleanup_req.parent_ids == []
+        assert cleanup_req.child_ids == []
+        assert len(cleanup_req.abort_ids) > 0
+
+    # 5.21
     def test_eos_stripped_from_text(self) -> None:
         """When best beam ends with EOS and ignore_eos=False, EOS should be
         stripped before decoding."""
