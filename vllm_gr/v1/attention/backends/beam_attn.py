@@ -24,7 +24,6 @@ from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
-from vllm.v1.attention.backends.flash_attn import _get_sliding_window_configs
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
@@ -316,7 +315,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
         self.max_num_splits = 0  # No upper bound on the number of splits.
-        self.aot_schedule = get_flash_attn_version() == 3
+        self.aot_schedule = False
 
         self.cp_kv_cache_interleave_size = self.parallel_config.cp_kv_cache_interleave_size
 
@@ -382,14 +381,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self.aot_schedule = self.aot_schedule and not fast_build
         if self.aot_sliding_window is None:
             self.aot_sliding_window = (-1, -1)
-            if self.aot_schedule:
-                sliding_window_configs = _get_sliding_window_configs(self.vllm_config)
-                if len(sliding_window_configs) == 1:
-                    sliding_window_config = sliding_window_configs.pop()
-                    if sliding_window_config is not None:
-                        self.aot_sliding_window = sliding_window_config
-                elif len(sliding_window_configs) > 1:
-                    self.aot_schedule = False
 
     def _get_max_num_splits(self, num_actual_tokens: int) -> int:
         """Determines the maximum number of splits for Cuda Graph."""
