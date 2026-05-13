@@ -70,7 +70,7 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
 
         # Find the longest common prefix (LCP) for the group.
         first_req = requests[group_req_ids[0]]
-        lcp_tokens = first_req.num_tokens
+        lcp_tokens = first_req.num_computed_tokens
         prev_num_common_blocks = 0
         for i in range(1, len(group_req_ids)):
             other_req = requests[group_req_ids[i]]
@@ -81,8 +81,8 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
 
 
             # Refine to token-level LCP by checking inside the first differing block
-            pairwise_lcp = num_common_blocks * block_size
-            limit = min(lcp_tokens, other_req.num_tokens)
+            pairwise_lcp = min(num_common_blocks * block_size, other_req.num_computed_tokens)
+            limit = min(lcp_tokens, other_req.num_computed_tokens)
 
             first_tokens = first_req._all_token_ids
             other_tokens = other_req._all_token_ids
@@ -175,7 +175,7 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
 
             # PBSC Safety Check: Active tail sharing is only for highly overlapping beams.
             # If the unshared part is large, these are likely unrelated requests.
-            child_compute_len_estimate = leader_req.num_tokens - t_prefix
+            child_compute_len_estimate = leader_req.num_computed_tokens - t_prefix
             if child_compute_len_estimate > block_size:
                 drop_tail_too_long += len(valid_children)
                 logger.debug("[PBSC debug] Subgroup skipped: tail too long (unshared=%d > block_size=%d)", child_compute_len_estimate, block_size)
@@ -242,7 +242,7 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
         if req_data.req_id in child_prefix_map:
             req_data.num_computed_tokens = child_prefix_map[req_data.req_id]
             
-    if hasattr(output, "scheduled_cached_reqs"):
+    if getattr(output, "scheduled_cached_reqs", None) is not None:
         req_data = output.scheduled_cached_reqs
         if isinstance(req_data.num_computed_tokens, tuple):
             req_data.num_computed_tokens = list(req_data.num_computed_tokens)
