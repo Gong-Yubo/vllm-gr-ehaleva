@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Pre-commit hook to prevent new pickle/cloudpickle imports.
 
@@ -7,9 +9,10 @@ and fails if any are found, as pickle can execute arbitrary code and is
 a security risk.
 """
 
-import re
 import sys
 from pathlib import Path
+
+import regex as re
 
 # Patterns to match pickle/cloudpickle imports
 PICKLE_PATTERNS = [

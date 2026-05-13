@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Graph Reuse Attention (Beam Attn) - Optimized attention with shared KV cache buffer separation."""
 
+import contextvars
 import copy
 import contextvars
 from dataclasses import dataclass
@@ -24,7 +25,6 @@ from vllm.v1.attention.backends.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
-from vllm.v1.attention.backends.flash_attn import _get_sliding_window_configs
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
@@ -319,7 +319,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
         self.max_num_splits = 0  # No upper bound on the number of splits.
-        self.aot_schedule = get_flash_attn_version() == 3
+        self.aot_schedule = False
 
         self.cp_kv_cache_interleave_size = self.parallel_config.cp_kv_cache_interleave_size
 
@@ -362,8 +362,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         beam_prefix_groups = BEAM_PREFIX_GROUPS_VAR.get()
 
         if beam_prefix_groups is None:
-            meta = self._build_standard_metadata(common_attn_metadata, max_num_splits)
-            return meta
+            return self._build_standard_metadata(common_attn_metadata, max_num_splits)
 
         common_prefix_groups = beam_prefix_groups
         # 3. Filter groups that have actual shared blocks
@@ -377,25 +376,15 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         # 5. Build Metadata (Shared vs Standard)
         if not shared_groups:
-            meta = self._build_standard_metadata(common_attn_metadata, max_num_splits)
-            return meta
+            return self._build_standard_metadata(common_attn_metadata, max_num_splits)
 
-        meta = self._build_shared_metadata(common_attn_metadata, shared_groups, max_num_splits)
-        return meta
+        return self._build_shared_metadata(common_attn_metadata, shared_groups, max_num_splits)
 
     def _update_aot_schedule(self, fast_build: bool):
         """Updates AOT schedule flags and sliding window configs."""
         self.aot_schedule = self.aot_schedule and not fast_build
         if self.aot_sliding_window is None:
             self.aot_sliding_window = (-1, -1)
-            if self.aot_schedule:
-                sliding_window_configs = _get_sliding_window_configs(self.vllm_config)
-                if len(sliding_window_configs) == 1:
-                    sliding_window_config = sliding_window_configs.pop()
-                    if sliding_window_config is not None:
-                        self.aot_sliding_window = sliding_window_config
-                elif len(sliding_window_configs) > 1:
-                    self.aot_schedule = False
 
     def _get_max_num_splits(self, num_actual_tokens: int) -> int:
         """Determines the maximum number of splits for Cuda Graph."""
@@ -536,7 +525,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             suffix_query_max_len,
             suffix_kv_max_len,
             suffix_col_indices,
-        ) = self._create_suffix_metadata(common_meta, shift_amounts, shift_amounts_cpu)        
+        ) = self._create_suffix_metadata(common_meta, shift_amounts, shift_amounts_cpu)
 
         # 3. Create Schedulers
         prefix_scheduler_metadata = self._get_schedule(
@@ -626,7 +615,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         starts_cpu = common_meta.query_start_loc_cpu[flat_req_ids_tensor_cpu]
         ends_cpu = common_meta.query_start_loc_cpu[flat_req_ids_tensor_cpu + 1]
         lengths_cpu = ends_cpu - starts_cpu
-        
         cumsum_lengths_cpu = torch.zeros(lengths_cpu.numel() + 1, dtype=torch.long)
         torch.cumsum(lengths_cpu, dim=0, out=cumsum_lengths_cpu[1:])
 
@@ -759,7 +747,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             common_meta.seq_lens - (shift_amounts * self.block_size), min=0
         )
 
-        seq_lens_cpu = getattr(common_meta, "_seq_lens_cpu", None)
+        # Try to get the CPU-side sequence lengths for optimization.
+        # This is a private attribute and may change in upstream vLLM.
+        has_cpu_lens = hasattr(common_meta, "_seq_lens_cpu")
+        seq_lens_cpu = common_meta._seq_lens_cpu if has_cpu_lens else None
+
         if seq_lens_cpu is not None:
             # Calculate suffix KV lengths on CPU (used for max length without sync)
             suffix_kv_lens_cpu = torch.clamp(
@@ -770,6 +762,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             )
         else:
             # Fallback to GPU tensor (will cause a host-device sync)
+            if not has_cpu_lens:
+                logger.warning(
+                    "The private attribute '_seq_lens_cpu' is not available in "
+                    "CommonAttentionMetadata. Falling back to a GPU-synchronized path, "
+                    "which may impact performance."
+                )
             suffix_kv_max_len = (
                 int(suffix_kv_lens.max().item()) if suffix_kv_lens.numel() > 0 else 0
             )

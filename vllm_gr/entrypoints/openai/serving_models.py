@@ -33,7 +33,7 @@ class Catalog:
             token_ids = self.tokenizer.convert_tokens_to_ids(seq)
             node = self.trie
             for i, token_id in enumerate(token_ids):
-                if token_id < 0:
+                if token_id is None:
                     raise ValueError(f"Invalid token ID: {seq[i]} at index {i}")
                 if token_id not in node:
                     node[token_id] = {}

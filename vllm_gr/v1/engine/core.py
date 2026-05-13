@@ -10,7 +10,12 @@ from functools import partial
 from typing import Any
 
 from vllm.logger import init_logger
-from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequestType, FinishReason
+from vllm.v1.engine import (
+    EngineCoreOutput,
+    EngineCoreOutputs,
+    EngineCoreRequestType,
+    FinishReason,
+)
 
 logger = init_logger(__name__)
 

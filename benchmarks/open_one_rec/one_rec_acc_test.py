@@ -31,7 +31,7 @@ def get_sampling_params(gen_config: Dict[str, Any]) -> SamplingParams:
     """
     # Extract standard vLLM parameters
     n = gen_config.get("num_return_sequences", 1)
-    max_tokens = gen_config.get("max_new_tokens", 16)
+    max_tokens = gen_config.get("max_new_tokens", 5)
     temperature = gen_config.get("temperature", 1.0)
     top_p = gen_config.get("top_p", 1.0)
     top_k = gen_config.get("top_k", -1)

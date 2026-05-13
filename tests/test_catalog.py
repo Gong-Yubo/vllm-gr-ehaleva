@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import json
 import os
 import tempfile
@@ -8,11 +10,11 @@ import pytest
 from vllm_gr.entrypoints.openai.serving_models import Catalog
 
 
-@pytest.fixture
-def mock_tokenizer():
+@pytest.fixture  # type: ignore
+def mock_tokenizer() -> MagicMock:
     tokenizer = MagicMock()
 
-    def convert_tokens_to_ids(seq):
+    def convert_tokens_to_ids(seq: list[str]) -> list[int] | int:
         # Mock behavior: convert string tokens to integers
         # Assuming seq is a list of strings like ["1", "2"]
         if isinstance(seq, list):
@@ -24,7 +26,7 @@ def mock_tokenizer():
     return tokenizer
 
 
-def test_catalog_functionality(mock_tokenizer):
+def test_catalog_functionality(mock_tokenizer: MagicMock) -> None:
     # Define catalog data
     # 3 sequences:
     # [1, 2, 3, 4, 5]

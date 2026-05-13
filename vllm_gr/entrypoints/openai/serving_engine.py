@@ -10,15 +10,32 @@ from vllm.beam_search import BeamSearchSequence
 from vllm.entrypoints.openai.protocol import VLLMValidationError
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
-from vllm.logprobs import Logprob
+from vllm.logger import init_logger
+from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MultiModalDataDict
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 
+from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
 from vllm_gr.v1.engine.types import BeamForkRequest
 from vllm_gr.v1.metrics.stats import RequestStateStats
+
+logger = init_logger(__name__)
+
+_dp_rank_counter = 0
+_dp_rank_lock = asyncio.Lock()
+
+
+# return rank for next beam search request in a round-robin manner across the data parallel ranks
+async def _next_data_parallel_rank(data_parallel_size: int) -> int:
+    global _dp_rank_counter
+
+    async with _dp_rank_lock:
+        rank = _dp_rank_counter % data_parallel_size
+        _dp_rank_counter += 1
+        return rank
 
 
 async def _collect_beam_result(q):
@@ -46,6 +63,7 @@ async def _beam_fork_step(
     lora_request,
     trace_headers,
     priority=0,
+    data_parallel_rank: int | None = None,
 ):
     """BEAM_FORK path: fork parent beams into children (steps 1+).
 
@@ -71,6 +89,7 @@ async def _beam_fork_step(
             lora_request=lora_request,
             trace_headers=trace_headers,
             priority=priority,
+            data_parallel_rank=data_parallel_rank,
         )
         queues.append(q)
 
@@ -87,6 +106,7 @@ async def _beam_fork_step(
             eos_token_id=eos_token_id,
             lora_request=lora_request,
             trace_headers=trace_headers,
+            data_parallel_rank=data_parallel_rank,
             priority=priority,
         )
     )
@@ -104,6 +124,7 @@ async def _add_batch_step(
     use_beam_fork,
     trace_headers,
     priority=0,
+    data_parallel_rank: int | None = None,
 ):
     """ADD_BATCH path: prepare and batch-send requests (step 0).
 
@@ -120,6 +141,7 @@ async def _add_batch_step(
             lora_request=lora_req,
             trace_headers=trace_headers,
             priority=priority,
+            data_parallel_rank=data_parallel_rank,
         )
         queues.append(q)
         engine_core_requests.append(ec_req)
@@ -152,6 +174,18 @@ async def beam_search(
     # (the prefill timestamp), so the scheduler will treat them as a group with equal priority
     MICROSECONDS = 1000000
     priority = int(time.perf_counter() * MICROSECONDS)  # us granularity
+    rank = None
+    if (
+        hasattr(self.engine_client, "vllm_config")
+        and self.engine_client.vllm_config.parallel_config is not None
+    ):
+        data_parallel_size = self.engine_client.vllm_config.parallel_config.data_parallel_size
+        if data_parallel_size is not None and data_parallel_size > 1:
+            # In DP mode, we assign ranks to beam search requests in a round-robin manner.
+            rank = await _next_data_parallel_rank(data_parallel_size)
+            logger.debug(
+                f"rank for beam search: {rank} out of data_parallel_size: {data_parallel_size}"
+            )
 
     include_stop_str_in_output = params.include_stop_str_in_output
     if beam_width == 0:
@@ -217,13 +251,23 @@ async def beam_search(
 
     logprobs_num = beam_width
     beam_search_params = SamplingParams(
-        logprobs=logprobs_num, max_tokens=1, temperature=temperature, detokenize=False
+        logprobs=logprobs_num,
+        max_tokens=1,
+        temperature=temperature,
+        detokenize=False,
+        flat_logprobs=True,
     )
     initial_tokens = list(prompt_token_ids)
-    initial_logprobs = []
+    # NOTE: FlatLogprobs intentionally passed where BeamSearchSequence
+    # expects list[dict[int, Logprob]].  Intermediate logprobs are never
+    # read as dicts; the final beam.logprobs is replaced during
+    # reconstruction at the end.
+    # This reference is shared read-only across all beams — do not mutate
+    # after the initial append below.
+    initial_logprobs = FlatLogprobs()
     if sid_begin_token_id is not None:
         initial_tokens.append(sid_begin_token_id)
-        initial_logprobs.append({sid_begin_token_id: Logprob(logprob=0.0)})
+        initial_logprobs.append_fast([sid_begin_token_id], [0.0], [None], [None])
 
     all_beams = [
         BeamSearchSequence(
@@ -235,6 +279,14 @@ async def beam_search(
             lora_request=lora_request,
         )
     ]
+    # Deferred logprobs: instead of copying 6 FlatLogprobs lists per beam
+    # per step (O(beams * steps^2)), store parent pointers and reconstruct
+    # only for the final best beams at the end.
+    # These dynamic attrs live on BeamSearchSequence (a plain @dataclass
+    # without __slots__).  If upstream adds __slots__, these will break —
+    # upstream the fields if that happens.
+    all_beams[0]._lp_parent = None
+    all_beams[0]._lp_step_data = None
     completed = []
 
     beam_search_start: int = time.perf_counter()
@@ -314,6 +366,7 @@ async def beam_search(
                 lora_request,
                 trace_headers,
                 priority=priority,
+                data_parallel_rank=rank,
             )
         elif use_batch:
             output, new_ids = await _add_batch_step(
@@ -325,6 +378,7 @@ async def beam_search(
                 use_beam_fork,
                 trace_headers,
                 priority=priority,
+                data_parallel_rank=rank,
             )
             if new_ids:
                 prev_beam_internal_ids = new_ids
@@ -346,6 +400,9 @@ async def beam_search(
         # Store the cumulative probability of all tokens
         # generated by beam search
         all_beams_logprob = []
+        # Per-beam flat data cache: (token_ids, logprobs, ranks, decoded_tokens)
+        # Used to build logprobs_entry dicts without calling FlatLogprobs.__getitem__
+        beam_flat_cache: list[tuple | None] = []
         # Iterate through all beam inference results
         for i, result in enumerate(output):
             current_beam = all_beams[i]
@@ -385,18 +442,21 @@ async def beam_search(
                 return
 
             if result.outputs[0].logprobs is not None:
-                logprobs = result.outputs[0].logprobs[0]
-                if len(logprobs) > logprobs_num:
-                    logprobs = dict(list(logprobs.items())[:logprobs_num])
+                flat = result.outputs[0].logprobs
+                token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = (
+                    extract_and_dedup_flat_logprobs(flat, logprobs_num)
+                )
                 if self.models.catalog is not None and catalog_task:
                     valid_tokens_set = valid_tokens_sets[i]
-                    for token_id in list(logprobs.keys()):
-                        if token_id not in valid_tokens_set:
-                            logprobs[token_id].logprob = -float("inf")
-                all_beams_token_id.extend(list(logprobs.keys()))
-                all_beams_logprob.extend(
-                    [current_beam.cum_logprob + obj.logprob for obj in logprobs.values()]
-                )
+                    logprobs_pos = [
+                        lp if tid in valid_tokens_set else -float("inf")
+                        for tid, lp in zip(token_ids_pos, logprobs_pos)
+                    ]
+                beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
+                all_beams_token_id.extend(token_ids_pos)
+                all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
+            else:
+                beam_flat_cache.append(None)
 
         # Handle the token for the end of sentence (EOS)
         all_beams_token_id = np.array(all_beams_token_id)
@@ -407,20 +467,20 @@ async def beam_search(
             eos_idx = np.where(all_beams_token_id == eos_token_id)[0]
             for idx in eos_idx:
                 current_beam = all_beams[idx // logprobs_num]
-                result = output[idx // logprobs_num]
-                assert result.outputs[0].logprobs is not None
-                logprobs_entry = result.outputs[0].logprobs[0]
-                completed.append(
-                    BeamSearchSequence(
-                        tokens=current_beam.tokens + [eos_token_id]
-                        if include_stop_str_in_output
-                        else current_beam.tokens,
-                        logprobs=current_beam.logprobs + [logprobs_entry],
-                        cum_logprob=float(all_beams_logprob[idx]),
-                        finish_reason="stop",
-                        stop_reason=eos_token_id,
-                    )
+                cached = beam_flat_cache[idx // logprobs_num]
+                assert cached is not None
+                eos_beam = BeamSearchSequence(
+                    tokens=current_beam.tokens + [eos_token_id]
+                    if include_stop_str_in_output
+                    else current_beam.tokens,
+                    logprobs=initial_logprobs,
+                    cum_logprob=float(all_beams_logprob[idx]),
+                    finish_reason="stop",
+                    stop_reason=eos_token_id,
                 )
+                eos_beam._lp_parent = current_beam
+                eos_beam._lp_step_data = cached
+                completed.append(eos_beam)
             # After processing, set the log probability of the eos condition
             # to negative infinity.
             all_beams_logprob[eos_idx] = -np.inf
@@ -434,20 +494,20 @@ async def beam_search(
 
         for idx in topn_idx:
             current_beam = all_beams[idx // logprobs_num]
-            result = output[idx // logprobs_num]
             token_id = int(all_beams_token_id[idx])
-            assert result.outputs[0].logprobs is not None
-            logprobs_entry = result.outputs[0].logprobs[0]
-            new_beams.append(
-                BeamSearchSequence(
-                    tokens=current_beam.tokens + [token_id],
-                    logprobs=current_beam.logprobs + [logprobs_entry],
-                    lora_request=current_beam.lora_request,
-                    cum_logprob=float(all_beams_logprob[idx]),
-                    multi_modal_data=current_beam.multi_modal_data,
-                    mm_processor_kwargs=current_beam.mm_processor_kwargs,
-                )
+            cached = beam_flat_cache[idx // logprobs_num]
+            assert cached is not None
+            new_beam = BeamSearchSequence(
+                tokens=current_beam.tokens + [token_id],
+                logprobs=initial_logprobs,
+                lora_request=current_beam.lora_request,
+                cum_logprob=float(all_beams_logprob[idx]),
+                multi_modal_data=current_beam.multi_modal_data,
+                mm_processor_kwargs=current_beam.mm_processor_kwargs,
             )
+            new_beam._lp_parent = current_beam
+            new_beam._lp_step_data = cached
+            new_beams.append(new_beam)
 
         # Build fork_info for next iteration's BEAM_FORK.
         if use_beam_fork:
@@ -464,16 +524,22 @@ async def beam_search(
                 token_ids=[],
                 abort_ids=prev_beam_internal_ids,
                 sampling_params=beam_search_params,
+                data_parallel_rank=rank,
             )
         )
 
     if sid_end_token_id is not None:
         for beam in all_beams:
             beam.tokens.append(sid_end_token_id)
-            beam.logprobs.append({sid_end_token_id: Logprob(logprob=0.0)})
     completed.extend(all_beams)
     sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
     best_beams = sorted_completed[:beam_width]
+
+    # Reconstruct full logprobs only for the final best beams by walking
+    # the parent-pointer tree.  This replaces the O(beams * steps^2)
+    # per-step copying with a single O(beams * steps) pass at the end.
+    for beam in best_beams:
+        reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
 
     for beam in best_beams:
         if beam.tokens[-1] == eos_token_id and not ignore_eos:

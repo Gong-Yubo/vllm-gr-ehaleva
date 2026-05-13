@@ -20,14 +20,17 @@ python offline_beam_search.py \
 ```
 
 Key arguments:
+
 - `--model`: Name or path of the model to load (required).
 - `--beam_width`: Beam width used during beam search (default: 128).
 - `--compare`: Comparison mode against vanilla vLLM. Options: none, latency, output, both (default: none).
 
-# Expected result
+## Expected result
+
 The script prints the latency of running the predefined input through vllm-gr, and—if comparison is enabled—also reports the latency of vanilla vLLM.
 
 Example:
+
 ```bash
 python offline_beam_search.py --model OpenOneRec/OneRec-1.7B --compare latency
 ...

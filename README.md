@@ -1,7 +1,6 @@
-<!-- markdownlint-disable-next-line MD033 -->
-<p align="center">
+<h1 align="center">
   <img src="docs/assets/vLLM-GR.png" alt="vLLM-GR">
-</p>
+</h1>
 
 <h3 align="center">
 Efficient Generative Recommendation Serving
@@ -33,6 +32,15 @@ vLLM-GR addresses these challenges by introducing:
 
 All features are designed to be **opt-in**, preserving vLLM’s general-purpose behavior when GR is disabled.
 
+## Supported Hardware
+
+vLLM-GR runs on **NVIDIA GPUs** as well as **Huawei Ascend NPUs**.
+
+| Backend | Notes |
+| --- | --- |
+| NVIDIA GPU | Relies on CUDA 12+ |
+| Huawei Ascend NPU | Supported via the CANN runtime |
+
 ## Getting Started
 
 Install vllm-gr with pip from source
@@ -47,6 +55,9 @@ Visit the documentation pages to learn more
 
 * [`Quickstart`](docs/quickstart.md):
   Instructions for setting up vLLM-GR and an example showing how to run a GR workload with vLLM-GR enabled.
+
+* [`Quickstart-Ascend`](docs/quickstart-ascend.md):
+  Instructions for setting up vLLM-GR on Huawei Ascend NPU environment.
 
 * [`Benchmark`](docs/benchmarks/README.md):
   Performance results and methodology, including GR-focused benchmarks (e.g. Open One Rec).

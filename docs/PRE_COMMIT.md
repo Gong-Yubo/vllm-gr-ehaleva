@@ -4,20 +4,23 @@ This project uses [pre-commit](https://pre-commit.com/) to ensure code quality a
 
 ## Quick Start
 
-1. **Install pre-commit**:
-   ```bash
-   pip install pre-commit
-   ```
+   1. **Install pre-commit**:
 
-2. **Install git hooks** (one-time setup):
-   ```bash
-   pre-commit install
-   ```
+      ```bash
+      pip install pre-commit
+      ```
 
-3. **Run manually** (optional):
-   ```bash
-   pre-commit run --all-files
-   ```
+   2. **Install git hooks** (one-time setup):
+
+      ```bash
+      pre-commit install
+      ```
+
+   3. **Run manually** (optional):
+
+      ```bash
+      pre-commit run --all-files
+      ```
 
 That's it! Pre-commit will now run automatically on every `git commit`.
 
@@ -39,23 +42,28 @@ The following checks run automatically:
 ## Manual Usage
 
 ### Run on all files
+
 ```bash
 pre-commit run --all-files
 ```
 
 ### Run on staged files only
+
 ```bash
 pre-commit run
 ```
 
 ### Run a specific hook
+
 ```bash
 pre-commit run ruff-check --all-files
 pre-commit run check-pickle-imports --all-files
 ```
 
 ### Update hooks
+
 When `.pre-commit-config.yaml` changes, update hooks:
+
 ```bash
 pre-commit autoupdate
 ```
@@ -63,11 +71,13 @@ pre-commit autoupdate
 ## Bypassing Hooks
 
 ### Skip all hooks
+
 ```bash
 git commit --no-verify
 ```
 
 ### Skip a specific hook
+
 ```bash
 SKIP=check-pickle-imports git commit
 SKIP=ruff-check git commit
@@ -76,19 +86,23 @@ SKIP=ruff-check git commit
 ## Troubleshooting
 
 ### Hooks not running
+
 - Make sure you ran `pre-commit install`
 - Check that `.git/hooks/pre-commit` exists
 
 ### Hook fails but you want to commit anyway
+
 - Fix the issues manually, or
 - Use `git commit --no-verify` (not recommended)
 
 ### Update hook versions
+
 ```bash
 pre-commit autoupdate
 ```
 
 ### Clear cache and reinstall
+
 ```bash
 pre-commit clean
 pre-commit install

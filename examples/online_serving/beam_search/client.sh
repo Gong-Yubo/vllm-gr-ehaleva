@@ -3,6 +3,7 @@ bw=512
 while getopts "b:" opt; do
   case $opt in
     b) bw=$OPTARG ;;
+    *) echo "only -b <val> is supported"; exit 1 ;;
   esac
 done
 

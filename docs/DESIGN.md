@@ -1,4 +1,5 @@
 # Architecture Design Document
+
 ## vllm-gr: High-Throughput Serving Plugin for HSTU Generative Recommendation Models
 
 **Version**: 1.0  
@@ -11,12 +12,14 @@
 This document describes the architecture design for vllm-gr, a vLLM inference plugin that enables high-throughput serving of HSTU (Hierarchical Sequential Transduction Unit) generative recommendation models.
 
 ### 1.1 Design Goals
+
 - **Performance**: Leverage vLLM's PagedAttention and continuous batching for 10x+ throughput improvement
 - **Compatibility**: Seamless integration with vLLM v1 plugin system
 - **Modularity**: Clear separation of concerns aligned with vLLM v1 structure
 - **Extensibility**: Support for future recommendation model architectures
 
 ### 1.2 Architecture Principles
+
 - **Alignment with vLLM v1**: Mirror vLLM's directory structure for seamless integration
 - **Plugin-Based**: Follow vLLM's plugin system architecture
 - **Efficiency First**: Optimize for high-throughput, low-latency serving
@@ -30,7 +33,7 @@ This document describes the architecture design for vllm-gr, a vLLM inference pl
 
 The plugin integrates with vLLM's v1 engine across multiple layers:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                     Client Applications                      │
 └──────────────────────┬──────────────────────────────────────┘
@@ -81,7 +84,7 @@ The plugin integrates with vLLM's v1 engine across multiple layers:
 
 ### 2.2 Directory Structure (Aligned with vLLM v1)
 
-```
+```text
 vllm_gr/
 ├── __init__.py
 ├── attention/              # Attention mechanisms for HSTU
@@ -150,27 +153,28 @@ The plugin integrates with vLLM's v1 engine through:
 **Components**:
 
 - **`cli.py`**: Command-line interface entry points
-  - `vllm-gr serve`: Start OpenAI-compatible API server for online serving
-  - `vllm-gr bench`: Benchmark HSTU model performance
-  - `vllm-gr run-batch`: Execute batch inference tasks
-  - `vllm-gr recommend`: Generate recommendations via CLI
-  - Follows vLLM's CLI pattern (`vllm serve`, `vllm bench`, etc.)
+    - `vllm-gr serve`: Start OpenAI-compatible API server for online serving
+    - `vllm-gr bench`: Benchmark HSTU model performance
+    - `vllm-gr run-batch`: Execute batch inference tasks
+    - `vllm-gr recommend`: Generate recommendations via CLI
+    - Follows vLLM's CLI pattern (`vllm serve`, `vllm bench`, etc.)
 
 - **`api_server.py`**: Online serving API server
-  - OpenAI-compatible API server for recommendation models
-  - Extends vLLM's API server with `/v1/recommendations` endpoint
-  - Handles HTTP requests for real-time recommendation serving
-  - Supports `/v1/completions` and `/v1/chat/completions` for compatibility
-  - Custom `/v1/recommendations` endpoint for recommendation-specific requests
+    - OpenAI-compatible API server for recommendation models
+    - Extends vLLM's API server with `/v1/recommendations` endpoint
+    - Handles HTTP requests for real-time recommendation serving
+    - Supports `/v1/completions` and `/v1/chat/completions` for compatibility
+    - Custom `/v1/recommendations` endpoint for recommendation-specific requests
 
 - **`gr.py`**: Offline serving interface
-  - Direct Python interface for batch processing without server
-  - `GRLLM` class (inherits from vLLM's `LLM` class)
-  - Extends vLLM's `LLM` with recommendation-specific functionality
-  - Enables programmatic access for offline inference
-  - Supports batch processing of recommendation requests
+      - Direct Python interface for batch processing without server
+      - `GRLLM` class (inherits from vLLM's `LLM` class)
+      - Extends vLLM's `LLM` with recommendation-specific functionality
+      - Enables programmatic access for offline inference
+      - Supports batch processing of recommendation requests
 
 **Integration**:
+
 - CLI commands via `pyproject.toml` entry points (e.g., `[project.scripts]`)
 - Plugin registration via `pyproject.toml` entry points
 - API server extends vLLM's existing API server infrastructure
@@ -180,30 +184,32 @@ The plugin integrates with vLLM's v1 engine through:
 **Purpose**: Core inference engine components aligned with `vllm/v1/engine`
 
 **Components**:
+
 - **`GREngine`**: Core inference engine managing request handling, scheduling, and execution
-  - Inherits from vLLM's `LLMEngine` class
-  - Extends vLLM's engine for recommendation workloads
-  - Handles recommendation-specific request routing
-  - Manages recommendation context and session state
-  - Provides all standard LLMEngine functionality plus recommendation-specific features
+    - Inherits from vLLM's `LLMEngine` class
+    - Extends vLLM's engine for recommendation workloads
+    - Handles recommendation-specific request routing
+    - Manages recommendation context and session state
+    - Provides all standard LLMEngine functionality plus recommendation-specific features
 
 - **`InputProcessor`** (`engine/input_processor.py`): Input processing for recommendation requests
-  - Handles heterogeneous user interaction sequences
-  - User interaction sequence encoding
-  - Item metadata embedding
-  - Context preparation
-  - Request parsing and validation
+    - Handles heterogeneous user interaction sequences
+    - User interaction sequence encoding
+    - Item metadata embedding
+    - Context preparation
+    - Request parsing and validation
 
 - **`OutputProcessor`** (`engine/output_processor.py`): Output processing for recommendation requests
-  - Autoregressive output parsing
-  - Probability distribution extraction
-  - Item ID prediction
-  - Response formatting
-  - Metadata attachment
+    - Autoregressive output parsing
+    - Probability distribution extraction
+    - Item ID prediction
+    - Response formatting
+    - Metadata attachment
 
 **Integration**: Inherits from `vllm.engine.llm_engine.LLMEngine` (or `vllm.v1.engine.LLMEngine` in v1)
 
 **Implementation Example**:
+
 ```python
 from vllm.engine.llm_engine import LLMEngine
 
@@ -229,22 +235,23 @@ class GREngine(LLMEngine):
 **Purpose**: Model execution logic aligned with `vllm/v1/model_executor`
 
 **Components**:
+
 - **`HSTUModelExecutor`**: Model execution logic for HSTU architecture
-  - Manages forward pass for HSTU models
-  - Handles hierarchical attention computation
-  - Implements autoregressive generation
+    - Manages forward pass for HSTU models
+    - Handles hierarchical attention computation
+    - Implements autoregressive generation
 
 - **`HSTUModelLoader`**: Model loading mechanism compatible with vLLM's processes
-  - Loads HSTU models from HuggingFace format
-  - Converts HSTU architecture to vLLM-compatible format
-  - Handles model configuration and initialization
+    - Loads HSTU models from HuggingFace format
+    - Converts HSTU architecture to vLLM-compatible format
+    - Handles model configuration and initialization
 
 - **`models/hstu.py`**: HSTU model implementation
-  - Hierarchical self-attention layers
-  - Pointwise attention mechanisms
-  - Gated transformation layers
-  - Learnable positional biases
-  - Autoregressive output head
+    - Hierarchical self-attention layers
+    - Pointwise attention mechanisms
+    - Gated transformation layers
+    - Learnable positional biases
+    - Autoregressive output head
 
 **Integration**: Extends `vllm.v1.model_executor.BaseModelExecutor`
 
@@ -253,15 +260,16 @@ class GREngine(LLMEngine):
 **Purpose**: HSTU-specific attention mechanisms
 
 **Components**:
+
 - **`HSTUAttentionProcessor`**: Implements hierarchical self-attention
-  - Pointwise attention computation
-  - Hierarchical attention layers
-  - Efficient attention caching
+    - Pointwise attention computation
+    - Hierarchical attention layers
+    - Efficient attention caching
 
 - **`HierarchicalAttention`**: Core hierarchical attention mechanism
-  - Multi-level attention aggregation
-  - Gated transformation layers
-  - Learnable positional bias application
+    - Multi-level attention aggregation
+    - Gated transformation layers
+    - Learnable positional bias application
 
 **Integration**: Integrates with vLLM's PagedAttention for efficient memory management
 
@@ -270,33 +278,35 @@ class GREngine(LLMEngine):
 **Purpose**: Core recommendation inference functionality
 
 **Components**:
+
 - **`SequenceEncoder`**: Efficient encoding of variable-length, heterogeneous user histories
-  - Sequence padding and truncation
-  - Encoding computation amortization
-  - Metadata embedding
+    - Sequence padding and truncation
+    - Encoding computation amortization
+    - Metadata embedding
 
 - **`RecommendationCore`**: Core recommendation logic
-  - Recommendation pipeline orchestration
-  - Context management
-  - Session state handling
+    - Recommendation pipeline orchestration
+    - Context management
+    - Session state handling
 
 - **`sched/GRScheduler`** (`core/sched/gr_scheduler.py`): Request-level scheduler optimized for HSTU inference patterns
-  - Inherits from vLLM's `Scheduler` class
-  - Variable-length sequence batching optimization
-  - Continuous batching for recommendation requests
-  - Priority queue management for real-time vs batch requests
-  - Request-level scheduling optimization for recommendation workloads
-  - Extends vLLM's scheduler with recommendation-specific scheduling logic
+    - Inherits from vLLM's `Scheduler` class
+    - Variable-length sequence batching optimization
+    - Continuous batching for recommendation requests
+    - Priority queue management for real-time vs batch requests
+    - Request-level scheduling optimization for recommendation workloads
+    - Extends vLLM's scheduler with recommendation-specific scheduling logic
 
 - **`KVCacheManager`** (`core/kv_cache_manager.py`): KV cache management for recommendation sequences
-  - Efficient KV cache allocation for variable-length sequences
-  - Paged KV cache management
-  - Cache compression for long sequences
-  - Memory optimization for high-cardinality item spaces
+    - Efficient KV cache allocation for variable-length sequences
+    - Paged KV cache management
+    - Cache compression for long sequences
+    - Memory optimization for high-cardinality item spaces
 
 **Integration**: GRScheduler inherits from vLLM's `Scheduler` class (from `vllm.v1.scheduler` or `vllm.scheduler`)
 
 **Implementation Example for GRScheduler**:
+
 ```python
 from vllm.v1.scheduler import Scheduler
 
@@ -319,28 +329,29 @@ class GRScheduler(Scheduler):
 **Purpose**: Sampling strategies for recommendation generation
 
 **Components**:
+
 - **`RecommendationSampler`**: Base sampling strategy interface for generating candidates
-  - Abstract base class for all sampling strategies
-  - Defines interface for sampling from next-item probability distributions
-  - Common utilities for candidate selection
+    - Abstract base class for all sampling strategies
+    - Defines interface for sampling from next-item probability distributions
+    - Common utilities for candidate selection
 
 - **`TopKSampler`**: Top-K sampling for recommendation generation
-  - Efficient top-K selection from probability distributions
-  - Greedy selection of top-K items based on probability scores
-  - Configurable K values
-  - Batch-optimized sampling
-  - Fast implementation for real-time serving
+    - Efficient top-K selection from probability distributions
+    - Greedy selection of top-K items based on probability scores
+    - Configurable K values
+    - Batch-optimized sampling
+    - Fast implementation for real-time serving
 
 - **`BeamSearchSampler`**: Beam search sampling for recommendation generation
-  - Maintains multiple candidate sequences (beams) during generation
-  - Explores diverse recommendation paths simultaneously
-  - Better coverage of recommendation space compared to greedy top-K
-  - Configurable beam width (number of beams to maintain)
-  - Beam pruning and expansion strategies
-  - Handles variable-length recommendation sequences
-  - Useful for generating diverse, high-quality recommendation lists
-  - Supports length normalization for fair comparison across beams
-  - Integration with autoregressive generation pipeline
+    - Maintains multiple candidate sequences (beams) during generation
+    - Explores diverse recommendation paths simultaneously
+    - Better coverage of recommendation space compared to greedy top-K
+    - Configurable beam width (number of beams to maintain)
+    - Beam pruning and expansion strategies
+    - Handles variable-length recommendation sequences
+    - Useful for generating diverse, high-quality recommendation lists
+    - Supports length normalization for fair comparison across beams
+    - Integration with autoregressive generation pipeline
 
 **Integration**: Extends vLLM's sampling engine and integrates with autoregressive generation
 
@@ -349,10 +360,11 @@ class GRScheduler(Scheduler):
 **Purpose**: Worker functionalities aligned with `vllm/v1/worker`
 
 **Components**:
+
 - **`RecommendationWorker`**: Worker handling inference tasks
-  - Integrates with vLLM's core engine
-  - Handles recommendation-specific worker logic
-  - Manages GPU memory for recommendation workloads
+    - Integrates with vLLM's core engine
+    - Handles recommendation-specific worker logic
+    - Manages GPU memory for recommendation workloads
 
 **Integration**: Extends `vllm.v1.worker.WorkerBase`
 
@@ -361,21 +373,22 @@ class GRScheduler(Scheduler):
 **Purpose**: Utility functions aligned with `vllm/v1/utils`
 
 **Components**:
+
 - **`RankingEngine`**: Post-processing ranking and reranking
-  - Score normalization
-  - Diversity enforcement
-  - Business rule filtering
+    - Score normalization
+    - Diversity enforcement
+    - Business rule filtering
 
 - **`MetricsCollector`**: Tracks recommendation quality metrics
-  - NDCG calculation
-  - MRR calculation
-  - Hit Rate calculation
-  - Latency and throughput tracking
+    - NDCG calculation
+    - MRR calculation
+    - Hit Rate calculation
+    - Latency and throughput tracking
 
 - **`BatchProcessor`**: Handles batch inference requests
-  - Batch formation for variable-length sequences
-  - Result aggregation
-  - Metrics calculation for batches
+    - Batch formation for variable-length sequences
+    - Result aggregation
+    - Metrics calculation for batches
 
 ---
 
@@ -383,7 +396,7 @@ class GRScheduler(Scheduler):
 
 ### 4.1 Request Flow
 
-```
+```text
 Client Request
     │
     ▼
@@ -500,6 +513,7 @@ Client Response
 The plugin registers with vLLM v1 via `pyproject.toml`:
 
 **CLI Entry Points** (for command-line usage):
+
 ```toml
 [project.scripts]
 vllm-gr = "vllm_gr.entrypoint.cli:main"
@@ -510,6 +524,7 @@ vllm-gr-recommend = "vllm_gr.entrypoint.cli:recommend"
 ```
 
 **Plugin Registration** (for vLLM plugin system):
+
 ```toml
 [project.entry-points."vllm.general_plugins"]
 vllm-gr = "vllm_gr.entrypoint:register_plugin"
@@ -524,6 +539,7 @@ hstu = "vllm_gr.model_executor.hstu_model_executor:HSTUModelExecutor"
 ### 5.2 CLI Usage Examples
 
 **Online Serving** (API Server):
+
 ```bash
 # Start API server for online serving
 vllm-gr serve hstu-model --port 8100 --host 0.0.0.0
@@ -533,6 +549,7 @@ vllm serve hstu-model --port 8100 --plugins vllm-gr
 ```
 
 **Offline Serving** (Python Interface):
+
 ```python
 from vllm_gr.entrypoint.gr import GRLLM
 
@@ -553,6 +570,7 @@ recommendations = llm.recommend(
 ```
 
 **CLI Commands**:
+
 ```bash
 # Benchmark model performance
 vllm-gr bench hstu-model --num-prompts 1000
@@ -602,11 +620,13 @@ engine_args = EngineArgs(
 ### 6.1 Fast Attention Optimization
 
 **PagedAttention Integration**:
+
 - Leverage vLLM's PagedAttention for efficient handling of long sequences
 - Hierarchical attention layers utilize PagedAttention's block-sparse attention
 - Efficient KV cache management for variable-length sequences
 
 **Implementation Strategy**:
+
 - Map HSTU's hierarchical attention to PagedAttention blocks
 - Optimize attention computation for pointwise operations
 - Cache frequently accessed attention patterns
@@ -614,11 +634,13 @@ engine_args = EngineArgs(
 ### 6.2 Continuous Batching
 
 **Batching Strategy**:
+
 - Utilize vLLM's continuous batching engine
 - Optimize batch composition for variable-length sequences
 - Group sequences by similar length for efficiency
 
 **Sequence Grouping**:
+
 - Group sequences with similar lengths together
 - Use dynamic padding strategies
 - Minimize padding overhead
@@ -626,11 +648,13 @@ engine_args = EngineArgs(
 ### 6.3 Encoding Amortization
 
 **Computation Reuse**:
+
 - Cache encoded representations for common sequence prefixes
 - Reuse computations across similar user histories
 - Implement incremental encoding for sequence updates
 
 **Memory Management**:
+
 - Efficient storage of encoded representations
 - LRU cache for frequently accessed encodings
 - Memory-aware cache eviction policies
@@ -638,11 +662,13 @@ engine_args = EngineArgs(
 ### 6.4 Memory Management
 
 **KV Cache Optimization**:
+
 - Efficient KV cache allocation for variable-length sequences
 - Paged KV cache management
 - Cache compression for long sequences
 
 **High-Cardinality Item Spaces**:
+
 - Efficient item embedding storage
 - Shared embeddings where possible
 - Quantization for large embedding tables
@@ -650,11 +676,13 @@ engine_args = EngineArgs(
 ### 6.5 Caching Strategies
 
 **Attention Cache**:
+
 - Cache hierarchical attention patterns
 - Reuse attention computations for similar sequences
 - Session-based attention caching
 
 **Sequence Cache**:
+
 - Cache encoded user histories
 - Incremental updates for sequence extensions
 - User-specific cache management
@@ -666,11 +694,13 @@ engine_args = EngineArgs(
 ### 7.1 Hierarchical Attention Mapping
 
 **Attention Layer Mapping**:
+
 - Map HSTU's hierarchical attention to vLLM's attention layers
 - Optimize pointwise attention operations
 - Efficient gated transformation computation
 
 **Positional Bias Handling**:
+
 - Efficient application of learnable positional biases
 - Cache positional embeddings
 - Optimize bias computation for long sequences
@@ -678,11 +708,13 @@ engine_args = EngineArgs(
 ### 7.2 Autoregressive Generation
 
 **Generation Strategy**:
+
 - Efficient autoregressive generation for next-item prediction
 - Optimize probability distribution computation
 - Batch-optimized generation
 
 **Output Processing**:
+
 - Efficient extraction of next-item probabilities
 - Top-K selection optimization (greedy)
 - Beam search optimization (diverse exploration)
@@ -692,11 +724,13 @@ engine_args = EngineArgs(
 ### 7.3 Sequence Encoding Optimization
 
 **Amortization Implementation**:
+
 - Incremental encoding for sequence updates
 - Prefix caching for common sequence starts
 - Efficient encoding computation reuse
 
 **Metadata Embedding**:
+
 - Efficient handling of heterogeneous metadata
 - Shared embedding spaces where possible
 - Optimized metadata encoding
@@ -708,11 +742,13 @@ engine_args = EngineArgs(
 ### 8.1 Unit Tests
 
 **Component Testing**:
+
 - Test each component in isolation
 - Mock dependencies for clean testing
 - Test edge cases and error handling
 
 **Coverage Targets**:
+
 - >80% code coverage
 - Critical paths: 100% coverage
 - Error paths: 90% coverage
@@ -720,11 +756,13 @@ engine_args = EngineArgs(
 ### 8.2 Integration Tests
 
 **vLLM Integration**:
+
 - Test plugin registration and discovery
 - Test model loading and execution
 - Test end-to-end inference pipeline
 
 **Performance Tests**:
+
 - Latency benchmarks
 - Throughput benchmarks
 - Memory usage tests
@@ -732,11 +770,13 @@ engine_args = EngineArgs(
 ### 8.3 Recommendation Quality Tests
 
 **Metrics Validation**:
+
 - NDCG calculation accuracy
 - MRR calculation accuracy
 - Hit Rate calculation accuracy
 
 **Quality Comparison**:
+
 - Compare against baseline HSTU implementations
 - Validate recommendation quality parity
 - Test on standard datasets (Amazon, MovieLens, etc.)

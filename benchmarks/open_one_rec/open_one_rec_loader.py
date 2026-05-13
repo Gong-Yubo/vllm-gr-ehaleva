@@ -112,6 +112,7 @@ def get_loader(
     data_dir: str,
     tokenizer: Optional[Any] = None,
     enable_thinking: Optional[bool] = None,
+    custom_input_len: Optional[int] = None,
 ):
     """
     Get loader instance for a task
@@ -124,6 +125,7 @@ def get_loader(
         data_dir: Data directory path
         tokenizer: Tokenizer instance (optional, required for message-based formats)
         enable_thinking: Enable thinking mode (optional, overrides task config if set)
+        custom_input_len: Set the input length to a predefined length
 
     Returns:
         Loader instance
@@ -143,6 +145,7 @@ def get_loader(
         data_dir=data_dir,
         tokenizer=tokenizer,
         enable_thinking=enable_thinking,
+        custom_input_len=custom_input_len,
     )
 
 
@@ -155,13 +158,20 @@ class DataLoaderWrapper:
         benchmark_version: str,
         data_dir: str,
         enable_thinking: Optional[bool] = None,
+        custom_input_len: Optional[int] = None,
     ):
         self.model_path = model_path
         self._tokenizer = self._create_tokenizer(model_path) if model_path else None
 
+        if custom_input_len is not None:
+            custom_input_len = int(custom_input_len)
+            if custom_input_len <= 0:
+                raise ValueError("custom_input_len must be a positive integer")
+
         self.benchmark_version = benchmark_version
         self.data_dir = data_dir
         self.enable_thinking = enable_thinking
+        self.custom_input_len = custom_input_len
         self._loader_cache = {}
 
     def _create_tokenizer(self, model_path: str):
@@ -188,6 +198,7 @@ class DataLoaderWrapper:
                 data_dir=self.data_dir,
                 tokenizer=self._tokenizer,
                 enable_thinking=self.enable_thinking,
+                custom_input_len=self.custom_input_len,
             )
 
         loader = self._loader_cache[task_name]
@@ -203,12 +214,19 @@ class BaseLoader(ABC):
         data_dir: Optional[str] = None,
         tokenizer: Optional[Any] = None,
         enable_thinking: Optional[bool] = None,
+        custom_input_len: Optional[int] = None,
     ):
         """Initialize base loader"""
+        if custom_input_len is not None:
+            custom_input_len = int(custom_input_len)
+            if custom_input_len <= 0:
+                raise ValueError("custom_input_len must be a positive integer")
+
         self.task_config = task_config
         self.data_dir = data_dir
         self.tokenizer = tokenizer
         self.enable_thinking = enable_thinking
+        self.custom_input_len = custom_input_len
         self.task_name = task_config.get("name", "unknown")
 
         # Validate tokenizer is provided for messages-based format
@@ -492,6 +510,9 @@ class BaseLoader(ABC):
                 logger.info(f"Sample {sample_id}: failed to apply chat template: {e}, skipping")
                 continue
 
+            if self.custom_input_len is not None:
+                formatted_prompt = self._enforce_prompt_token_length(formatted_prompt, sample_id)
+
             metadata_raw = row.get("metadata")
             if self._is_empty_value(metadata_raw):
                 logger.info(f"Sample {sample_id}: metadata is empty, skipping")
@@ -527,6 +548,70 @@ class BaseLoader(ABC):
         logger.info(f"Loaded {len(result)} samples for {self.task_name}")
 
         return result
+
+    def _tokenize_prompt(self, prompt: str) -> list[int]:
+        """Tokenize prompt text for length normalization."""
+        tokenized = self.tokenizer(prompt, add_special_tokens=False)
+        token_ids = getattr(tokenized, "input_ids", None)
+        if token_ids is None and isinstance(tokenized, dict):
+            token_ids = tokenized.get("input_ids", [])
+        return list(token_ids or [])
+
+    def _enforce_prompt_token_length(self, prompt: str, sample_id: str) -> str:
+        """Trim or repeat prompt tokens to match custom_input_len exactly."""
+        if self.custom_input_len is None:
+            return prompt
+
+        target_len = int(self.custom_input_len)
+        if target_len <= 0:
+            raise ValueError("custom_input_len must be a positive integer")
+
+        prompt_token_ids = self._tokenize_prompt(prompt)
+        current_len = len(prompt_token_ids)
+
+        if current_len == target_len:
+            return prompt
+
+        if current_len == 0:
+            logger.warning(
+                "Sample %s: prompt tokenized to empty input; cannot enforce custom_input_len=%s",
+                sample_id,
+                target_len,
+            )
+            return prompt
+
+        if current_len < target_len:
+            repeat_count = (target_len + current_len - 1) // current_len
+            adjusted_token_ids = (prompt_token_ids * repeat_count)[:target_len]
+            action = "extended"
+        else:
+            adjusted_token_ids = prompt_token_ids[:target_len]
+            action = "trimmed"
+
+        adjusted_prompt = self.tokenizer.decode(
+            adjusted_token_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
+        final_len = len(self._tokenize_prompt(adjusted_prompt))
+        if final_len != target_len:
+            logger.warning(
+                "Sample %s: requested custom_input_len=%s, got %s after %s",
+                sample_id,
+                target_len,
+                final_len,
+                action,
+            )
+        else:
+            logger.debug(
+                "Sample %s: prompt %s to %s tokens",
+                sample_id,
+                action,
+                target_len,
+            )
+
+        return adjusted_prompt
 
     def _make_metadata_serializable(
         self,

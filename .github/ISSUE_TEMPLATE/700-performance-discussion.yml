@@ -7,7 +7,7 @@ body:
 - type: markdown
   attributes:
     value: >
-      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/vllm-project/vllm-gr/issues?q=is%3Aissue+sort%3Acreated-desc+).
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/JiusiServe/vllm-gr/issues?q=is%3Aissue+sort%3Acreated-desc+).
 - type: textarea
   attributes:
     label: Proposal to improve performance
@@ -19,7 +19,7 @@ body:
   attributes:
     label: Report of performance regression
     description: >
-      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark script at https://github.com/vllm-project/vllm-gr/tree/main/tests/benchmarks .
+      Please provide detailed description of performance comparison to confirm the regression. You may want to run the benchmark scripts. See https://github.com/JiusiServe/vllm-gr/blob/main/docs/benchmarks/README.md
   validations:
     required: false
 - type: textarea
@@ -33,9 +33,8 @@ body:
   attributes:
     label: Your current environment (if you think it is necessary)
     description: |
-      Please run the following and paste the output below.
+      Run the `collect_env.py` script from the repository root and paste its output below.
       ```sh
-      wget https://raw.githubusercontent.com/vllm-project/vllm-gr/main/vllm_gr/collect_env.py
       # For security purposes, please feel free to check the contents of collect_env.py before running it.
       python collect_env.py
       ```

@@ -39,6 +39,7 @@ class BeamForkRequest(
     client_index: int = 0
     current_wave: int = 0
     priority: int = 0
+    data_parallel_rank: int | None = None
     lora_request: LoRARequest | None = None
     cache_salt: str | None = None
     trace_headers: Mapping[str, str] | None = None

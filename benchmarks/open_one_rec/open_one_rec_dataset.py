@@ -15,7 +15,14 @@ class OneRecDataset(BenchmarkDataset):
     Loads data using data_loader.load_data() with task_name, split, and sample_size.
     """
 
-    def __init__(self, task_types: list[str] = None, model_path: str = None, **kwargs) -> None:
+    def __init__(
+        self,
+        task_types: list[str] = None,
+        model_path: str = None,
+        custom_input_len: int | None = None,
+        sample_size: int | None = None,
+        **kwargs,
+    ) -> None:
         self.task_types = task_types or [
             "rec_reason",
             "item_understand",
@@ -28,6 +35,8 @@ class OneRecDataset(BenchmarkDataset):
         ]
 
         self.tokenizer = kwargs.get("tokenizer")
+        self.custom_input_len = custom_input_len
+        self.sample_size = sample_size
 
         super().__init__(**kwargs)
 
@@ -36,6 +45,7 @@ class OneRecDataset(BenchmarkDataset):
             benchmark_version="v1.0",
             data_dir=self.dataset_path,
             enable_thinking=None,
+            custom_input_len=self.custom_input_len,
         )
 
         self.load_data()

@@ -9,7 +9,9 @@ import torch
 from vllm.utils.torch_utils import set_random_seed
 
 try:
-    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionBackend, BeamAttentionImpl
+    from vllm_gr.v1.attention.backends.beam_attn import (
+        BeamAttentionImpl,
+    )
 except ImportError:
     pytest.skip(
         "beam_attn backend is not supported.",
@@ -179,7 +181,7 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
         device=inputs.query.device,
     )
 
-    def run_kernel():
+    def run_kernel() -> None:
         flash_attn_varlen_func(
             q=inputs.query,
             k=inputs.key_cache,
@@ -203,19 +205,47 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     return output
 
 
+def get_prefix_groups(block_tables: torch.Tensor) -> list[tuple[int, list[int]]]:
+    """
+    Group sequences by their longest common prefix of block indices.
+    """
+    block_tables_cpu = block_tables.cpu().tolist()
+
+    groups_dict: dict[int, list[tuple[int, list[int]]]] = {}
+    for i, blocks in enumerate(block_tables_cpu):
+        first_block = blocks[0] if blocks else -1
+        if first_block not in groups_dict:
+            groups_dict[first_block] = []
+        groups_dict[first_block].append((i, blocks))
+
+    res = []
+    for first_block, seqs in groups_dict.items():
+        if len(seqs) == 1:
+            res.append((0, [seqs[0][0]]))
+            continue
+
+        min_lcp = len(seqs[0][1])
+        for i in range(1, len(seqs)):
+            lcp = 0
+            for b1, b2 in zip(seqs[0][1], seqs[i][1]):
+                if b1 == b2:
+                    lcp += 1
+                else:
+                    break
+            min_lcp = min(min_lcp, lcp)
+
+        res.append((min_lcp, [s[0] for s in seqs]))
+
+    # Sort groups by the first request id to maintain deterministic order
+    res.sort(key=lambda x: x[1][0])
+    return res
+
+
 def run_cascade_beam_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     output = torch.empty_like(inputs.query)
 
-    # Use prefix_partition to determine groups
-    groups = BeamAttentionBackend.prefix_partition(
-        num_reqs=inputs.num_seqs,
-        block_size=inputs.block_size,
-        block_table_device=inputs.block_tables,
-        seq_lens=inputs.seq_lens,
-        threshold=0,
-        min_blocks_for_sharing=0,
-        device_lcp=True,
-    )
+    # Dynamically determine groups from block tables
+    groups = get_prefix_groups(inputs.block_tables)
 
     # Filter for actual sharing
     shared_groups = [g for g in groups if g[0] > 0]
@@ -291,7 +321,7 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs) -> torch.Tensor:
         offsets = starts.repeat_interleave(lengths) - cumsum_lengths[:-1].repeat_interleave(lengths)
         prefix_indices = arrange_tensor + offsets
 
-    def run_kernel():
+    def run_kernel() -> None:
         BeamAttentionImpl.cascade_attention(
             output=output,
             query=inputs.query,
@@ -322,16 +352,16 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     return output
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("beam_width", [16, 32])
-@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("soft_cap", [None, 50])
-@pytest.mark.parametrize("fa_version", [2, 3])
-@torch.inference_mode()
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore
+@pytest.mark.parametrize("beam_width", [16, 32])  # type: ignore
+@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)  # type: ignore
+@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore
+@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore
+@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore
+@pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore
+@torch.inference_mode()  # type: ignore
 def test_beam_cascade(
     batch_size: int,
     beam_width: int,
@@ -389,15 +419,15 @@ def test_beam_cascade(
     torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("batch_size", [3])
-@pytest.mark.parametrize("beam_width", [32])
-@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("non_shared_location", ["beginning", "middle", "end"])
-@torch.inference_mode()
+@pytest.mark.parametrize("batch_size", [3])  # type: ignore
+@pytest.mark.parametrize("beam_width", [32])  # type: ignore
+@pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)  # type: ignore
+@pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore
+@pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore
+@pytest.mark.parametrize("dtype", DTYPES)  # type: ignore
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore
+@pytest.mark.parametrize("non_shared_location", ["beginning", "middle", "end"])  # type: ignore
+@torch.inference_mode()  # type: ignore
 def test_beam_cascade_non_identity_path(
     batch_size: int,
     beam_width: int,

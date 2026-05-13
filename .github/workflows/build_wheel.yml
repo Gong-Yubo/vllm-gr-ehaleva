@@ -55,6 +55,7 @@ jobs:
           bash scripts/build_wheel.sh --python python
 
       - name: Upload Wheel Artifact
+        if: ${{ !env.ACT }}
         uses: actions/upload-artifact@v4
         with:
           name: vllm-gr-wheel-py${{ matrix.python-version }}

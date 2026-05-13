@@ -56,30 +56,31 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
     # Group requests by beam group id (priority)
     beam_groups: dict[int, list[str]] = {}
     for req_id in req_ids:
-        priority = requests[req_id].priority
-        if priority not in beam_groups:
-            beam_groups[priority] = []
-        beam_groups[priority].append(req_id)
+        if req_id not in requests:
+            continue
+        g = requests[req_id].priority        
+        if g not in beam_groups:
+            beam_groups[g] = []
+        beam_groups[g].append(req_id)
 
     all_groups = []
-    for _, group_req_ids in beam_groups.items():
-        if len(group_req_ids) <= 1:
-            if group_req_ids:
-                all_groups.append((0, group_req_ids))
+    for g, group_req_ids in beam_groups.items():
+        n = len(group_req_ids)
+        if n == 0:
+            continue
+        if n == 1:
+            all_groups.append((0, [group_req_ids[0]]))
             continue
 
+        prev_num_common_blocks = 0
         # Find the longest common prefix (LCP) for the group.
         first_req = requests[group_req_ids[0]]
         lcp_tokens = first_req.num_computed_tokens
-        prev_num_common_blocks = 0
         for i in range(1, len(group_req_ids)):
             other_req = requests[group_req_ids[i]]
-
             # Use block hashes for a fast block-aligned LCP
             num_common_blocks = _get_lcp(first_req.block_hashes, other_req.block_hashes, hint=prev_num_common_blocks)
             prev_num_common_blocks = num_common_blocks
-
-
             # Refine to token-level LCP by checking inside the first differing block
             pairwise_lcp = min(num_common_blocks * block_size, other_req.num_computed_tokens)
             limit = min(lcp_tokens, other_req.num_computed_tokens)
@@ -175,7 +176,7 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
 
             # PBSC Safety Check: Active tail sharing is only for highly overlapping beams.
             # If the unshared part is large, these are likely unrelated requests.
-            child_compute_len_estimate = leader_req.num_computed_tokens - t_prefix
+            child_compute_len_estimate = leader_req.num_tokens - t_prefix
             if child_compute_len_estimate > block_size:
                 drop_tail_too_long += len(valid_children)
                 logger.debug("[PBSC debug] Subgroup skipped: tail too long (unshared=%d > block_size=%d)", child_compute_len_estimate, block_size)
@@ -242,7 +243,7 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
         if req_data.req_id in child_prefix_map:
             req_data.num_computed_tokens = child_prefix_map[req_data.req_id]
             
-    if getattr(output, "scheduled_cached_reqs", None) is not None:
+    if hasattr(output, "scheduled_cached_reqs"):
         req_data = output.scheduled_cached_reqs
         if isinstance(req_data.num_computed_tokens, tuple):
             req_data.num_computed_tokens = list(req_data.num_computed_tokens)

@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import json
+import multiprocessing
 import os
 import random
 import tempfile
+from typing import Any
 
 import pytest
 import torch
@@ -13,6 +16,7 @@ try:
     from vllm_gr.sampling_params import BeamSearchParams
 except ImportError:
     from vllm.sampling_params import BeamSearchParams
+
 
 from transformers import AutoTokenizer
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -27,13 +31,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA is not available", allow_module_level=True)
 
 
-@pytest.mark.slow
-@pytest.mark.asyncio
-async def test_serving_catalog_generation(loops: int):
-    from vllm_gr.patch import run_patch
-
-    run_patch()
-
+async def _serving_catalog_generation_impl(loops: int) -> None:
     # Mockup catalog: list of 10 lists of 5 tokens
     # We use tokens that are compatible with the model's tokenizer/format
     catalog_data = []
@@ -94,7 +92,7 @@ async def test_serving_catalog_generation(loops: int):
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
 
             beam_width = 1024
-            beam_search_params_dict = {
+            beam_search_params_dict: dict[str, Any] = {
                 "beam_width": beam_width,
                 "max_tokens": 5,
                 "ignore_eos": False,
@@ -137,3 +135,19 @@ async def test_serving_catalog_generation(loops: int):
     finally:
         if os.path.exists(catalog_path):
             os.remove(catalog_path)
+
+
+def _run_serving_catalog_generation_target(loops: int) -> None:
+    from vllm_gr.patch import run_patch
+
+    run_patch()
+    asyncio.run(_serving_catalog_generation_impl(loops))
+
+
+@pytest.mark.slow  # type: ignore
+def test_serving_catalog_generation(loops: int) -> None:
+    ctx = multiprocessing.get_context("spawn")
+    p = ctx.Process(target=_run_serving_catalog_generation_target, args=(loops,))
+    p.start()
+    p.join()
+    assert p.exitcode == 0
