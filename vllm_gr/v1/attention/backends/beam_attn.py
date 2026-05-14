@@ -62,6 +62,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 BEAM_PREFIX_GROUPS_VAR = contextvars.ContextVar("beam_prefix_groups", default=None)
+PBSC_SHAPED_GROUPS_VAR = contextvars.ContextVar("pbsc_shaped_groups", default=None)
 
 
 @register_backend(AttentionBackendEnum.CUSTOM)
@@ -281,6 +282,10 @@ class BeamAttentionMetadata:
     prefix_indices_is_identity: bool = False
     group_first_reqs: torch.Tensor | None = None
     suffix_col_indices: torch.Tensor | None = None
+
+    # PBSC KV Broadcast metadata
+    pbsc_src_slots: torch.Tensor | None = None
+    pbsc_dst_slots: torch.Tensor | None = None
 
     causal: bool = True
     use_cascade_attention: bool = True
@@ -551,6 +556,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
+        pbsc_src_slots, pbsc_dst_slots = self._create_pbsc_metadata(common_meta)
+
         return BeamAttentionMetadata(
             num_actual_tokens=common_meta.num_actual_tokens,
             max_query_len=common_meta.max_query_len,
@@ -575,6 +582,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_indices_is_identity=prefix_indices_is_identity,
             group_first_reqs=group_first_reqs,
             suffix_col_indices=suffix_col_indices,
+            pbsc_src_slots=pbsc_src_slots,
+            pbsc_dst_slots=pbsc_dst_slots,
             causal=common_meta.causal,
             use_cascade_attention=True,
             max_num_splits=max_num_splits,
@@ -582,10 +591,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
     def _create_prefix_metadata(self, common_meta: CommonAttentionMetadata, shared_groups: list):
         """Constructs metadata for the shared prefix pass."""
-        group_depths, group_req_ids_list = zip(*shared_groups) if shared_groups else ([], [])
+        group_prefix_tokens, group_req_ids_list = zip(*shared_groups) if shared_groups else ([], [])
 
-        # Calculate lengths
-        group_depths_tensor = torch.tensor(group_depths, dtype=torch.int32)
+        # Convert token depths to block depths for cascade attention prefix
+        group_prefix_tokens_tensor = torch.tensor(group_prefix_tokens, dtype=torch.int32)
+        group_depths_tensor = group_prefix_tokens_tensor // self.block_size
+
         prefix_kv_lens_cpu = group_depths_tensor * self.block_size
         prefix_kv_max_len = (
             int(prefix_kv_lens_cpu.max().item()) if prefix_kv_lens_cpu.numel() > 0 else 0
@@ -605,7 +616,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         starts_cpu = common_meta.query_start_loc_cpu[flat_req_ids_tensor_cpu]
         ends_cpu = common_meta.query_start_loc_cpu[flat_req_ids_tensor_cpu + 1]
         lengths_cpu = ends_cpu - starts_cpu
-
         cumsum_lengths_cpu = torch.zeros(lengths_cpu.numel() + 1, dtype=torch.long)
         torch.cumsum(lengths_cpu, dim=0, out=cumsum_lengths_cpu[1:])
 
@@ -679,6 +689,67 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             prefix_indices_is_identity,
             group_first_reqs_tensor,
         )
+
+    def _create_pbsc_metadata(self, common_meta: CommonAttentionMetadata):
+        """Constructs metadata for PBSC KV cache broadcast."""
+        pbsc_groups = PBSC_SHAPED_GROUPS_VAR.get()
+        if not pbsc_groups:
+            return None, None
+
+        all_leader_reqs = []
+        all_child_reqs = []
+        all_token_indices = []
+
+        for t_shared, req_indices in pbsc_groups:
+            t_block_aligned = (t_shared // self.block_size) * self.block_size
+            tail_len = t_shared - t_block_aligned
+            num_children = len(req_indices) - 1
+
+            if tail_len > 0 and num_children > 0:
+                leader_idx = req_indices[0]
+                all_leader_reqs.append(
+                    torch.full((num_children * tail_len,), leader_idx, dtype=torch.int32)
+                )
+
+                children = torch.tensor(req_indices[1:], dtype=torch.int32)
+                all_child_reqs.append(children.repeat_interleave(tail_len))
+
+                tokens = torch.arange(t_block_aligned, t_shared, dtype=torch.int32)
+                all_token_indices.append(tokens.repeat(num_children))
+
+        if not all_leader_reqs:
+            return None, None
+
+        num_slots = len(all_leader_reqs)
+
+        leaders_cat = torch.cat(all_leader_reqs)
+        children_cat = torch.cat(all_child_reqs)
+        tokens_cat = torch.cat(all_token_indices)
+        num_slots = leaders_cat.numel()
+
+        # Single pinned H2D copy
+        all_data_tensor = (
+            torch.cat([leaders_cat, children_cat, tokens_cat])
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+
+        leaders_tensor = all_data_tensor[:num_slots]
+        children_tensor = all_data_tensor[num_slots : 2 * num_slots]
+        tokens_tensor = all_data_tensor[2 * num_slots :]
+
+        # Vectorized block math
+        block_indices = tokens_tensor // self.block_size
+        block_offsets = tokens_tensor % self.block_size
+
+        # Read physical blocks for both leaders and children simultaneously
+        leader_blocks = common_meta.block_table_tensor[leaders_tensor, block_indices]
+        pbsc_src_slots = (leader_blocks * self.block_size + block_offsets).to(torch.int64)
+
+        child_blocks = common_meta.block_table_tensor[children_tensor, block_indices]
+        pbsc_dst_slots = (child_blocks * self.block_size + block_offsets).to(torch.int64)
+
+        return pbsc_src_slots, pbsc_dst_slots
 
     def _create_suffix_metadata(
         self,
@@ -1089,6 +1160,19 @@ class BeamAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
+
+            # -------------------------------------------------------------
+            # PBSC KV Hook: Broadcast Leader's Tail Tokens to Children
+            # -------------------------------------------------------------
+            if getattr(attn_metadata, "pbsc_src_slots", None) is not None:
+                src_slots = attn_metadata.pbsc_src_slots
+                dst_slots = attn_metadata.pbsc_dst_slots
+
+                k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
+                v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
+
+                k_flat[dst_slots] = k_flat[src_slots]
+                v_flat[dst_slots] = v_flat[src_slots]
 
         # Handle FP8 quantization if needed
         if self.kv_cache_dtype.startswith("fp8"):
