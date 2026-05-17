@@ -625,6 +625,8 @@ def apply_scheduler_patch():
 def apply_worker_patches():
     """Monkey-patch GPUModelRunner to inject beam_prefix_groups into the attention builder."""
     try:
+        import numpy as np
+        from vllm.v1.worker.gpu_input_batch import InputBatch
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
         from vllm_gr.v1.attention.backends.beam_attn import (
@@ -646,11 +648,22 @@ def apply_worker_patches():
         self._current_beam_prefix_groups_str = beam_groups
         self._current_pbsc_shaped_groups_str = pbsc_groups
 
+        # Clear fast prefix copy cache to prevent cross-step stale index usage
+        if hasattr(self, "input_batch"):
+            self.input_batch._last_prompt_token_ids_list = None
+            self.input_batch._last_prompt_token_ids_index = None
+            self.input_batch._last_req_id = None
+            self.input_batch._current_beam_prefix_groups = beam_groups
+            self.input_batch._last_beam_group = None
+
         try:
             return _original_execute_model(self, scheduler_output, intermediate_tensors)
         finally:
             self._current_beam_prefix_groups_str = None
             self._current_pbsc_shaped_groups_str = None
+            if hasattr(self, "input_batch"):
+                self.input_batch._current_beam_prefix_groups = None
+                self.input_batch._last_beam_group = None
 
     def patched_build_attention_metadata(self, *args, **kwargs):
         beam_groups_str = getattr(self, "_current_beam_prefix_groups_str", None)
@@ -688,6 +701,97 @@ def apply_worker_patches():
         else:
             return _original_build_attention_metadata(self, *args, **kwargs)
 
+    if not getattr(InputBatch, "_patched_for_fast_beam_add", False):
+        _original_add_request = InputBatch.add_request
+
+        def patched_add_request(self, request, *args, **kwargs):
+            original_prompt_token_ids = request.prompt_token_ids
+            if original_prompt_token_ids is not None:
+                # Use a dummy array as a sentinel to skip the slow Python-to-numpy copy
+                # in the upstream method, while still providing the correct length.
+                dummy_tensor = np.empty(
+                    len(original_prompt_token_ids), dtype=self.token_ids_cpu.dtype
+                )
+                request.prompt_token_ids = dummy_tensor
+
+            try:
+                req_index = _original_add_request(self, request, *args, **kwargs)
+            finally:
+                request.prompt_token_ids = original_prompt_token_ids
+
+            assert isinstance(req_index, int), "Upstream add_request signature changed"
+
+            try:
+                if original_prompt_token_ids is not None:
+                    prompt_len = len(original_prompt_token_ids)
+                    req_id = request.req_id
+
+                    # --- OPTIMIZED FAST PREFIX COPY ---
+                    last_list = getattr(self, "_last_prompt_token_ids_list", None)
+                    last_idx = getattr(self, "_last_prompt_token_ids_index", None)
+                    last_req_id = getattr(self, "_last_req_id", None)
+
+                    diverge_idx = -1
+                    # Check for prefix sharing with the last added request
+                    if (
+                        last_list is not None
+                        and last_idx is not None
+                        and last_req_id is not None
+                        and len(last_list) == prompt_len
+                    ):
+                        current_beam_groups = getattr(self, "_current_beam_prefix_groups", None)
+                        if current_beam_groups is not None:
+                            last_group = getattr(self, "_last_beam_group", None)
+                            found_group = None
+
+                            if last_group is not None:
+                                lcp, req_ids = last_group
+                                if req_id in req_ids and last_req_id in req_ids:
+                                    found_group = last_group
+
+                            if found_group is None:
+                                for group in current_beam_groups:
+                                    _, req_ids = group
+                                    if req_id in req_ids and last_req_id in req_ids:
+                                        found_group = group
+                                        self._last_beam_group = group
+                                        break
+
+                            if found_group is not None:
+                                group_lcp_tokens = found_group[0]
+                                diverge_idx = group_lcp_tokens - 1
+
+                    if diverge_idx >= 0:
+                        # Copy shared prefix efficiently from previously populated numpy row
+                        self.token_ids_cpu[req_index, : diverge_idx + 1] = self.token_ids_cpu[
+                            last_idx, : diverge_idx + 1
+                        ]
+                        # Process the divergent tail
+                        if diverge_idx + 1 < prompt_len:
+                            self.token_ids_cpu[req_index, diverge_idx + 1 : prompt_len] = (
+                                original_prompt_token_ids[diverge_idx + 1 :]
+                            )
+                    else:
+                        # Fallback to slow Python-to-NumPy conversion
+                        self.token_ids_cpu[req_index, :prompt_len] = original_prompt_token_ids
+
+                    self.is_token_ids[req_index, :prompt_len] = True
+            finally:
+                if original_prompt_token_ids is not None:
+                    # Cache this list state for the next sibling request
+                    self._last_prompt_token_ids_list = original_prompt_token_ids
+                    self._last_prompt_token_ids_index = req_index
+                    self._last_req_id = request.req_id
+                    # --- END OPTIMIZED ---
+                else:
+                    self._last_prompt_token_ids_list = None
+                    self._last_prompt_token_ids_index = None
+                    self._last_req_id = None
+
+            return req_index
+
+    InputBatch.add_request = patched_add_request
+    InputBatch._patched_for_fast_beam_add = True
     GPUModelRunner.execute_model = patched_execute_model
     GPUModelRunner._build_attention_metadata = patched_build_attention_metadata
     GPUModelRunner._patched_for_beam_groups = True
