@@ -58,7 +58,7 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
     for req_id in req_ids:
         if req_id not in requests:
             continue
-        g = requests[req_id].priority        
+        g = requests[req_id].priority
         if g not in beam_groups:
             beam_groups[g] = []
         beam_groups[g].append(req_id)
@@ -493,7 +493,6 @@ def run_engine_core(*args, **kwargs):
 
 def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule with the cache computed blocks version."""
-    import torch
     from functools import wraps
 
     import torch
@@ -512,7 +511,7 @@ def apply_scheduler_patch():
         last_res = None
         block_size = self.cache_config.block_size
         _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
-        
+
         # Evaluate once per scheduler instance based on actual model configs
         if not hasattr(self, "_enable_pbsc"):
             attn_backend = "NONE"
@@ -520,24 +519,30 @@ def apply_scheduler_patch():
             # 1. Check vllm_config for CLI arguments
             if hasattr(self, "vllm_config"):
                 # Supports --attention-config.backend
-                if hasattr(self.vllm_config, "attention_config") and hasattr(self.vllm_config.attention_config, "backend"):
+                if hasattr(self.vllm_config, "attention_config") and hasattr(
+                    self.vllm_config.attention_config, "backend"
+                ):
                     attn_backend = getattr(self.vllm_config.attention_config, "backend")
                 # Supports --attention-backend (sometimes mapped directly to vllm_config or model_config)
                 if not attn_backend or "NONE" in str(attn_backend).upper():
                     attn_backend = getattr(self.vllm_config, "attention_backend", "NONE")
                 if not attn_backend or "NONE" in str(attn_backend).upper():
                     if hasattr(self.vllm_config, "model_config"):
-                        attn_backend = getattr(self.vllm_config.model_config, "attn_backend", "NONE")
+                        attn_backend = getattr(
+                            self.vllm_config.model_config, "attn_backend", "NONE"
+                        )
 
             # 2. Fallback to environment variables
             if not attn_backend or "NONE" in str(attn_backend).upper():
                 try:
                     from vllm.envs import VLLM_ATTENTION_BACKEND
+
                     attn_backend = str(VLLM_ATTENTION_BACKEND)
                 except ImportError:
                     import os
+
                     attn_backend = os.environ.get("VLLM_ATTENTION_BACKEND", "NONE")
-                    
+
             self._enable_pbsc = torch.cuda.is_available() and "CUSTOM" in str(attn_backend).upper()
         enable_pbsc = self._enable_pbsc
 
@@ -649,13 +654,13 @@ def apply_scheduler_patch():
 def apply_worker_patches():
     """Monkey-patch GPUModelRunner to inject beam_prefix_groups into the attention builder."""
     try:
+        from vllm.v1.worker.gpu_input_batch import InputBatch
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
         from vllm_gr.v1.attention.backends.beam_attn import (
             BEAM_PREFIX_GROUPS_VAR,
             PBSC_SHAPED_GROUPS_VAR,
         )
-        from vllm.v1.worker.gpu_input_batch import InputBatch
     except ImportError:
         return
 
@@ -677,12 +682,17 @@ def apply_worker_patches():
             self.input_batch._last_prompt_token_ids_index = None
             self.input_batch._last_req_id = None
             self.input_batch._last_priority = None
+            self.input_batch._current_beam_prefix_groups = beam_groups
+            self.input_batch._last_beam_group = None
 
         try:
             return _original_execute_model(self, scheduler_output, intermediate_tensors)
         finally:
             self._current_beam_prefix_groups_str = None
             self._current_pbsc_shaped_groups_str = None
+            if hasattr(self, "input_batch"):
+                self.input_batch._current_beam_prefix_groups = None
+                self.input_batch._last_beam_group = None
 
     def patched_build_attention_metadata(self, *args, **kwargs):
         beam_groups_str = getattr(self, "_current_beam_prefix_groups_str", None)
@@ -720,8 +730,7 @@ def apply_worker_patches():
         else:
             return _original_build_attention_metadata(self, *args, **kwargs)
 
-    if not getattr(InputBatch, "_patched_for_fast_beam_add", False):        
-
+    if not getattr(InputBatch, "_patched_for_fast_beam_add", False):
         _original_add_request = InputBatch.add_request
 
         def patched_add_request(self, request, *args, **kwargs):
@@ -731,82 +740,82 @@ def apply_worker_patches():
             if original_prompt_token_ids is not None:
                 # Use a dummy array as a sentinel to skip the slow Python-to-numpy copy
                 # in the upstream method, while still providing the correct length.
-                dummy_tensor = np.empty(len(original_prompt_token_ids), dtype=self.token_ids_cpu.dtype)
+                dummy_tensor = np.empty(
+                    len(original_prompt_token_ids), dtype=self.token_ids_cpu.dtype
+                )
                 request.prompt_token_ids = dummy_tensor
-            
+
             try:
                 req_index = _original_add_request(self, request, *args, **kwargs)
             finally:
                 request.prompt_token_ids = original_prompt_token_ids
-            
+
             assert isinstance(req_index, int), "Upstream add_request signature changed"
 
             if original_prompt_token_ids is not None:
-                l = len(original_prompt_token_ids)
+                prompt_len = len(original_prompt_token_ids)
                 req_id = request.req_id
-                
+
                 # --- OPTIMIZED FAST PREFIX COPY ---
                 last_list = getattr(self, "_last_prompt_token_ids_list", None)
                 last_idx = getattr(self, "_last_prompt_token_ids_index", None)
                 last_req_id = getattr(self, "_last_req_id", None)
-                last_priority = getattr(self, "_last_priority", None)                
-                curr_priority = getattr(request, "priority", None)
-                
+
                 diverge_idx = -1
-                
                 # Check for prefix sharing with the last added request
-                if last_list is not None and last_idx is not None and last_req_id is not None and len(last_list) == l:
-                    is_same_beam_group = False
-                    
-                    if curr_priority is not None and last_priority is not None and curr_priority == last_priority and curr_priority != 0:
-                        is_same_beam_group = True
-                    else:
-                        # Fallback heuristic
-                        if '-beam-' in req_id and '-beam-' in last_req_id:
-                            if req_id.rsplit('-beam-', 1)[0] == last_req_id.rsplit('-beam-', 1)[0]:
-                                is_same_beam_group = True
-                                
-                    if is_same_beam_group:
-                        diverge_limit = 8
-                        start_check = max(0, l - diverge_limit)
-                        
-                        # Fast C-level slice comparison for the bulk of the shared prompt.
-                        # This safely guarantees the entire prefix matches and avoids false positives.
-                        # if original_prompt_token_ids[:start_check] == last_list[:start_check]:
-                        diverge_idx = start_check - 1
-                        # Scan forward to find the exact first divergence point
-                        for i in range(start_check, l):
-                            if original_prompt_token_ids[i] == last_list[i]:
-                                diverge_idx = i
-                            else:
-                                break                           
-                        # else:
-                        #     # They don't share the expected prefix, fallback to full copy
-                        #     diverge_idx = -1
-                
+                if (
+                    last_list is not None
+                    and last_idx is not None
+                    and last_req_id is not None
+                    and len(last_list) == prompt_len
+                ):
+                    current_beam_groups = getattr(self, "_current_beam_prefix_groups", None)
+                    if current_beam_groups is not None:
+                        last_group = getattr(self, "_last_beam_group", None)
+                        found_group = None
+
+                        if last_group is not None:
+                            lcp, req_ids = last_group
+                            if req_id in req_ids and last_req_id in req_ids:
+                                found_group = last_group
+
+                        if found_group is None:
+                            for group in current_beam_groups:
+                                _, req_ids = group
+                                if req_id in req_ids and last_req_id in req_ids:
+                                    found_group = group
+                                    self._last_beam_group = group
+                                    break
+
+                        if found_group is not None:
+                            group_lcp_tokens = found_group[0]
+                            diverge_idx = group_lcp_tokens - 1
+
                 if diverge_idx >= 0:
                     # Copy shared prefix efficiently from previously populated numpy row
-                    self.token_ids_cpu[req_index, :diverge_idx+1] = self.token_ids_cpu[last_idx, :diverge_idx+1]
+                    self.token_ids_cpu[req_index, : diverge_idx + 1] = self.token_ids_cpu[
+                        last_idx, : diverge_idx + 1
+                    ]
                     # Process the divergent tail
-                    if diverge_idx + 1 < l:
-                        self.token_ids_cpu[req_index, diverge_idx+1:l] = original_prompt_token_ids[diverge_idx+1:]
+                    if diverge_idx + 1 < prompt_len:
+                        self.token_ids_cpu[req_index, diverge_idx + 1 : prompt_len] = (
+                            original_prompt_token_ids[diverge_idx + 1 :]
+                        )
                 else:
                     # Fallback to slow Python-to-NumPy conversion
-                    self.token_ids_cpu[req_index, :l] = original_prompt_token_ids
-                
-                self.is_token_ids[req_index, :l] = True
-                
+                    self.token_ids_cpu[req_index, :prompt_len] = original_prompt_token_ids
+
+                self.is_token_ids[req_index, :prompt_len] = True
+
                 # Cache this list state for the next sibling request
                 self._last_prompt_token_ids_list = original_prompt_token_ids
                 self._last_prompt_token_ids_index = req_index
                 self._last_req_id = req_id
-                self._last_priority = curr_priority
                 # --- END OPTIMIZED ---
             else:
                 self._last_prompt_token_ids_list = None
                 self._last_prompt_token_ids_index = None
                 self._last_req_id = None
-                self._last_priority = None
 
             return req_index
 

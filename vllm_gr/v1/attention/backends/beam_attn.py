@@ -4,7 +4,6 @@
 
 import contextvars
 import copy
-import contextvars
 from dataclasses import dataclass
 from itertools import compress
 from typing import ClassVar
@@ -64,6 +63,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 BEAM_PREFIX_GROUPS_VAR = contextvars.ContextVar("beam_prefix_groups", default=None)
 PBSC_SHAPED_GROUPS_VAR = contextvars.ContextVar("pbsc_shaped_groups", default=None)
+
 
 @register_backend(AttentionBackendEnum.CUSTOM)
 class BeamAttentionBackend(AttentionBackend):
@@ -239,6 +239,7 @@ class BeamAttentionBackend(AttentionBackend):
             return "BeamAttentionBackend does not support sparse attention."
 
         return None
+
 
 @dataclass
 class BeamAttentionMetadata:
@@ -1158,19 +1159,6 @@ class BeamAttentionImpl(AttentionImpl):
                 layer._k_scale,
                 layer._v_scale,
             )
-            
-            # -------------------------------------------------------------
-            # PBSC KV Hook: Broadcast Leader's Tail Tokens to Children
-            # -------------------------------------------------------------
-            if getattr(attn_metadata, "pbsc_src_slots", None) is not None:
-                src_slots = attn_metadata.pbsc_src_slots
-                dst_slots = attn_metadata.pbsc_dst_slots
-                
-                k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
-                v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
-                
-                k_flat[dst_slots] = k_flat[src_slots]
-                v_flat[dst_slots] = v_flat[src_slots]
 
             # -------------------------------------------------------------
             # PBSC KV Hook: Broadcast Leader's Tail Tokens to Children

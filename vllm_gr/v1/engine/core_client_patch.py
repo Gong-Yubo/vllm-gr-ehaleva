@@ -34,7 +34,6 @@ def apply_batch_fork_patches():
     parent process)."""
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.v1.engine.core_client import AsyncMPClient
-    from vllm.v1.engine.output_processor import OutputProcessor
 
     from vllm_gr.v1.engine.engine_core_patch import _add_enum_member
 
