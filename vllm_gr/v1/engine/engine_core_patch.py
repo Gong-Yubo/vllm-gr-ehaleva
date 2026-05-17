@@ -79,7 +79,9 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
         for i in range(1, len(group_req_ids)):
             other_req = requests[group_req_ids[i]]
             # Use block hashes for a fast block-aligned LCP
-            num_common_blocks = _get_lcp(first_req.block_hashes, other_req.block_hashes, hint=prev_num_common_blocks)
+            num_common_blocks = _get_lcp(
+                first_req.block_hashes, other_req.block_hashes, hint=prev_num_common_blocks
+            )
             prev_num_common_blocks = num_common_blocks
             # Refine to token-level LCP by checking inside the first differing block
             pairwise_lcp = min(num_common_blocks * block_size, other_req.num_computed_tokens)
@@ -103,27 +105,26 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
     return all_groups
 
 
-def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: dict, block_size: int) -> None:
+def _apply_pbsc_routing(
+    enable_pbsc: bool, output, beam_groups: list, requests: dict, block_size: int
+) -> None:
     """Applies Partial-Block Shared Compute (PBSC) routing logic to the scheduled requests."""
 
     new_num_scheduled_tokens = {}
-    
+
     # PBSC Statistics
     pbsc_stats_groups_total = 0
     pbsc_stats_groups_active = 0
     pbsc_stats_children_total = 0
     pbsc_stats_children_valid = 0
     pbsc_stats_tokens_saved = 0
-    
     # PBSC Drop Reasons
     drop_fully_cached = 0
     drop_no_prefix = 0
     drop_tail_too_long = 0
 
-   
     pbsc_shaped_groups = []
-    
-    
+
     for orig_t_prefix, group_req_ids in beam_groups:
         if not enable_pbsc:
             break
@@ -134,17 +135,23 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
         cache_hit_groups = {}
         for req_id in group_req_ids:
             req = requests[req_id]
-            # vLLM updates req.num_computed_tokens during schedule(). 
-            # By subtracting the schedule, we get the exact number of tokens 
+            # vLLM updates req.num_computed_tokens during schedule().
+            # By subtracting the schedule, we get the exact number of tokens
             cache_hit = req.num_computed_tokens - output.num_scheduled_tokens[req_id]
-           
+
             # If the request already has the entire shared prefix in cache,
             # it doesn't need PBSC tail sharing.
             if cache_hit >= orig_t_prefix:
                 drop_fully_cached += 1
-                logger.debug("[PBSC debug] Subgroup skipped: tokens=%d, schedule=%d cache_hit=%d, orig_t_prefix=%d)", req.num_tokens, output.num_scheduled_tokens[req_id], cache_hit, orig_t_prefix)
+                logger.debug(
+                    "[PBSC debug] Subgroup skipped: tokens=%d, schedule=%d cache_hit=%d, orig_t_prefix=%d)",
+                    req.num_tokens,
+                    output.num_scheduled_tokens[req_id],
+                    cache_hit,
+                    orig_t_prefix,
+                )
                 continue
-                
+
             if cache_hit not in cache_hit_groups:
                 cache_hit_groups[cache_hit] = []
             cache_hit_groups[cache_hit].append(req_id)
@@ -168,10 +175,14 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
             # restrict the sharing to what is actually cached.
             if t_block_aligned > t_cache_hit:
                 t_prefix = min(t_prefix, t_cache_hit)
-                
+
             if t_prefix <= t_cache_hit:
                 drop_no_prefix += len(valid_children)
-                logger.debug("[PBSC debug] Subgroup skipped: t_prefix became <= t_cache_hit (orig_t_prefix=%d, t_cache_hit=%d)", orig_t_prefix, t_cache_hit)
+                logger.debug(
+                    "[PBSC debug] Subgroup skipped: t_prefix became <= t_cache_hit (orig_t_prefix=%d, t_cache_hit=%d)",
+                    orig_t_prefix,
+                    t_cache_hit,
+                )
                 continue
 
             # PBSC Safety Check: Active tail sharing is only for highly overlapping beams.
@@ -179,13 +190,16 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
             child_compute_len_estimate = leader_req.num_tokens - t_prefix
             if child_compute_len_estimate > block_size:
                 drop_tail_too_long += len(valid_children)
-                logger.debug("[PBSC debug] Subgroup skipped: tail too long (unshared=%d > block_size=%d)", child_compute_len_estimate, block_size)
+                logger.debug(
+                    "[PBSC debug] Subgroup skipped: tail too long (unshared=%d > block_size=%d)",
+                    child_compute_len_estimate,
+                    block_size,
+                )
                 continue
 
             pbsc_shaped_groups.append((t_prefix, sub_group_req_ids))
             pbsc_stats_groups_total += 1
             pbsc_stats_children_total += len(valid_children)
-            
             # Leader computes exactly what the scheduler told it to (respects chunking)
             leader_scheduled = output.num_scheduled_tokens[leader_id]
             new_num_scheduled_tokens[leader_id] = leader_scheduled
@@ -206,11 +220,17 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
     if pbsc_stats_groups_total > 0:
         logger.debug(
             "[PBSC Stats] Groups Active: %d / %d | Valid Children: %d / %d (%.1f%%) | Tokens Compute Saved: %d | Drops (Cached: %d, NoPrefix: %d, TailTooLong: %d)",
-            pbsc_stats_groups_active, pbsc_stats_groups_total,
-            pbsc_stats_children_valid, pbsc_stats_children_total,
-            (pbsc_stats_children_valid / pbsc_stats_children_total * 100) if pbsc_stats_children_total > 0 else 0,
+            pbsc_stats_groups_active,
+            pbsc_stats_groups_total,
+            pbsc_stats_children_valid,
+            pbsc_stats_children_total,
+            (pbsc_stats_children_valid / pbsc_stats_children_total * 100)
+            if pbsc_stats_children_total > 0
+            else 0,
             pbsc_stats_tokens_saved,
-            drop_fully_cached, drop_no_prefix, drop_tail_too_long
+            drop_fully_cached,
+            drop_no_prefix,
+            drop_tail_too_long,
         )
 
     output.beam_prefix_groups = beam_groups
@@ -222,17 +242,23 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
         for req_id in pbsc_group:
             if req_id in new_num_scheduled_tokens:
                 ordered_num_scheduled[req_id] = new_num_scheduled_tokens[req_id]
-    
     # Add any requests that were not in groups (just in case)
     for req_id, num in output.num_scheduled_tokens.items():
         if req_id not in ordered_num_scheduled:
             ordered_num_scheduled[req_id] = num
-            
     output.num_scheduled_tokens = ordered_num_scheduled
     output.total_num_scheduled_tokens = sum(ordered_num_scheduled.values())
 
     # PBSC: Update num_computed_tokens for children so GPUModelRunner
     # generates correct Position IDs and slot mappings.
+    # INVARIANT: `output.scheduled_new_reqs` and `output.scheduled_cached_reqs`
+    # are DTOs created fresh during `schedule()`. Mutating `num_computed_tokens`
+    # here only affects the message sent to the worker, instructing it to start
+    # the child's local computation at `t_prefix` (skipping the broadcast tokens).
+    # The Scheduler's internal state (`requests[child_id].num_computed_tokens`)
+    # correctly reflects the total computed tokens by the end of the step (including
+    # the broadcast ones), ensuring consistency with the KV-cache manager and
+    # subsequent steps. Therefore, we do not mutate `requests[child_id]` here.
     child_prefix_map = {}
     for t_prefix, pbsc_group in pbsc_shaped_groups:
         for child_id in pbsc_group[1:]:
@@ -242,7 +268,6 @@ def _apply_pbsc_routing(enable_pbsc: bool, output, beam_groups: list, requests: 
     for req_data in output.scheduled_new_reqs:
         if req_data.req_id in child_prefix_map:
             req_data.num_computed_tokens = child_prefix_map[req_data.req_id]
-            
     if hasattr(output, "scheduled_cached_reqs"):
         req_data = output.scheduled_cached_reqs
         if isinstance(req_data.num_computed_tokens, tuple):
@@ -470,6 +495,8 @@ def apply_scheduler_patch():
     """Monkey-patch Scheduler.schedule with the cache computed blocks version."""
     import torch
     from functools import wraps
+
+    import torch
     from vllm.v1.core.sched.scheduler import Scheduler
 
     if getattr(Scheduler, "_patched_for_cache_computed_blocks", False):
@@ -512,6 +539,43 @@ def apply_scheduler_patch():
                     attn_backend = os.environ.get("VLLM_ATTENTION_BACKEND", "NONE")
                     
             self._enable_pbsc = torch.cuda.is_available() and "CUSTOM" in str(attn_backend).upper()
+        enable_pbsc = self._enable_pbsc
+
+        # Evaluate once per scheduler instance based on actual model configs
+        if not hasattr(self, "_enable_pbsc"):
+            attn_backend = "NONE"
+
+            # 1. Check vllm_config for CLI arguments
+            if hasattr(self, "vllm_config"):
+                # Supports --attention-config.backend
+                if hasattr(self.vllm_config, "attention_config") and hasattr(
+                    self.vllm_config.attention_config, "backend"
+                ):
+                    attn_backend = getattr(self.vllm_config.attention_config, "backend")
+                # Supports --attention-backend (sometimes mapped directly to vllm_config or model_config)
+                if not attn_backend or "NONE" in str(attn_backend).upper():
+                    attn_backend = getattr(self.vllm_config, "attention_backend", "NONE")
+                if not attn_backend or "NONE" in str(attn_backend).upper():
+                    if hasattr(self.vllm_config, "model_config"):
+                        attn_backend = getattr(
+                            self.vllm_config.model_config, "attn_backend", "NONE"
+                        )
+
+            # 2. Fallback to environment variables
+            if not attn_backend or "NONE" in str(attn_backend).upper():
+                try:
+                    from vllm.envs import VLLM_ATTENTION_BACKEND
+
+                    attn_backend = str(VLLM_ATTENTION_BACKEND)
+                except ImportError:
+                    import os
+
+                    attn_backend = os.environ.get("VLLM_ATTENTION_BACKEND", "NONE")
+
+            self._enable_pbsc = torch.cuda.is_available() and "CUSTOM" in str(attn_backend).upper()
+            logger.info(
+                "PBSC (Partial-Block Shared Compute) routing enabled: %s", self._enable_pbsc
+            )
         enable_pbsc = self._enable_pbsc
 
         def get_cache_computed_blocks(req):
@@ -571,7 +635,9 @@ def apply_scheduler_patch():
             beam_groups = _compute_beam_prefix_groups(
                 req_ids, self.requests, self.cache_config.block_size
             )
-            _apply_pbsc_routing(enable_pbsc, output, beam_groups, self.requests, self.cache_config.block_size)
+            _apply_pbsc_routing(
+                enable_pbsc, output, beam_groups, self.requests, self.cache_config.block_size
+            )
 
         return output
 
@@ -584,7 +650,11 @@ def apply_worker_patches():
     """Monkey-patch GPUModelRunner to inject beam_prefix_groups into the attention builder."""
     try:
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-        from vllm_gr.v1.attention.backends.beam_attn import BEAM_PREFIX_GROUPS_VAR, PBSC_SHAPED_GROUPS_VAR
+
+        from vllm_gr.v1.attention.backends.beam_attn import (
+            BEAM_PREFIX_GROUPS_VAR,
+            PBSC_SHAPED_GROUPS_VAR,
+        )
         from vllm.v1.worker.gpu_input_batch import InputBatch
     except ImportError:
         return
@@ -617,7 +687,6 @@ def apply_worker_patches():
     def patched_build_attention_metadata(self, *args, **kwargs):
         beam_groups_str = getattr(self, "_current_beam_prefix_groups_str", None)
         pbsc_groups_str = getattr(self, "_current_pbsc_shaped_groups_str", None)
-        
 
         tokens_to_reset = []
         if beam_groups_str is not None or pbsc_groups_str is not None:
@@ -625,14 +694,24 @@ def apply_worker_patches():
                 r_id: i for i, r_id in enumerate(self.input_batch.req_ids) if r_id is not None
             }
             if beam_groups_str is not None:
-                translated_groups = [(d, [req_id_to_idx[r] for r in g if r in req_id_to_idx]) for d, g in beam_groups_str]
+                translated_groups = [
+                    (d, [req_id_to_idx[r] for r in g if r in req_id_to_idx])
+                    for d, g in beam_groups_str
+                ]
                 translated_groups = [(d, g) for d, g in translated_groups if g]
-                tokens_to_reset.append((BEAM_PREFIX_GROUPS_VAR, BEAM_PREFIX_GROUPS_VAR.set(translated_groups)))
-                
+                tokens_to_reset.append(
+                    (BEAM_PREFIX_GROUPS_VAR, BEAM_PREFIX_GROUPS_VAR.set(translated_groups))
+                )
+
             if pbsc_groups_str is not None:
-                translated_pbsc = [(d, [req_id_to_idx[r] for r in g if r in req_id_to_idx]) for d, g in pbsc_groups_str]
+                translated_pbsc = [
+                    (d, [req_id_to_idx[r] for r in g if r in req_id_to_idx])
+                    for d, g in pbsc_groups_str
+                ]
                 translated_pbsc = [(d, g) for d, g in translated_pbsc if g]
-                tokens_to_reset.append((PBSC_SHAPED_GROUPS_VAR, PBSC_SHAPED_GROUPS_VAR.set(translated_pbsc)))
+                tokens_to_reset.append(
+                    (PBSC_SHAPED_GROUPS_VAR, PBSC_SHAPED_GROUPS_VAR.set(translated_pbsc))
+                )
             try:
                 return _original_build_attention_metadata(self, *args, **kwargs)
             finally:

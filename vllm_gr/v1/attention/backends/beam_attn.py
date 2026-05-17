@@ -595,7 +595,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         # Convert token depths to block depths for cascade attention prefix
         group_prefix_tokens_tensor = torch.tensor(group_prefix_tokens, dtype=torch.int32)
         group_depths_tensor = group_prefix_tokens_tensor // self.block_size
-        
+
         prefix_kv_lens_cpu = group_depths_tensor * self.block_size
         prefix_kv_max_len = (
             int(prefix_kv_lens_cpu.max().item()) if prefix_kv_lens_cpu.numel() > 0 else 0
@@ -703,24 +703,39 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             t_block_aligned = (t_shared // self.block_size) * self.block_size
             tail_len = t_shared - t_block_aligned
             num_children = len(req_indices) - 1
-            
+
             if tail_len > 0 and num_children > 0:
                 leader_idx = req_indices[0]
-                tokens = list(range(t_block_aligned, t_shared))
-                leader_list = [leader_idx] * tail_len
-                
-                for child_idx in req_indices[1:]:
-                    all_leader_reqs.extend(leader_list)
-                    all_child_reqs.extend([child_idx] * tail_len)
-                    all_token_indices.extend(tokens)
-                    
+                all_leader_reqs.append(
+                    torch.full((num_children * tail_len,), leader_idx, dtype=torch.int32)
+                )
+
+                children = torch.tensor(req_indices[1:], dtype=torch.int32)
+                all_child_reqs.append(children.repeat_interleave(tail_len))
+
+                tokens = torch.arange(t_block_aligned, t_shared, dtype=torch.int32)
+                all_token_indices.append(tokens.repeat(num_children))
+
         if not all_leader_reqs:
             return None, None
-            
-        # Transfer to GPU asynchronously avoiding pageable H2D copies
-        leaders_tensor = torch.tensor(all_leader_reqs, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        children_tensor = torch.tensor(all_child_reqs, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
-        tokens_tensor = torch.tensor(all_token_indices, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+
+        num_slots = len(all_leader_reqs)
+
+        leaders_cat = torch.cat(all_leader_reqs)
+        children_cat = torch.cat(all_child_reqs)
+        tokens_cat = torch.cat(all_token_indices)
+        num_slots = leaders_cat.numel()
+
+        # Single pinned H2D copy
+        all_data_tensor = (
+            torch.cat([leaders_cat, children_cat, tokens_cat])
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+
+        leaders_tensor = all_data_tensor[:num_slots]
+        children_tensor = all_data_tensor[num_slots : 2 * num_slots]
+        tokens_tensor = all_data_tensor[2 * num_slots :]
 
         # Vectorized block math
         block_indices = tokens_tensor // self.block_size
@@ -732,7 +747,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         child_blocks = common_meta.block_table_tensor[children_tensor, block_indices]
         pbsc_dst_slots = (child_blocks * self.block_size + block_offsets).to(torch.int64)
-        
         return pbsc_src_slots, pbsc_dst_slots
 
     def _create_suffix_metadata(
@@ -1155,6 +1169,19 @@ class BeamAttentionImpl(AttentionImpl):
                 k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
                 v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
                 
+                k_flat[dst_slots] = k_flat[src_slots]
+                v_flat[dst_slots] = v_flat[src_slots]
+
+            # -------------------------------------------------------------
+            # PBSC KV Hook: Broadcast Leader's Tail Tokens to Children
+            # -------------------------------------------------------------
+            if getattr(attn_metadata, "pbsc_src_slots", None) is not None:
+                src_slots = attn_metadata.pbsc_src_slots
+                dst_slots = attn_metadata.pbsc_dst_slots
+
+                k_flat = key_cache.view(-1, self.num_kv_heads, self.head_size)
+                v_flat = value_cache.view(-1, self.num_kv_heads, self.head_size)
+
                 k_flat[dst_slots] = k_flat[src_slots]
                 v_flat[dst_slots] = v_flat[src_slots]
 
