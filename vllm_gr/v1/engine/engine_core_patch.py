@@ -722,34 +722,29 @@ def apply_worker_patches():
 
     if not getattr(InputBatch, "_patched_for_fast_beam_add", False):        
 
+        _original_add_request = InputBatch.add_request
+
         def patched_add_request(self, request, *args, **kwargs):
-            import torch
-            from vllm.utils import length_from_prompt_token_ids_or_embeds
-            from vllm.sampling_params import SamplingType
+            import numpy as np
 
-            req_index = self._register_add_request(request)
-
-            req_id = request.req_id
-            if req_index == len(self._req_ids):
-                self._req_ids.append(req_id)
-                self.req_output_token_ids.append(request.output_token_ids)
-                self.spec_token_ids.append([])
-            else:
-                self._req_ids[req_index] = req_id
-                self.req_output_token_ids[req_index] = request.output_token_ids
-                self.spec_token_ids[req_index].clear()
-
-            self.req_id_to_index[req_id] = req_index
-
-            # Copy the prompt token ids and output token ids.
-            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
-                request.prompt_token_ids, request.prompt_embeds
-            )
-            self.num_prompt_tokens[req_index] = num_prompt_tokens
-            start_idx = num_prompt_tokens
-            end_idx = start_idx + len(request.output_token_ids)
+            original_prompt_token_ids = request.prompt_token_ids
+            if original_prompt_token_ids is not None:
+                # Use a dummy array as a sentinel to skip the slow Python-to-numpy copy
+                # in the upstream method, while still providing the correct length.
+                dummy_tensor = np.empty(len(original_prompt_token_ids), dtype=self.token_ids_cpu.dtype)
+                request.prompt_token_ids = dummy_tensor
             
-            if request.prompt_token_ids is not None:
+            try:
+                req_index = _original_add_request(self, request, *args, **kwargs)
+            finally:
+                request.prompt_token_ids = original_prompt_token_ids
+            
+            assert isinstance(req_index, int), "Upstream add_request signature changed"
+
+            if original_prompt_token_ids is not None:
+                l = len(original_prompt_token_ids)
+                req_id = request.req_id
+                
                 # --- OPTIMIZED FAST PREFIX COPY ---
                 last_list = getattr(self, "_last_prompt_token_ids_list", None)
                 last_idx = getattr(self, "_last_prompt_token_ids_index", None)
@@ -757,7 +752,6 @@ def apply_worker_patches():
                 last_priority = getattr(self, "_last_priority", None)                
                 curr_priority = getattr(request, "priority", None)
                 
-                l = len(request.prompt_token_ids)
                 diverge_idx = -1
                 
                 # Check for prefix sharing with the last added request
@@ -773,122 +767,47 @@ def apply_worker_patches():
                                 is_same_beam_group = True
                                 
                     if is_same_beam_group:
-                        diverge_limit = 16
+                        diverge_limit = 8
                         start_check = max(0, l - diverge_limit)
                         
                         # Fast C-level slice comparison for the bulk of the shared prompt.
                         # This safely guarantees the entire prefix matches and avoids false positives.
-                        if request.prompt_token_ids[:start_check] == last_list[:start_check]:
-                            diverge_idx = start_check - 1
-                            # Scan forward to find the exact first divergence point
-                            for i in range(start_check, l):
-                                if request.prompt_token_ids[i] == last_list[i]:
-                                    diverge_idx = i
-                                else:
-                                    break                           
-                        else:
-                            # They don't share the expected prefix, fallback to full copy
-                            diverge_idx = -1
+                        # if original_prompt_token_ids[:start_check] == last_list[:start_check]:
+                        diverge_idx = start_check - 1
+                        # Scan forward to find the exact first divergence point
+                        for i in range(start_check, l):
+                            if original_prompt_token_ids[i] == last_list[i]:
+                                diverge_idx = i
+                            else:
+                                break                           
+                        # else:
+                        #     # They don't share the expected prefix, fallback to full copy
+                        #     diverge_idx = -1
                 
                 if diverge_idx >= 0:
                     # Copy shared prefix efficiently from previously populated numpy row
                     self.token_ids_cpu[req_index, :diverge_idx+1] = self.token_ids_cpu[last_idx, :diverge_idx+1]
                     # Process the divergent tail
                     if diverge_idx + 1 < l:
-                        self.token_ids_cpu[req_index, diverge_idx+1:l] = request.prompt_token_ids[diverge_idx+1:]
+                        self.token_ids_cpu[req_index, diverge_idx+1:l] = original_prompt_token_ids[diverge_idx+1:]
                 else:
                     # Fallback to slow Python-to-NumPy conversion
-                    self.token_ids_cpu[req_index, :l] = request.prompt_token_ids
+                    self.token_ids_cpu[req_index, :l] = original_prompt_token_ids
                 
                 self.is_token_ids[req_index, :l] = True
                 
                 # Cache this list state for the next sibling request
-                self._last_prompt_token_ids_list = request.prompt_token_ids
+                self._last_prompt_token_ids_list = original_prompt_token_ids
                 self._last_prompt_token_ids_index = req_index
                 self._last_req_id = req_id
                 self._last_priority = curr_priority
                 # --- END OPTIMIZED ---
             else:
-                self.is_token_ids[req_index, :num_prompt_tokens] = False
                 self._last_prompt_token_ids_list = None
                 self._last_prompt_token_ids_index = None
                 self._last_req_id = None
                 self._last_priority = None
-                
-            if request.prompt_embeds is not None:
-                self.req_prompt_embeds[req_index] = request.prompt_embeds
-            self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
-            self.is_token_ids[req_index, start_idx:end_idx] = True
-            self.num_tokens_no_spec[req_index] = request.num_tokens
 
-            self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
-            self.block_table.add_row(request.block_ids, req_index)
-
-            if sampling_params := request.sampling_params:
-                if sampling_params.sampling_type == SamplingType.GREEDY:
-                    self.temperature_cpu[req_index] = 0.0
-                    self.greedy_reqs.add(req_id)
-                else:
-                    self.temperature_cpu[req_index] = sampling_params.temperature
-                    self.random_reqs.add(req_id)
-
-                self.top_p_cpu[req_index] = sampling_params.top_p
-                if sampling_params.top_p < 1:
-                    self.top_p_reqs.add(req_id)
-                top_k = sampling_params.top_k
-                if 0 < top_k < self.vocab_size:
-                    self.top_k_reqs.add(req_id)
-                else:
-                    top_k = self.vocab_size
-                self.top_k_cpu[req_index] = top_k
-                self.frequency_penalties_cpu[req_index] = sampling_params.frequency_penalty
-                if sampling_params.frequency_penalty != 0.0:
-                    self.frequency_penalties_reqs.add(req_id)
-                self.presence_penalties_cpu[req_index] = sampling_params.presence_penalty
-                if sampling_params.presence_penalty != 0.0:
-                    self.presence_penalties_reqs.add(req_id)
-                self.repetition_penalties_cpu[req_index] = sampling_params.repetition_penalty
-                if sampling_params.repetition_penalty != 1.0:
-                    self.repetition_penalties_reqs.add(req_id)
-
-                if request.generator is not None:
-                    self.generators[req_index] = request.generator
-
-                if sampling_params.logprobs is not None:
-                    self.num_logprobs[req_id] = (
-                        self.vocab_size if sampling_params.logprobs == -1 else sampling_params.logprobs
-                    )
-
-                if sampling_params.allowed_token_ids:
-                    self.has_allowed_token_ids.add(req_id)
-                    if self.allowed_token_ids_mask_cpu_tensor is None:
-                        self.allowed_token_ids_mask = torch.zeros(self.max_num_reqs, self.vocab_size, dtype=torch.bool, device=self.device)
-                        self.allowed_token_ids_mask_cpu_tensor = torch.zeros(self.max_num_reqs, self.vocab_size, dtype=torch.bool, device="cpu")
-                    self.allowed_token_ids_mask_cpu_tensor[req_index] = True
-                    self.allowed_token_ids_mask_cpu_tensor[req_index][sampling_params.allowed_token_ids] = False
-
-                if sampling_params.bad_words_token_ids:
-                    self.bad_words_token_ids[req_index] = sampling_params.bad_words_token_ids
-            elif pooling_params := request.pooling_params:
-                pooling_states = request.pooling_states
-                assert pooling_states is not None
-                self.pooling_params[req_id] = pooling_params
-                self.pooling_states[req_id] = pooling_states
-                self.logits_processing_needs_token_ids[req_index] = pooling_params.requires_token_ids
-            else:
-                raise NotImplementedError("Unrecognized request type")
-
-            self.num_accepted_tokens_cpu[req_index] = 1
-
-            if request.lora_request:
-                lora_id = request.lora_request.lora_int_id
-                if lora_id not in self.lora_id_to_request_ids:
-                    self.lora_id_to_request_ids[lora_id] = set()
-                self.request_lora_mapping[req_index] = lora_id
-                self.lora_id_to_request_ids[lora_id].add(request.req_id)
-                self.lora_id_to_lora_request[lora_id] = request.lora_request
-            else:
-                self.request_lora_mapping[req_index] = 0
             return req_index
 
     InputBatch.add_request = patched_add_request
