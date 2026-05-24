@@ -71,10 +71,11 @@ def _handle_mega_request_step_update(self, update) -> None:
         if session_cached is None and update.parent_beam_ids:
             session_cached = self.beam_cache.get(update.parent_beam_ids[0])
 
+        parent_states = []
         if session_cached is not None:
             parent_states = [self.beam_cache.get(pid, session_cached) for pid in update.parent_beam_ids]
 
-    if session_cached is None:
+    if session_cached is None and update.beam_width > 0:
         logger.error("MEGA_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
         for child_id in update.child_beam_ids:
             self.output_queue.put_nowait((
@@ -133,6 +134,13 @@ def _handle_mega_request_step_update(self, update) -> None:
 
     # Optimization 2: Bulk Write Phase (Single Lock Commit)
     with self.beam_cache_lock:
+        if update.pruned_ids:
+            for pid in update.pruned_ids:
+                self.beam_cache.pop(pid, None)
+        if update.parent_beam_ids:
+            for pid in update.parent_beam_ids:
+                self.beam_cache.pop(pid, None)
+
         for req in requests_to_cache:
             self.beam_cache[req.request_id] = {
                 "all_token_ids": req.prompt_token_ids,
@@ -143,17 +151,12 @@ def _handle_mega_request_step_update(self, update) -> None:
                 "prompt_embeds": req.prompt_embeds,
                 "mm_features": req.mm_features,
             }
-        self.beam_cache[session_id] = session_cached    
-        if update.pruned_ids:
-            for pid in update.pruned_ids:
-                self.beam_cache.pop(pid, None)
+        if update.beam_width > 0 and session_cached is not None:
+            self.beam_cache[session_id] = session_cached    
         # If beam_width is 0, this is an explicit tear-down message for the session
         if update.beam_width == 0:
             self.beam_cache.pop(session_id, None)
-            # Defensive check: clear out the session key if it was masquerading as a beam
-            if update.pruned_ids:
-                for pid in update.pruned_ids:
-                    self.beam_cache.pop(pid, None)
+            print("len of beam_cache:", len(self.beam_cache))
 
     # Non-blocking concurrent queue pushes
     for item in inputs_to_push:

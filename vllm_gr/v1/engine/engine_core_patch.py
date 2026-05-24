@@ -15,38 +15,6 @@ logger = init_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _get_lcp(a: list, b: list, hint: int = 0) -> int:
-    """Find longest common prefix between two hash lists using binary search."""
-    m = min(len(a), len(b))
-    if m == 0:
-        return 0
-
-    start = 0
-    end = m - 1
-
-    if hint > 0:
-        h = min(hint, m)
-        if a[h - 1] == b[h - 1]:
-            if h == m or a[h] != b[h]:
-                return h
-            start = h
-        else:
-            end = h - 2
-
-    if start <= end and a[end] == b[end]:
-        return end + 1
-
-    ans = start
-    low, high = start, end
-    while low <= high:
-        mid = (low + high) // 2
-        if a[mid] == b[mid]:
-            ans = mid + 1
-            low = mid + 1
-        else:
-            high = mid - 1
-    return ans
-
 
 def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: int) -> list:
     """Group requests by beam priority and find the common prefix length in tokens."""
@@ -72,35 +40,9 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
             all_groups.append((0, [group_req_ids[0]]))
             continue
 
-        prev_num_common_blocks = 0
-        # Find the longest common prefix (LCP) for the group.
-        first_req = requests[group_req_ids[0]]
-        lcp_tokens = first_req.num_computed_tokens
-        for i in range(1, len(group_req_ids)):
-            other_req = requests[group_req_ids[i]]
-            # Use block hashes for a fast block-aligned LCP
-            num_common_blocks = _get_lcp(
-                first_req.block_hashes, other_req.block_hashes, hint=prev_num_common_blocks
-            )
-            prev_num_common_blocks = num_common_blocks
-            # Refine to token-level LCP by checking inside the first differing block
-            pairwise_lcp = min(num_common_blocks * block_size, other_req.num_computed_tokens)
-            limit = min(lcp_tokens, other_req.num_computed_tokens)
-
-            first_tokens = first_req._all_token_ids
-            other_tokens = other_req._all_token_ids
-
-            for i in range(pairwise_lcp, limit):
-                if first_tokens[i] != other_tokens[i]:
-                    limit = i
-                    break
-            pairwise_lcp = limit
-
-            lcp_tokens = min(lcp_tokens, pairwise_lcp)
-            if lcp_tokens == 0:
-                break
-
-        all_groups.append((lcp_tokens, group_req_ids))
+        # Use request's prefix_len attribute directly instead of block hash matching
+        lcp_tokens = min(getattr(requests[r_id], "prefix_len", 0) for r_id in group_req_ids)
+        all_groups.append((lcp_tokens-1, group_req_ids))
 
     return all_groups
 

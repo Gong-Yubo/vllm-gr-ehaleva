@@ -393,7 +393,7 @@ async def beam_search(
                 eos_token_id=eos_token_id,
                 lora_request=lora_request,
                 trace_headers=trace_headers,
-                prefix_len=len(all_beams[0].tokens) if all_beams else 0,
+                prefix_len=len(initial_tokens),
                 priority=priority,
                 data_parallel_rank=rank,
             )
