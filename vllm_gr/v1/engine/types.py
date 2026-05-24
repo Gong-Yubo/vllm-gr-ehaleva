@@ -43,3 +43,53 @@ class BeamForkRequest(
     lora_request: LoRARequest | None = None
     cache_salt: str | None = None
     trace_headers: Mapping[str, str] | None = None
+
+
+class BeamStepUpdate(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    """Single-message step update for a Frontend-Driven Persistent Session."""
+
+    session_id: str
+    survivor_ids: list[str]
+    survivor_tokens: list[int]
+    pruned_ids: list[str]
+    prefix_len: int
+    sampling_params: SamplingParams
+    eos_token_id: int | None = None
+    client_index: int = 0
+    current_wave: int = 0
+    priority: int = 0
+    data_parallel_rank: int | None = None
+    lora_request: LoRARequest | None = None
+    cache_salt: str | None = None
+    trace_headers: Mapping[str, str] | None = None
+
+
+class MegaRequestStepUpdate(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    """Single logical message for all branches of a decode step."""
+
+    session_id: str
+    parent_beam_ids: list[str]
+    child_beam_ids: list[str]
+    beam_tokens: list[int]
+    pruned_ids: list[str]
+    prefix_len: int
+    beam_width: int
+    sampling_params: SamplingParams
+    eos_token_id: int | None = None
+    client_index: int = 0
+    current_wave: int = 0
+    priority: int = 0
+    data_parallel_rank: int | None = None
+    lora_request: LoRARequest | None = None
+    cache_salt: str | None = None
+    trace_headers: Mapping[str, str] | None = None

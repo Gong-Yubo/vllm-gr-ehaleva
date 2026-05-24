@@ -11,11 +11,16 @@ from vllm.logger import init_logger
 
 from vllm_gr.v1.engine.async_llm import (
     _add_requests_batch_fn,
-    beam_fork_fn,
+    beam_step_update_fn,
+    mega_request_step_update_fn,
     prepare_request_fn,
     register_beam_output_fn,
 )
-from vllm_gr.v1.engine.core_client import add_requests_async, beam_fork_async
+from vllm_gr.v1.engine.core_client import (
+    add_requests_async,
+    beam_step_update_async,
+    mega_request_step_update_async,
+)
 
 logger = init_logger(__name__)
 
@@ -39,14 +44,20 @@ def apply_batch_fork_patches():
 
     # Ensure enum members exist in parent process
     _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_FORK", b"\x06")
+    _add_enum_member("BEAM_STEP_UPDATE", b"\x07")
+    _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x08")
 
     # Patch AsyncMPClient
     AsyncMPClient.add_requests_async = add_requests_async
-    AsyncMPClient.beam_fork_async = beam_fork_async
+    AsyncMPClient.beam_step_update_async = beam_step_update_async
+    AsyncMPClient.mega_request_step_update_async = mega_request_step_update_async
 
     # Patch AsyncLLM
     AsyncLLM.prepare_request = prepare_request_fn
     AsyncLLM._add_requests_batch = _add_requests_batch_fn
     AsyncLLM.register_beam_output = register_beam_output_fn
-    AsyncLLM.beam_fork = beam_fork_fn
+    AsyncLLM.beam_step_update = beam_step_update_fn
+    AsyncLLM.mega_request_step_update = mega_request_step_update_fn
+
+
+

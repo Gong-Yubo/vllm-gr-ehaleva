@@ -43,74 +43,125 @@ def _cache_beam_request(self, request) -> None:
         }
 
 
-def _handle_beam_fork(self, fork_req) -> None:
-    """Create child Requests from cached parent state.
+def _handle_mega_request_step_update(self, update) -> None:
+    """Apply a grouped step update for all active branches with batched locking."""
 
-    Thread-safe: uses beam_cache_lock to prevent data races.
-    """
     from vllm.v1.request import Request
+    from vllm.v1.engine import EngineCoreOutputs, EngineCoreOutput, FinishReason
 
-    for parent_id, child_id, token_id in zip(
-        fork_req.parent_ids, fork_req.child_ids, fork_req.token_ids
-    ):
-        with self.beam_cache_lock:
-            cached = self.beam_cache.get(parent_id)
-        if cached is None:
-            logger.error("BEAM_FORK: parent %s not in cache", parent_id)
-            self.output_queue.put_nowait(
-                (
-                    fork_req.client_index,
-                    EngineCoreOutputs(
-                        engine_index=self.engine_index,
-                        finished_requests=[child_id],
-                        outputs=[
-                            EngineCoreOutput(
-                                request_id=child_id,
-                                new_token_ids=[],
-                                finish_reason=FinishReason.ERROR,
-                            )
-                        ],
-                    ),
+    session_id = update.session_id
+    B = update.beam_width
+
+    # Validate parallel arrays
+    if len(update.beam_tokens) != B or len(update.parent_beam_ids) != B or len(update.child_beam_ids) != B:
+        logger.error("MEGA_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
+        for child_id in update.child_beam_ids:
+            self.output_queue.put_nowait((
+                update.client_index,
+                EngineCoreOutputs(
+                    engine_index=self.engine_index,
+                    finished_requests={child_id},
+                    outputs=[EngineCoreOutput(request_id=child_id, new_token_ids=[], finish_reason=FinishReason.ERROR)]
                 )
-            )
-            continue
+            ))
+        return
 
-        child_token_ids = cached["all_token_ids"] + [token_id]
+    with self.beam_cache_lock:
+        session_cached = self.beam_cache.get(session_id)
+        if session_cached is None and update.parent_beam_ids:
+            session_cached = self.beam_cache.get(update.parent_beam_ids[0])
+
+        if session_cached is not None:
+            parent_states = [self.beam_cache.get(pid, session_cached) for pid in update.parent_beam_ids]
+
+    if session_cached is None:
+        logger.error("MEGA_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
+        for child_id in update.child_beam_ids:
+            self.output_queue.put_nowait((
+                update.client_index,
+                EngineCoreOutputs(
+                    engine_index=self.engine_index,
+                    finished_requests={child_id},
+                    outputs=[EngineCoreOutput(request_id=child_id, new_token_ids=[], finish_reason=FinishReason.ERROR)]
+                )
+            ))
+        return
+
+    arrival = time.time()
+    requests_to_cache = []
+    inputs_to_push = []
+
+    # Parallel loop calculation (Safe to process heavy hashing outside the lock)
+    for i, (parent_id, child_id, token_id, parent_state) in enumerate(zip(
+        update.parent_beam_ids, update.child_beam_ids, update.beam_tokens, parent_states
+    )):
+        child_token_ids = parent_state["all_token_ids"] + [token_id]
 
         req = Request(
             request_id=child_id,
             prompt_token_ids=child_token_ids,
-            sampling_params=fork_req.sampling_params,
+            sampling_params=update.sampling_params,
             pooling_params=None,
             eos_token_id=(
-                fork_req.eos_token_id
-                if fork_req.eos_token_id is not None
-                else cached["eos_token_id"]
+                update.eos_token_id if update.eos_token_id is not None else session_cached["eos_token_id"]
             ),
-            client_index=fork_req.client_index,
-            arrival_time=time.time(),
-            lora_request=(fork_req.lora_request or cached["lora_request"]),
-            cache_salt=fork_req.cache_salt or cached["cache_salt"],
-            priority=fork_req.priority,
-            trace_headers=fork_req.trace_headers,
-            prompt_embeds=cached["prompt_embeds"],
-            mm_features=cached["mm_features"],
+            client_index=update.client_index,
+            arrival_time=arrival,
+            lora_request=(update.lora_request or session_cached["lora_request"]),
+            cache_salt=update.cache_salt or session_cached["cache_salt"],
+            priority=update.priority,
+            trace_headers=update.trace_headers,
+            prompt_embeds=session_cached["prompt_embeds"],
+            mm_features=session_cached["mm_features"],
             block_hasher=None,  # Skip O(N) hash computation
         )
 
         # Clone parent's block hashes and incrementally compute new ones
-        req.block_hashes = list(cached["block_hashes"])
+        req.block_hashes = list(parent_state["block_hashes"])
         if self.request_block_hasher is not None:
             req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
             req.block_hashes.extend(req.get_hash_new_full_blocks())
 
-        self._cache_beam_request(req)
-        self.input_queue.put_nowait((EngineCoreRequestType.ADD, (req, fork_req.current_wave)))
+        # Metadata Enrichment
+        req.is_mega_beam = True
+        req.mega_beam_width = B
+        req.mega_beam_index = i
+        req.prefix_len = update.prefix_len
 
-    # Clean up parents + aborted beams from cache
+        requests_to_cache.append(req)
+        inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
+
+    # Optimization 2: Bulk Write Phase (Single Lock Commit)
     with self.beam_cache_lock:
-        for pid in set(fork_req.parent_ids) | set(fork_req.abort_ids):
-            self.beam_cache.pop(pid, None)
+        for req in requests_to_cache:
+            self.beam_cache[req.request_id] = {
+                "all_token_ids": req.prompt_token_ids,
+                "block_hashes": req.block_hashes,
+                "eos_token_id": req.eos_token_id,
+                "lora_request": req.lora_request,
+                "cache_salt": req.cache_salt,
+                "prompt_embeds": req.prompt_embeds,
+                "mm_features": req.mm_features,
+            }
+        self.beam_cache[session_id] = session_cached    
+        if update.pruned_ids:
+            for pid in update.pruned_ids:
+                self.beam_cache.pop(pid, None)
+        # If beam_width is 0, this is an explicit tear-down message for the session
+        if update.beam_width == 0:
+            self.beam_cache.pop(session_id, None)
+            # Defensive check: clear out the session key if it was masquerading as a beam
+            if update.pruned_ids:
+                for pid in update.pruned_ids:
+                    self.beam_cache.pop(pid, None)
+
+    # Non-blocking concurrent queue pushes
+    for item in inputs_to_push:
+        self.input_queue.put_nowait(item)
+
+    if update.pruned_ids:
+        for abort_id in update.pruned_ids:
+            self.aborts_queue.put_nowait(abort_id)
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +185,12 @@ def process_input_sockets(
     from vllm.v1.engine import EngineCoreRequest, EngineCoreRequestType
     from vllm.v1.serial_utils import MsgpackDecoder
 
-    from vllm_gr.v1.engine.types import BeamForkRequest
+    from vllm_gr.v1.engine.types import MegaRequestStepUpdate
 
     # Msgpack serialization decoding.
     add_request_decoder = MsgpackDecoder(EngineCoreRequest)
     add_batch_decoder = MsgpackDecoder(list[EngineCoreRequest])
-    beam_fork_decoder = MsgpackDecoder(BeamForkRequest)
+    mega_request_decoder = MsgpackDecoder(MegaRequestStepUpdate)
     generic_decoder = MsgpackDecoder()
 
     with ExitStack() as stack, zmq.Context() as ctx:
@@ -202,9 +253,9 @@ def process_input_sockets(
                         self.input_queue.put_nowait((EngineCoreRequestType.ADD, request))
                     continue
 
-                elif request_type == EngineCoreRequestType.BEAM_FORK:
-                    fork_req: BeamForkRequest = beam_fork_decoder.decode(data_frames)
-                    self._handle_beam_fork(fork_req)
+                elif request_type == EngineCoreRequestType.MEGA_REQUEST_STEP_UPDATE:
+                    mega_update: MegaRequestStepUpdate = mega_request_decoder.decode(data_frames)
+                    self._handle_mega_request_step_update(mega_update)
                     continue
 
                 else:

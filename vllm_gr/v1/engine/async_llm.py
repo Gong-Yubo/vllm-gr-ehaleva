@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_gr.v1.engine.types import BeamForkRequest
+from vllm_gr.v1.engine.types import BeamStepUpdate, MegaRequestStepUpdate
 
 logger = init_logger(__name__)
 
@@ -172,6 +172,14 @@ def register_beam_output_fn(
     return queue
 
 
-async def beam_fork_fn(self, fork_request: BeamForkRequest) -> None:
-    """Send BEAM_FORK to EngineCore."""
-    await self.engine_core.beam_fork_async(fork_request)
+async def beam_step_update_fn(self, step_update: BeamStepUpdate) -> None:
+    """Send BEAM_STEP_UPDATE to EngineCore (new persistent-session path).
+
+    Replace the per-step ADD_BATCH + BEAM_FORK pair with a single message.
+    """
+    await self.engine_core.beam_step_update_async(step_update)
+
+
+async def mega_request_step_update_fn(self, update: MegaRequestStepUpdate) -> None:
+    """Send MEGA_REQUEST_STEP_UPDATE to EngineCore to grouped processing."""
+    await self.engine_core.mega_request_step_update_async(update)

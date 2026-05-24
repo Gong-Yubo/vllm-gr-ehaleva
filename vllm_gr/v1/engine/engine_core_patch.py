@@ -374,26 +374,21 @@ def apply_engine_core_child_patches():
 
     from vllm_gr.v1.engine.core import (
         _cache_beam_request,
-        _handle_beam_fork,
+        _handle_mega_request_step_update,
         process_input_sockets,
     )
-    from vllm_gr.v1.engine.types import BeamForkRequest
+    
 
-    # Inject types into vllm.v1.engine module
-    engine_mod.BeamForkRequest = BeamForkRequest
-
-    # Add new enum members: ADD_BATCH, BEAM_FORK
+    # Add new enum members: ADD_BATCH, MEGA_REQUEST_STEP_UPDATE
     _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("BEAM_FORK", b"\x06")
+    _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x08")
 
     # Wrap EngineCore.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
 
-    # Bind _cache_beam_request and _handle_beam_fork on both classes
+    # Bind _cache_beam_request and _handle_mega_request_step_update on both classes
     EngineCore._cache_beam_request = _cache_beam_request
-    EngineCore._handle_beam_fork = _handle_beam_fork
-    EngineCoreProc._cache_beam_request = _cache_beam_request
-    EngineCoreProc._handle_beam_fork = _handle_beam_fork
+    EngineCore._handle_mega_request_step_update = _handle_mega_request_step_update
 
     # Replace EngineCoreProc.process_input_sockets
     EngineCoreProc.process_input_sockets = process_input_sockets

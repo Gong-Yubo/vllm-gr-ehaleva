@@ -19,8 +19,9 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils import random_uuid
 
 from vllm_gr.logprobs import extract_and_dedup_flat_logprobs, reconstruct_beam_logprobs
-from vllm_gr.v1.engine.types import BeamForkRequest
 from vllm_gr.v1.metrics.stats import RequestStateStats
+from vllm_gr.v1.engine.types import MegaRequestStepUpdate
+
 
 logger = init_logger(__name__)
 
@@ -50,69 +51,6 @@ async def _gather_beam_results(queues):
     """Gather results from multiple output queues."""
     tasks = [asyncio.create_task(_collect_beam_result(q)) for q in queues]
     return list(await asyncio.gather(*tasks))
-
-
-async def _beam_fork_step(
-    engine_client,
-    fork_info,
-    prev_beam_internal_ids,
-    all_beams,
-    request_id_batch,
-    beam_search_params,
-    eos_token_id,
-    lora_request,
-    trace_headers,
-    priority=0,
-    data_parallel_rank: int | None = None,
-):
-    """BEAM_FORK path: fork parent beams into children (steps 1+).
-
-    Returns (output_list, new_internal_ids).
-    """
-    parent_ids = []
-    child_ids = []
-    child_token_ids = []
-    queues = []
-
-    for new_idx, (parent_beam_idx, tok) in enumerate(fork_info):
-        parent_id = prev_beam_internal_ids[parent_beam_idx]
-        child_id = f"{request_id_batch}-beam-{new_idx}"
-        parent_ids.append(parent_id)
-        child_ids.append(child_id)
-        child_token_ids.append(tok)
-
-        q = engine_client.register_beam_output(
-            child_id,
-            all_beams[parent_beam_idx].tokens,
-            beam_search_params,
-            eos_token_id=eos_token_id,
-            lora_request=lora_request,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-        )
-        queues.append(q)
-
-    used = set(parent_ids)
-    abort_ids = [pid for pid in prev_beam_internal_ids if pid not in used]
-
-    await engine_client.beam_fork(
-        BeamForkRequest(
-            parent_ids=parent_ids,
-            child_ids=child_ids,
-            token_ids=child_token_ids,
-            abort_ids=abort_ids,
-            sampling_params=beam_search_params,
-            eos_token_id=eos_token_id,
-            lora_request=lora_request,
-            trace_headers=trace_headers,
-            data_parallel_rank=data_parallel_rank,
-            priority=priority,
-        )
-    )
-
-    output = await _gather_beam_results(queues)
-    return output, child_ids
 
 
 async def _add_batch_step(
@@ -152,6 +90,94 @@ async def _add_batch_step(
     output = await _gather_beam_results(queues)
     return output, internal_ids
 
+async def _mega_request_step(
+    engine_client,
+    session_id: str,
+    fork_info,
+    prev_beam_internal_ids,
+    all_beams,
+    request_id_batch,
+    beam_search_params,
+    eos_token_id,
+    lora_request,
+    trace_headers,
+    prefix_len: int,
+    priority=0,
+    data_parallel_rank: int | None = None,
+):
+    """MEGA_REQUEST path: single logical message update for all active branches."""
+    parent_beam_ids = []
+    child_beam_ids = []
+    beam_tokens = []
+    queues = []
+
+    # Map the current generation step's routing array
+    for new_idx, (parent_beam_idx, tok) in enumerate(fork_info):
+        parent_id = prev_beam_internal_ids[parent_beam_idx]
+        child_id = f"{request_id_batch}-beam-{new_idx}"
+        parent_beam_ids.append(parent_id)
+        child_beam_ids.append(child_id)
+        beam_tokens.append(tok)
+
+        # Retain the stream listener queues for individual beams
+        q = engine_client.register_beam_output(
+            child_id,
+            all_beams[parent_beam_idx].tokens,
+            beam_search_params,
+            eos_token_id=eos_token_id,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            priority=priority,
+            data_parallel_rank=data_parallel_rank,
+        )
+        queues.append(q)
+
+    # Detect branches that were pruned during top-K filtering
+    used_parents = set(parent_beam_ids)
+    pruned_ids = [pid for pid in prev_beam_internal_ids if pid not in used_parents]
+
+    # Dispatch the consolidated persistent update to the client
+    await engine_client.mega_request_step_update(
+        MegaRequestStepUpdate(
+            session_id=session_id,
+            parent_beam_ids=parent_beam_ids,
+            child_beam_ids=child_beam_ids,
+            beam_tokens=beam_tokens,
+            pruned_ids=pruned_ids,
+            prefix_len=prefix_len,
+            beam_width=len(fork_info),
+            sampling_params=beam_search_params,
+            eos_token_id=eos_token_id,
+            lora_request=lora_request,
+            trace_headers=trace_headers,
+            data_parallel_rank=data_parallel_rank,
+            priority=priority,
+        )
+    )
+
+    output = await _gather_beam_results(queues)
+    return output, child_beam_ids
+
+async def _mega_request_cleanup(engine_client, session_id, final_ids, rank):
+    """Signals the core engine to fully purge all remaining session cache allocations."""
+    if not final_ids:
+        return
+    try:
+        await engine_client.mega_request_step_update(
+            MegaRequestStepUpdate(
+                session_id=session_id,
+                parent_beam_ids=[],
+                child_beam_ids=[],
+                beam_tokens=[],
+                pruned_ids=final_ids,  # Clear the surviving beams from the final step
+                prefix_len=0,
+                beam_width=0,          # 0 indicates a termination/cleanup call
+                sampling_params=SamplingParams(), # Dummy placeholder
+                data_parallel_rank=rank,
+            )
+        )
+    except Exception as e:
+        logger.error("Failed to clear mega_request cache for session %s: %s", session_id, e)
 
 async def beam_search(
     self,
@@ -302,7 +328,7 @@ async def beam_search(
 
     # Check once if the engine supports batch submission / beam fork.
     use_batch = hasattr(self.engine_client, "prepare_request")
-    use_beam_fork = hasattr(self.engine_client, "beam_fork")
+    use_mega_request = hasattr(self.engine_client, "mega_request_step_update")
 
     if not use_batch:
         raise VLLMValidationError(
@@ -354,17 +380,20 @@ async def beam_search(
 
         gen_start = time.perf_counter()
 
-        if use_beam_fork and fork_info is not None:
-            output, prev_beam_internal_ids = await _beam_fork_step(
+        # Intercept steps 1+ using the session update pipeline
+        if use_mega_request and fork_info is not None:
+            output, prev_beam_internal_ids = await _mega_request_step(
                 self.engine_client,
-                fork_info,
-                prev_beam_internal_ids,
-                all_beams,
-                request_id_batch,
-                beam_search_params,
-                eos_token_id,
-                lora_request,
-                trace_headers,
+                session_id=request_id,
+                fork_info=fork_info,
+                prev_beam_internal_ids=prev_beam_internal_ids,
+                all_beams=all_beams,
+                request_id_batch=request_id_batch,
+                beam_search_params=beam_search_params,
+                eos_token_id=eos_token_id,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                prefix_len=len(all_beams[0].tokens) if all_beams else 0,
                 priority=priority,
                 data_parallel_rank=rank,
             )
@@ -375,7 +404,7 @@ async def beam_search(
                 lora_req_batch,
                 request_id_batch,
                 beam_search_params,
-                use_beam_fork,
+                use_mega_request,
                 trace_headers,
                 priority=priority,
                 data_parallel_rank=rank,
@@ -409,18 +438,8 @@ async def beam_search(
 
             # check for error finish reason and abort beam search
             if result.outputs[0].finish_reason == "error":
-                # Clean up beam cache before returning to avoid leak.
-                if use_beam_fork and prev_beam_internal_ids:
-                    await self.engine_client.beam_fork(
-                        BeamForkRequest(
-                            parent_ids=[],
-                            child_ids=[],
-                            token_ids=[],
-                            abort_ids=prev_beam_internal_ids,
-                            sampling_params=beam_search_params,
-                            data_parallel_rank=rank,
-                        )
-                    )
+                if use_mega_request and prev_beam_internal_ids:
+                    await _mega_request_cleanup(self.engine_client, request_id, prev_beam_internal_ids, rank)
                 # yield error output and terminate beam search
                 yield RequestOutput(
                     request_id=request_id,
@@ -510,23 +529,14 @@ async def beam_search(
             new_beams.append(new_beam)
 
         # Build fork_info for next iteration's BEAM_FORK.
-        if use_beam_fork:
+        if use_mega_request:
             fork_info = [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
 
         all_beams = new_beams
 
-    # Cleanup: remove remaining beam cache entries.
-    if use_beam_fork and prev_beam_internal_ids:
-        await self.engine_client.beam_fork(
-            BeamForkRequest(
-                parent_ids=[],
-                child_ids=[],
-                token_ids=[],
-                abort_ids=prev_beam_internal_ids,
-                sampling_params=beam_search_params,
-                data_parallel_rank=rank,
-            )
-        )
+    # Cleanup: remove remaining beam cache entries after generation finishes successfully
+    if use_mega_request and prev_beam_internal_ids:
+        await _mega_request_cleanup(self.engine_client, request_id, prev_beam_internal_ids, rank)
 
     if sid_end_token_id is not None:
         for beam in all_beams:
