@@ -44,8 +44,7 @@ def _cache_beam_request(self, request) -> None:
 
 
 def _handle_mega_request_step_update(self, update) -> None:
-    """Apply a grouped step update for all active branches with batched locking."""
-
+    """Apply a grouped step update using only the prefill cache entry."""
     from vllm.v1.request import Request
     from vllm.v1.engine import EngineCoreOutputs, EngineCoreOutput, FinishReason
 
@@ -66,14 +65,12 @@ def _handle_mega_request_step_update(self, update) -> None:
             ))
         return
 
+    # Fetch the shared prefill cache entry
     with self.beam_cache_lock:
         session_cached = self.beam_cache.get(session_id)
         if session_cached is None and update.parent_beam_ids:
+            # First decode step: retrieve from the initial batch request ID
             session_cached = self.beam_cache.get(update.parent_beam_ids[0])
-
-        parent_states = []
-        if session_cached is not None:
-            parent_states = [self.beam_cache.get(pid, session_cached) for pid in update.parent_beam_ids]
 
     if session_cached is None and update.beam_width > 0:
         logger.error("MEGA_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
@@ -89,18 +86,16 @@ def _handle_mega_request_step_update(self, update) -> None:
         return
 
     arrival = time.time()
-    requests_to_cache = []
     inputs_to_push = []
 
-    # Parallel loop calculation (Safe to process heavy hashing outside the lock)
-    for i, (parent_id, child_id, token_id, parent_state) in enumerate(zip(
-        update.parent_beam_ids, update.child_beam_ids, update.beam_tokens, parent_states
-    )):
-        child_token_ids = parent_state["all_token_ids"] + [token_id]
-
+    prefill_tokens = session_cached["all_token_ids"]
+    prefill_block_hashes = list(session_cached["block_hashes"])
+    # Map directly over incoming full sequences without looking up intermediate parents
+    for i, (child_id, gen_tokens) in enumerate(zip(update.child_beam_ids, update.beam_tokens)):
+        child_token_ids = prefill_tokens + gen_tokens
         req = Request(
             request_id=child_id,
-            prompt_token_ids=child_token_ids,
+            prompt_token_ids=child_token_ids, # Using the full token sequence directly
             sampling_params=update.sampling_params,
             pooling_params=None,
             eos_token_id=(
@@ -114,11 +109,11 @@ def _handle_mega_request_step_update(self, update) -> None:
             trace_headers=update.trace_headers,
             prompt_embeds=session_cached["prompt_embeds"],
             mm_features=session_cached["mm_features"],
-            block_hasher=None,  # Skip O(N) hash computation
+            block_hasher=None,  
         )
 
-        # Clone parent's block hashes and incrementally compute new ones
-        req.block_hashes = list(parent_state["block_hashes"])
+        # Start with the prefill block hashes; block_hasher extends it incrementally
+        req.block_hashes = prefill_block_hashes
         if self.request_block_hasher is not None:
             req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
             req.block_hashes.extend(req.get_hash_new_full_blocks())
@@ -129,34 +124,25 @@ def _handle_mega_request_step_update(self, update) -> None:
         req.mega_beam_index = i
         req.prefix_len = update.prefix_len
 
-        requests_to_cache.append(req)
         inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
 
-    # Optimization 2: Bulk Write Phase (Single Lock Commit)
+    # Bulk Write Phase - Keep only the base session_id cache
     with self.beam_cache_lock:
-        if update.pruned_ids:
-            for pid in update.pruned_ids:
-                self.beam_cache.pop(pid, None)
+        # Clear original prefill batch request IDs during Step 1 to prevent leaking
         if update.parent_beam_ids:
             for pid in update.parent_beam_ids:
                 self.beam_cache.pop(pid, None)
+        if update.pruned_ids:
+            for pid in update.pruned_ids:
+                self.beam_cache.pop(pid, None)
 
-        for req in requests_to_cache:
-            self.beam_cache[req.request_id] = {
-                "all_token_ids": req.prompt_token_ids,
-                "block_hashes": req.block_hashes,
-                "eos_token_id": req.eos_token_id,
-                "lora_request": req.lora_request,
-                "cache_salt": req.cache_salt,
-                "prompt_embeds": req.prompt_embeds,
-                "mm_features": req.mm_features,
-            }
+        # Retain only the base prefill cache under the session_id for future decode steps
         if update.beam_width > 0 and session_cached is not None:
             self.beam_cache[session_id] = session_cached    
-        # If beam_width is 0, this is an explicit tear-down message for the session
+            
+        # Clear the session completely upon generation termination / cleanup message
         if update.beam_width == 0:
             self.beam_cache.pop(session_id, None)
-            print("len of beam_cache:", len(self.beam_cache))
 
     # Non-blocking concurrent queue pushes
     for item in inputs_to_push:
@@ -165,7 +151,6 @@ def _handle_mega_request_step_update(self, update) -> None:
     if update.pruned_ids:
         for abort_id in update.pruned_ids:
             self.aborts_queue.put_nowait(abort_id)
-
 
 # ---------------------------------------------------------------------------
 # EngineCoreProc.process_input_sockets replacement

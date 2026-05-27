@@ -117,12 +117,16 @@ async def _mega_request_step(
         child_id = f"{request_id_batch}-beam-{new_idx}"
         parent_beam_ids.append(parent_id)
         child_beam_ids.append(child_id)
-        beam_tokens.append(tok)
+        
+        # all_beams was updated to new_beams at the end of the previous step.
+        # all_beams[new_idx] already contains the exact historical sequence including the new token.
+        full_tokens = all_beams[new_idx].tokens
+        beam_tokens.append(full_tokens[prefix_len:])
 
         # Retain the stream listener queues for individual beams
         q = engine_client.register_beam_output(
             child_id,
-            all_beams[parent_beam_idx].tokens,
+            full_tokens,
             beam_search_params,
             eos_token_id=eos_token_id,
             lora_request=lora_request,
@@ -341,7 +345,6 @@ async def beam_search(
     prev_beam_internal_ids: list[str] = []
     # fork_info: list of (parent_beam_idx, token_id) for BEAM_FORK
     fork_info: list[tuple[int, int]] | None = None
-
     for token in range(max_tokens - pre_calc):
         if token == 1:
             beam_search_start = time.perf_counter()

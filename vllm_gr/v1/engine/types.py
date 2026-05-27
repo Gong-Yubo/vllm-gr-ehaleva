@@ -80,7 +80,7 @@ class MegaRequestStepUpdate(
     session_id: str
     parent_beam_ids: list[str]
     child_beam_ids: list[str]
-    beam_tokens: list[int]
+    beam_tokens: list[list[int]]
     pruned_ids: list[str]
     prefix_len: int
     beam_width: int

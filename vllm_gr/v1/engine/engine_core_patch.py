@@ -42,7 +42,7 @@ def _compute_beam_prefix_groups(req_ids: list[str], requests: dict, block_size: 
 
         # Use request's prefix_len attribute directly instead of block hash matching
         lcp_tokens = min(getattr(requests[r_id], "prefix_len", 0) for r_id in group_req_ids)
-        all_groups.append((lcp_tokens-1, group_req_ids))
+        all_groups.append((lcp_tokens, group_req_ids))
 
     return all_groups
 
