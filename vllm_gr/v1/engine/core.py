@@ -68,9 +68,6 @@ def _handle_mega_request_step_update(self, update) -> None:
     # Fetch the shared prefill cache entry
     with self.beam_cache_lock:
         session_cached = self.beam_cache.get(session_id)
-        if session_cached is None and update.parent_beam_ids:
-            # First decode step: retrieve from the initial batch request ID
-            session_cached = self.beam_cache.get(update.parent_beam_ids[0])
 
     if session_cached is None and update.beam_width > 0:
         logger.error("MEGA_REQUEST_STEP_UPDATE: session %s not in cache", session_id)
@@ -132,22 +129,9 @@ def _handle_mega_request_step_update(self, update) -> None:
 
         inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
 
-    # Bulk Write Phase - Keep only the base session_id cache
-    with self.beam_cache_lock:
-        # Clear original prefill batch request IDs during Step 1 to prevent leaking
-        if update.parent_beam_ids:
-            for pid in update.parent_beam_ids:
-                self.beam_cache.pop(pid, None)
-        if update.pruned_ids:
-            for pid in update.pruned_ids:
-                self.beam_cache.pop(pid, None)
-
-        # Retain only the base prefill cache under the session_id for future decode steps
-        if update.beam_width > 0 and session_cached is not None:
-            self.beam_cache[session_id] = session_cached    
-            
-        # Clear the session completely upon generation termination / cleanup message
-        if update.beam_width == 0:
+    # Clear the session completely upon generation termination / cleanup message
+    if update.beam_width == 0:
+        with self.beam_cache_lock:            
             self.beam_cache.pop(session_id, None)
 
     # Non-blocking concurrent queue pushes

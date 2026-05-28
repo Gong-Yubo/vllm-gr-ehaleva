@@ -345,6 +345,7 @@ async def beam_search(
     prev_beam_internal_ids: list[str] = []
     # fork_info: list of (parent_beam_idx, token_id) for BEAM_FORK
     fork_info: list[tuple[int, int]] | None = None
+    prefill_id: str | None = None
     for token in range(max_tokens - pre_calc):
         if token == 1:
             beam_search_start = time.perf_counter()
@@ -387,7 +388,7 @@ async def beam_search(
         if use_mega_request and fork_info is not None:
             output, prev_beam_internal_ids = await _mega_request_step(
                 self.engine_client,
-                session_id=request_id,
+                session_id=prefill_id,
                 fork_info=fork_info,
                 prev_beam_internal_ids=prev_beam_internal_ids,
                 all_beams=all_beams,
@@ -414,6 +415,8 @@ async def beam_search(
             )
             if new_ids:
                 prev_beam_internal_ids = new_ids
+                if prefill_id is None:
+                    prefill_id = new_ids[0]
         else:
             raise VLLMValidationError(
                 "internal error. use_batch must be enabled",
@@ -442,7 +445,7 @@ async def beam_search(
             # check for error finish reason and abort beam search
             if result.outputs[0].finish_reason == "error":
                 if use_mega_request and prev_beam_internal_ids:
-                    await _mega_request_cleanup(self.engine_client, request_id, prev_beam_internal_ids, rank)
+                    await _mega_request_cleanup(self.engine_client, prefill_id, prev_beam_internal_ids, rank)
                 # yield error output and terminate beam search
                 yield RequestOutput(
                     request_id=request_id,
@@ -539,7 +542,7 @@ async def beam_search(
 
     # Cleanup: remove remaining beam cache entries after generation finishes successfully
     if use_mega_request and prev_beam_internal_ids:
-        await _mega_request_cleanup(self.engine_client, request_id, prev_beam_internal_ids, rank)
+        await _mega_request_cleanup(self.engine_client, prefill_id, prev_beam_internal_ids, rank)
 
     if sid_end_token_id is not None:
         for beam in all_beams:
