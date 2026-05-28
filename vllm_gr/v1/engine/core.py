@@ -90,6 +90,12 @@ def _handle_mega_request_step_update(self, update) -> None:
 
     prefill_tokens = session_cached["all_token_ids"]
     prefill_block_hashes = list(session_cached["block_hashes"])
+    lora_request = session_cached["lora_request"]
+    cache_salt = session_cached["cache_salt"]
+    mm_features = session_cached["mm_features"]
+    prompt_embeds = session_cached["prompt_embeds"]
+    eos = session_cached["eos_token_id"]
+
     # Map directly over incoming full sequences without looking up intermediate parents
     for i, (child_id, gen_tokens) in enumerate(zip(update.child_beam_ids, update.beam_tokens)):
         child_token_ids = prefill_tokens + gen_tokens
@@ -99,16 +105,16 @@ def _handle_mega_request_step_update(self, update) -> None:
             sampling_params=update.sampling_params,
             pooling_params=None,
             eos_token_id=(
-                update.eos_token_id if update.eos_token_id is not None else session_cached["eos_token_id"]
+                update.eos_token_id if update.eos_token_id is not None else eos
             ),
             client_index=update.client_index,
             arrival_time=arrival,
-            lora_request=(update.lora_request or session_cached["lora_request"]),
-            cache_salt=update.cache_salt or session_cached["cache_salt"],
+            lora_request=(update.lora_request or lora_request),
+            cache_salt=update.cache_salt or cache_salt,
             priority=update.priority,
             trace_headers=update.trace_headers,
-            prompt_embeds=session_cached["prompt_embeds"],
-            mm_features=session_cached["mm_features"],
+            prompt_embeds=prompt_embeds,
+            mm_features=mm_features,
             block_hasher=None,  
         )
 
