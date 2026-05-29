@@ -93,41 +93,45 @@ def _handle_mega_request_step_update(self, update) -> None:
     prompt_embeds = session_cached["prompt_embeds"]
     eos = session_cached["eos_token_id"]
 
-    # Map directly over incoming full sequences without looking up intermediate parents
-    for i, (child_id, gen_tokens) in enumerate(zip(update.child_beam_ids, update.beam_tokens)):
-        child_token_ids = prefill_tokens + gen_tokens
-        req = Request(
-            request_id=child_id,
-            prompt_token_ids=child_token_ids, # Using the full token sequence directly
-            sampling_params=update.sampling_params,
-            pooling_params=None,
-            eos_token_id=(
-                update.eos_token_id if update.eos_token_id is not None else eos
-            ),
-            client_index=update.client_index,
-            arrival_time=arrival,
-            lora_request=(update.lora_request or lora_request),
-            cache_salt=update.cache_salt or cache_salt,
-            priority=update.priority,
-            trace_headers=update.trace_headers,
-            prompt_embeds=prompt_embeds,
-            mm_features=mm_features,
-            block_hasher=None,  
-        )
+    # Pack the shared prefill and all beam suffixes into a single contiguous Mega Request
+    mega_token_ids = list(prefill_tokens)
+    decode_steps = len(update.beam_tokens[0]) if update.beam_tokens else 0
+    for gen_tokens in update.beam_tokens:
+        mega_token_ids.extend(gen_tokens)
 
-        # Start with the prefill block hashes; block_hasher extends it incrementally
-        req.block_hashes = prefill_block_hashes
-        if self.request_block_hasher is not None:
-            req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
-            req.block_hashes.extend(req.get_hash_new_full_blocks())
+    req = Request(
+        request_id=session_id,  # Single request ID representing all beams
+        prompt_token_ids=mega_token_ids,
+        sampling_params=update.sampling_params,
+        pooling_params=None,
+        eos_token_id=(
+            update.eos_token_id if update.eos_token_id is not None else eos
+        ),
+        client_index=update.client_index,
+        arrival_time=arrival,
+        lora_request=(update.lora_request or lora_request),
+        cache_salt=update.cache_salt or cache_salt,
+        priority=update.priority,
+        trace_headers=update.trace_headers,
+        prompt_embeds=prompt_embeds,
+        mm_features=mm_features,
+        block_hasher=None,  
+    )
 
-        # Metadata Enrichment
-        req.is_mega_beam = True
-        req.mega_beam_width = B
-        req.mega_beam_index = i
-        req.prefix_len = update.prefix_len
+    # Start with the prefill block hashes; block_hasher extends it incrementally
+    req.block_hashes = prefill_block_hashes
+    if self.request_block_hasher is not None:
+        req.get_hash_new_full_blocks = partial(self.request_block_hasher, req)
+        req.block_hashes.extend(req.get_hash_new_full_blocks())
 
-        inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
+    # Metadata Enrichment
+    req.is_mega_beam = True
+    req.mega_beam_width = B
+    req.is_mega_decode = True  # Flag indicating it's the decode stage
+    req.mega_decode_steps = decode_steps
+    req.prefix_len = update.prefix_len
+
+    inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
 
     # Clear the session completely upon generation termination / cleanup message
     if update.beam_width == 0:

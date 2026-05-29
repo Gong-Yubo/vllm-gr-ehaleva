@@ -14,6 +14,10 @@ def patch_beam_search():
 
 def patch_sampling():
     ChatCompletionRequest.to_beam_search_params = to_beam_search_params
+    
+    from vllm.sampling_params import SamplingParams
+    # Force the greedy verification check to be a no-op to allow n > 1 under greedy beam search parameters
+    SamplingParams._verify_greedy_sampling = lambda self: None
 
 
 def patch_batch_and_fork():

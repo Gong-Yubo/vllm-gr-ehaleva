@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import copy
 import time
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any
@@ -109,7 +110,6 @@ async def _mega_request_step(
     parent_beam_ids = []
     child_beam_ids = []
     beam_tokens = []
-    queues = []
 
     # Map the current generation step's routing array
     for new_idx, (parent_beam_idx, tok) in enumerate(fork_info):
@@ -123,18 +123,28 @@ async def _mega_request_step(
         full_tokens = all_beams[new_idx].tokens
         beam_tokens.append(full_tokens[prefix_len:])
 
-        # Retain the stream listener queues for individual beams
-        q = engine_client.register_beam_output(
-            child_id,
-            full_tokens,
-            beam_search_params,
-            eos_token_id=eos_token_id,
-            lora_request=lora_request,
-            trace_headers=trace_headers,
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-        )
-        queues.append(q)
+    # -------------------------------------------------------------------------
+    # CRITICAL SWITCH: Set n=W strictly for the decode phase
+    # -------------------------------------------------------------------------
+    # Keep n=1 at step 0 so vLLM returns top-K logprobs for a single prompt token.
+    # For steps 1+, force n=W so the sampler allocates W generation tracks.
+    decode_sampling_params = copy.copy(beam_search_params)
+    decode_sampling_params.n = len(fork_info)
+
+    # -------------------------------------------------------------------------
+    # PERSISTENT SINGLE QUEUE MONITORING
+    # -------------------------------------------------------------------------
+    # Listen exclusively to the parent session_id stream queue
+    q = engine_client.register_beam_output(
+        session_id,
+        all_beams[0].tokens,
+        decode_sampling_params,
+        eos_token_id=eos_token_id,
+        lora_request=lora_request,
+        trace_headers=trace_headers,
+        priority=priority,
+        data_parallel_rank=data_parallel_rank,
+    )
 
     # Detect branches that were pruned during top-K filtering
     used_parents = set(parent_beam_ids)
@@ -150,7 +160,7 @@ async def _mega_request_step(
             pruned_ids=pruned_ids,
             prefix_len=prefix_len,
             beam_width=len(fork_info),
-            sampling_params=beam_search_params,
+            sampling_params=decode_sampling_params,  # Propagates n=W to core
             eos_token_id=eos_token_id,
             lora_request=lora_request,
             trace_headers=trace_headers,
@@ -159,8 +169,29 @@ async def _mega_request_step(
         )
     )
 
-    output = await _gather_beam_results(queues)
-    return output, child_beam_ids
+    # Await the singular unified engine execution response block
+    single_output = await _collect_beam_result(q)
+
+    # -------------------------------------------------------------------------
+    # BACKWARD-COMPATIBLE DEMULTIPLEXING PASS
+    # -------------------------------------------------------------------------
+    # Map the single RequestOutput containing W CompletionOutputs back into 
+    # an array of W independent virtual RequestOutputs to preserve accuracy downstream.
+    mocked_outputs = []
+    for b in range(len(fork_info)):
+        completion_out = single_output.outputs[b] if b < len(single_output.outputs) else single_output.outputs[0]
+        mocked_outputs.append(
+            RequestOutput(
+                request_id=f"{request_id_batch}-beam-{b}",
+                prompt="",
+                outputs=[completion_out],
+                finished=single_output.finished,
+                prompt_token_ids=[],
+                prompt_logprobs=None
+            )
+        )
+
+    return mocked_outputs, child_beam_ids
 
 async def _mega_request_cleanup(engine_client, session_id, final_ids, rank):
     """Signals the core engine to fully purge all remaining session cache allocations."""
