@@ -51,6 +51,18 @@ def _handle_mega_request_step_update(self, update) -> None:
     session_id = update.session_id
     B = update.beam_width
 
+    # Clear the session completely upon generation termination / cleanup message
+    if B == 0:
+        with self.beam_cache_lock:            
+            self.beam_cache.pop(session_id, None)
+        
+        # We MUST abort the running mega-request session_id itself!
+        self.aborts_queue.put_nowait(session_id)
+        if update.pruned_ids:
+            for abort_id in update.pruned_ids:
+                self.aborts_queue.put_nowait(abort_id)
+        return
+
     # Validate parallel arrays
     if len(update.beam_tokens) != B or len(update.parent_beam_ids) != B or len(update.child_beam_ids) != B:
         logger.error("MEGA_REQUEST_STEP_UPDATE: session=%s length mismatch", session_id)
@@ -132,11 +144,6 @@ def _handle_mega_request_step_update(self, update) -> None:
     req.prefix_len = update.prefix_len
 
     inputs_to_push.append((EngineCoreRequestType.ADD, (req, update.current_wave)))
-
-    # Clear the session completely upon generation termination / cleanup message
-    if update.beam_width == 0:
-        with self.beam_cache_lock:            
-            self.beam_cache.pop(session_id, None)
 
     # Non-blocking concurrent queue pushes
     for item in inputs_to_push:

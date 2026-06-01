@@ -126,10 +126,8 @@ async def _mega_request_step(
     # -------------------------------------------------------------------------
     # CRITICAL SWITCH: Set n=W strictly for the decode phase
     # -------------------------------------------------------------------------
-    # Keep n=1 at step 0 so vLLM returns top-K logprobs for a single prompt token.
-    # For steps 1+, force n=W so the sampler allocates W generation tracks.
     decode_sampling_params = copy.copy(beam_search_params)
-    decode_sampling_params.n = len(fork_info)
+    decode_sampling_params.n = 1
 
     # -------------------------------------------------------------------------
     # PERSISTENT SINGLE QUEUE MONITORING
@@ -160,7 +158,7 @@ async def _mega_request_step(
             pruned_ids=pruned_ids,
             prefix_len=prefix_len,
             beam_width=len(fork_info),
-            sampling_params=decode_sampling_params,  # Propagates n=W to core
+            sampling_params=decode_sampling_params,  # Propagates n=1 to core
             eos_token_id=eos_token_id,
             lora_request=lora_request,
             trace_headers=trace_headers,
@@ -175,11 +173,16 @@ async def _mega_request_step(
     # -------------------------------------------------------------------------
     # BACKWARD-COMPATIBLE DEMULTIPLEXING PASS
     # -------------------------------------------------------------------------
-    # Map the single RequestOutput containing W CompletionOutputs back into 
+    # Map the single RequestOutput containing 1 CompletionOutput back into 
     # an array of W independent virtual RequestOutputs to preserve accuracy downstream.
     mocked_outputs = []
-    for b in range(len(fork_info)):
-        completion_out = single_output.outputs[b] if b < len(single_output.outputs) else single_output.outputs[0]
+    W = len(fork_info)
+    for b in range(W):
+        completion_out = copy.copy(single_output.outputs[0])
+
+        if len(completion_out.token_ids) >= W:
+            completion_out.token_ids = [completion_out.token_ids[-W + b]]
+
         mocked_outputs.append(
             RequestOutput(
                 request_id=f"{request_id_batch}-beam-{b}",
@@ -190,7 +193,7 @@ async def _mega_request_step(
                 prompt_logprobs=None
             )
         )
-
+    print("mocked_outputs", mocked_outputs)
     return mocked_outputs, child_beam_ids
 
 async def _mega_request_cleanup(engine_client, session_id, final_ids, rank):
@@ -317,6 +320,7 @@ async def beam_search(
         temperature=temperature,
         detokenize=False,
         flat_logprobs=True,
+        # logprob_token_ids=[0] * beam_width,  # Pre-allocate sampler buffers!
     )
     initial_tokens = list(prompt_token_ids)
     # NOTE: FlatLogprobs intentionally passed where BeamSearchSequence

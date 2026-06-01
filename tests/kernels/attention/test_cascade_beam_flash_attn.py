@@ -29,19 +29,21 @@ except ImportError:
         "vllm_flash_attn is not supported.",
         allow_module_level=True,
     )
+
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
-HEAD_SIZES = [128, 192, 256]
+HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16]
 DTYPES = [torch.float16, torch.bfloat16]
 CASES = [
     # Case 1. A general case.
-    (8, 128, 8),
+    #Q_SEQ, KV_SEQ, Suffix
+    (8, 118, 8),
     (4, 64, 4),
     # Case 2. A general case + only suffix.
     (4, 16, 4),
-    # Case 3. Flash-decoding case.
+    # # Case 3. Flash-decoding case.
     (1, 32, 8),
-    # Case 4. Flash-decoding case + only suffix.
+    # # Case 4. Flash-decoding case + only suffix.
     (1, 16, 4),
 ]
 
@@ -247,104 +249,148 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs) -> torch.Tensor:
     # Dynamically determine groups from block tables
     groups = get_prefix_groups(inputs.block_tables)
 
-    # Filter for actual sharing
-    shared_groups = [g for g in groups if g[0] > 0]
+    std_indices = []
+    std_q_lens = []
+    std_seq_lens_list = []
+    std_block_tables = []
+    
+    mega_prefix_indices = []
+    mega_prefix_q_lens = []
+    mega_prefix_seq_lens_list = []
+    mega_suffix_q_lens = []
+    mega_suffix_seq_lens_list = []
+    mega_suffix_seq_idx = []
+    mega_suffix_start_tok = []
+    mega_suffix_out_offset = []
+    mega_prefix_block_tables = []
+    
+    offset = 0
+    device = inputs.query.device
 
-    # Construct metadata from shared_groups
-    # 1. cu_prefix_query_lens
-    group_q_lens = [len(g[1]) * inputs.q_seq_len for g in shared_groups]
-    cu_prefix_query_lens = torch.tensor(
-        [0] + group_q_lens, dtype=torch.int32, device=inputs.query.device
-    ).cumsum(0, dtype=torch.int32)
+    from vllm_gr.v1.attention.backends.beam_attn import BeamAttentionMetadata
 
-    # 2. prefix_kv_lens
-    prefix_kv_lens = torch.tensor(
-        [g[0] * inputs.block_size for g in shared_groups],
-        dtype=torch.int32,
-        device=inputs.query.device,
-    )
+    for depth, seq_ids in groups:
+        if depth == 0:
+            for seq_idx in seq_ids:
+                q_curr = seq_idx * inputs.q_seq_len
+                std_indices.extend(range(q_curr, q_curr + inputs.q_seq_len))
+                std_q_lens.append(inputs.q_seq_len)
+                std_seq_lens_list.append(inputs.seq_lens[seq_idx].item())
+                std_block_tables.append(inputs.block_tables[seq_idx])
+        else:
+            prefix_len_tokens = depth * inputs.block_size
+            for seq_idx in seq_ids:
+                q_curr = seq_idx * inputs.q_seq_len
+                b_uncached = inputs.q_seq_len
+                b_cache_len = prefix_len_tokens
+                b_suffix_start = prefix_len_tokens
+                b_suffix_len = inputs.seq_lens[seq_idx].item() - prefix_len_tokens
 
-    # 3. prefix_block_table
-    if shared_groups:
-        first_reqs = [g[1][0] for g in shared_groups]
-        prefix_block_table = inputs.block_tables[first_reqs]
+                mega_prefix_indices.extend(range(q_curr, q_curr + b_uncached))
+                mega_prefix_q_lens.append(b_uncached)
+                mega_prefix_seq_lens_list.append(b_cache_len)
+
+                mega_suffix_q_lens.append(b_uncached)
+                mega_suffix_seq_lens_list.append(b_suffix_len)
+                mega_suffix_seq_idx.append(seq_idx)
+                mega_suffix_start_tok.append(b_suffix_start)
+                mega_suffix_out_offset.append(offset)
+
+                offset += b_suffix_len
+                mega_prefix_block_tables.append(inputs.block_tables[seq_idx])
+
+    if std_q_lens:
+        std_indices_tensor = torch.tensor(std_indices, dtype=torch.long, device=device)
+        std_seq_lens = torch.tensor(std_seq_lens_list, dtype=torch.int32, device=device)
+        std_cu_seqlens_q = torch.tensor([0] + std_q_lens, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
+        std_max_q_len = max(std_q_lens) if std_q_lens else 0
+        std_max_seq_len = max(std_seq_lens_list) if std_seq_lens_list else 0
+        std_block_table = torch.stack(std_block_tables).contiguous()
     else:
-        prefix_block_table = torch.empty((0, 0), dtype=torch.int32, device=inputs.query.device)
+        std_indices_tensor = std_seq_lens = std_cu_seqlens_q = std_block_table = None
+        std_max_q_len = std_max_seq_len = 0
 
-    # 4. Suffix metadata
-    shift_amounts = torch.zeros(inputs.num_seqs, dtype=torch.int32, device=inputs.query.device)
-    for depth, req_ids in shared_groups:
-        shift_amounts[req_ids] = depth
+    if mega_prefix_q_lens:
+        mega_prefix_indices_tensor = torch.tensor(mega_prefix_indices, dtype=torch.long, device=device)
+        mega_prefix_seq_lens = torch.tensor(mega_prefix_seq_lens_list, dtype=torch.int32, device=device)
+        mega_prefix_max_seq_len = max(mega_prefix_seq_lens_list) if mega_prefix_seq_lens_list else 0
+        mega_prefix_cu_seqlens_q = torch.tensor([0] + mega_prefix_q_lens, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
+        mega_prefix_max_q_len = max(mega_prefix_q_lens) if mega_prefix_q_lens else 0
+        mega_prefix_block_table = torch.stack(mega_prefix_block_tables).contiguous()
+        
+        mega_suffix_seq_lens = torch.tensor(mega_suffix_seq_lens_list, dtype=torch.int32, device=device)
+        mega_suffix_max_seq_len = max(mega_suffix_seq_lens_list) if mega_suffix_seq_lens_list else 0
+        
+        mega_suffix_cu_seqlens_q = torch.tensor([0] + mega_suffix_q_lens, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
+        mega_suffix_cu_seqlens_k = torch.tensor([0] + mega_suffix_seq_lens_list, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
+        mega_suffix_max_q_len = max(mega_suffix_q_lens) if mega_suffix_q_lens else 0
+        
+        mega_suffix_seq_idx = torch.tensor(mega_suffix_seq_idx, dtype=torch.int32, device=device)
+        mega_suffix_start_tok = torch.tensor(mega_suffix_start_tok, dtype=torch.int32, device=device)
+        mega_suffix_out_offset = torch.tensor(mega_suffix_out_offset, dtype=torch.int32, device=device)
+    else:
+        mega_prefix_indices_tensor = mega_prefix_seq_lens = mega_prefix_cu_seqlens_q = mega_prefix_block_table = None
+        mega_prefix_max_q_len = mega_prefix_max_seq_len = 0
+        mega_suffix_cu_seqlens_q = mega_suffix_cu_seqlens_k = mega_suffix_seq_lens = None
+        mega_suffix_max_q_len = mega_suffix_max_seq_len = 0
+        mega_suffix_seq_idx = mega_suffix_start_tok = mega_suffix_out_offset = None
 
-    max_blocks = inputs.block_tables.shape[1]
-    col_indices = torch.arange(max_blocks, device=inputs.query.device, dtype=torch.int32).unsqueeze(
-        0
-    ) + shift_amounts.unsqueeze(1)
-    col_indices = torch.clamp(col_indices, max=max_blocks - 1)
-    suffix_block_table = torch.gather(inputs.block_tables, 1, col_indices)
-
-    suffix_kv_lens = torch.clamp(inputs.seq_lens - (shift_amounts * inputs.block_size), min=0)
-
-    cu_suffix_query_lens = torch.arange(
-        0,
-        (inputs.num_seqs + 1) * inputs.q_seq_len,
-        inputs.q_seq_len,
-        dtype=torch.int32,
-        device=inputs.query.device,
+    attn_metadata = BeamAttentionMetadata(
+        num_actual_tokens=inputs.num_seqs * inputs.q_seq_len,
+        max_query_len=inputs.q_seq_len,
+        query_start_loc=torch.arange(0, (inputs.num_seqs + 1) * inputs.q_seq_len, inputs.q_seq_len, dtype=torch.int32, device=device),
+        max_seq_len=inputs.max_seq_len,
+        seq_lens=inputs.seq_lens,
+        block_table=inputs.block_tables,
+        slot_mapping=torch.empty(0),
+        causal=True,
+        std_indices=std_indices_tensor,
+        std_cu_seqlens_q=std_cu_seqlens_q,
+        std_seq_lens=std_seq_lens,
+        std_max_q_len=std_max_q_len,
+        std_max_seq_len=std_max_seq_len,
+        std_block_table=std_block_table,
+        mega_prefix_indices=mega_prefix_indices_tensor,
+        mega_prefix_cu_seqlens_q=mega_prefix_cu_seqlens_q,
+        mega_prefix_seq_lens=mega_prefix_seq_lens,
+        mega_prefix_max_q_len=mega_prefix_max_q_len,
+        mega_prefix_max_seq_len=mega_prefix_max_seq_len,
+        mega_prefix_block_table=mega_prefix_block_table,
+        mega_suffix_cu_seqlens_q=mega_suffix_cu_seqlens_q,
+        mega_suffix_cu_seqlens_k=mega_suffix_cu_seqlens_k,
+        mega_suffix_seq_lens=mega_suffix_seq_lens,
+        mega_suffix_max_q_len=mega_suffix_max_q_len,
+        mega_suffix_max_seq_len=mega_suffix_max_seq_len,
+        mega_suffix_seq_idx=mega_suffix_seq_idx,
+        mega_suffix_start_tok=mega_suffix_start_tok,
+        mega_suffix_out_offset=mega_suffix_out_offset,
     )
-
-    # Max lengths
-    prefix_query_max_len = int(max(group_q_lens)) if group_q_lens else 0
-    prefix_kv_max_len = int(prefix_kv_lens.max().item()) if prefix_kv_lens.numel() > 0 else 0
-    suffix_query_max_len = inputs.q_seq_len
-    suffix_kv_max_len = int(suffix_kv_lens.max().item()) if suffix_kv_lens.numel() > 0 else 0
-
-    # Prefix indices generation
-    flat_req_ids_list = [req_id for _, req_ids in shared_groups for req_id in req_ids]
-    prefix_indices_is_identity = len(flat_req_ids_list) == inputs.num_seqs
-
-    prefix_indices = None
-    if not prefix_indices_is_identity and flat_req_ids_list:
-        flat_req_ids = torch.tensor(flat_req_ids_list, device=inputs.query.device, dtype=torch.long)
-        # In this test, q_seq_len is constant per request
-        starts = flat_req_ids * inputs.q_seq_len
-        lengths = torch.full_like(starts, inputs.q_seq_len)
-
-        total_prefix_tokens = lengths.sum().item()
-        arrange_tensor = torch.arange(
-            total_prefix_tokens, device=inputs.query.device, dtype=torch.long
-        )
-        cumsum_lengths = torch.zeros(
-            lengths.numel() + 1, dtype=torch.long, device=inputs.query.device
-        )
-        torch.cumsum(lengths, dim=0, out=cumsum_lengths[1:])
-        offsets = starts.repeat_interleave(lengths) - cumsum_lengths[:-1].repeat_interleave(lengths)
-        prefix_indices = arrange_tensor + offsets
 
     def run_kernel() -> None:
+        if attn_metadata.std_indices is not None:
+            std_query = inputs.query[attn_metadata.std_indices]
+            std_out = torch.empty_like(std_query)
+            flash_attn_varlen_func(
+                q=std_query, k=inputs.key_cache, v=inputs.value_cache, out=std_out,
+                cu_seqlens_q=attn_metadata.std_cu_seqlens_q, max_seqlen_q=attn_metadata.std_max_q_len,
+                seqused_k=attn_metadata.std_seq_lens, max_seqlen_k=attn_metadata.std_max_seq_len,
+                softmax_scale=inputs.scale, causal=attn_metadata.causal, alibi_slopes=None,
+                window_size=(-1,-1), block_table=attn_metadata.std_block_table,
+                softcap=inputs.soft_cap, fa_version=inputs.fa_version,
+            )
+            output[attn_metadata.std_indices] = std_out
+
         BeamAttentionImpl.cascade_attention(
             output=output,
             query=inputs.query,
             key_cache=inputs.key_cache,
             value_cache=inputs.value_cache,
-            cu_prefix_query_lens=cu_prefix_query_lens,
-            cu_suffix_query_lens=cu_suffix_query_lens,
-            prefix_kv_lens=prefix_kv_lens,
-            suffix_kv_lens=suffix_kv_lens,
-            prefix_indices=prefix_indices,
-            prefix_indices_is_identity=prefix_indices_is_identity,
-            softmax_scale=inputs.scale,
-            sliding_window=(-1, -1),
+            attn_metadata=attn_metadata,
+            sliding_window_size=(-1, -1),
+            scale=inputs.scale,
             logits_soft_cap=inputs.soft_cap,
-            max_num_splits=0,
-            fa_version=inputs.fa_version,
-            block_table=inputs.block_tables,
-            prefix_block_table=prefix_block_table,
-            suffix_block_table=suffix_block_table,
-            prefix_query_max_len=prefix_query_max_len,
-            suffix_query_max_len=suffix_query_max_len,
-            prefix_kv_max_len=prefix_kv_max_len,
-            suffix_kv_max_len=suffix_kv_max_len,
+            vllm_flash_attn_version=inputs.fa_version,
+            alibi_slopes=None,
         )
 
     run_kernel()

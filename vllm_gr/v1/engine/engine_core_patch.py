@@ -253,7 +253,10 @@ def apply_scheduler_patch():
                         "mega_beam_width": getattr(req, "mega_beam_width", 1),
                         "mega_decode_steps": getattr(req, "mega_decode_steps", 0),
                         "prefix_len": getattr(req, "prefix_len", 0),
+                        "cache_len":req.num_computed_tokens - output.num_scheduled_tokens[req_id],
                     }
+                # if req:
+                #     print(f"Req {req_id}: Mega {mega_data.get(req_id, {})}, computed={req.num_computed_tokens}, schedule={output.num_scheduled_tokens[req_id]}")
         output.mega_data = mega_data
         return output
 
@@ -268,6 +271,7 @@ def apply_worker_patches():
         import torch
         from vllm.v1.worker.gpu_input_batch import InputBatch
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+        from vllm.sampling_params import SamplingType
     except ImportError:
         logger.warning("Failed to import GPUModelRunner, skipping worker patches.")
         return
@@ -287,7 +291,6 @@ def apply_worker_patches():
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
         # Stash the mega_data temporarily on the runner so prepare_model_input can read it
         self._current_mega_data = getattr(scheduler_output, "mega_data", {})
-        logger.info(f"patched_execute_model mega_data={self._current_mega_data}")
         from vllm_gr.v1.attention.backends.beam_attn import MEGA_DATA_VAR
         mega_info = {
             "mega_data": self._current_mega_data,
@@ -304,14 +307,12 @@ def apply_worker_patches():
             MEGA_DATA_VAR.reset(token)
 
     def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
-        # Call original function first to get logits_indices and populate runner state
+        # 1. Initialize native vLLM parameters and populate baseline states
         logits_indices, spec_decode_metadata = _original_prepare_inputs(
             self, scheduler_output, num_scheduled_tokens
         )
 
-        logger.info("patched_prepare_inputs called for mega-request")
-
-        # Populate the shared mutable context with fresh, synchronized request IDs
+        # Synchronize dynamic tracking arrays if monitoring hooks are active
         if getattr(self, "_current_mega_info", None) is not None:
             self._current_mega_info["req_ids"] = self.input_batch.req_ids
 
@@ -319,63 +320,103 @@ def apply_worker_patches():
         if not mega_data:
             return logits_indices, spec_decode_metadata
 
-        # CUDAGraphs require fixed shapes. We find our sequence in the batch
-        # and adjust its position_ids post-hoc.
+        # Initialize tracking registries for our unified layout pass
+        self.input_batch.logprob_token_ids = {}
+        new_logits_indices = []
+        sample_routing = []
+
         token_offset = 0
+        logit_row_idx = 0
+        sample_slot_offset = 0
+        
+        
+        # 2. Execute the Consolidated Single-Pass Batch Layout Engine
         for i, req_id in enumerate(self.input_batch.req_ids):
             seq_len = num_scheduled_tokens[i]            
-            if req_id is not None:
-                mdata = mega_data.get(req_id)
-                if mdata and mdata.get('is_mega_decode', False):
-                    prefix_len = mdata['prefix_len']
-                    beam_width = mdata['mega_beam_width']
-                    decode_steps = mdata['mega_decode_steps']
+            if req_id is None:
+                token_offset += seq_len
+                continue
 
-                    computed = self.input_batch.num_computed_tokens_cpu[i]
-                    step_start = computed
-                    step_end = computed + seq_len
+            request = self.requests[req_id]
+            req_n = request.sampling_params.n if request.sampling_params else 1
+            mdata = mega_data.get(req_id)
 
-                    suffix_req_start = prefix_len
-                    suffix_req_end = prefix_len + beam_width * decode_steps
+            # ---------------------------------------------------------------------
+            # PATH A: Grouped Mega-Request Branch Resolution
+            # ---------------------------------------------------------------------
+            if mdata and mdata.get('is_mega_decode', False):
+                prefix_len = mdata['prefix_len']
+                beam_width = mdata['mega_beam_width']
+                decode_steps = mdata['mega_decode_steps']
+                cache_len = mdata['cache_len']
 
-                    # Overwrite position IDs for suffix tokens scheduled in this step.
-                    # This is done token-by-token to avoid complex slicing logic that
-                    # was causing size mismatch errors under chunked scheduling.
-                    for j in range(seq_len):
-                        # Absolute position of the token in the full sequence
-                        abs_pos = computed + j
-                        
-                        # Check if this token is part of the suffix
-                        if abs_pos >= prefix_len and abs_pos < suffix_req_end:
-                            # Index of this token within the suffix part of the request
-                            suffix_idx = abs_pos - prefix_len
-                            # Position ID should be relative to the start of the beam step
-                            correct_pos = prefix_len + (suffix_idx % decode_steps)
-                            
-                            # Index of this token in the flattened batch tensor
-                            batch_idx = token_offset + j
-                            self.positions.gpu[batch_idx] = correct_pos
+                req_n = beam_width
+                mdata['sample_slot_offset'] = sample_slot_offset
 
-                        # Only inject sampler metadata if this step actually reaches the leaf tokens
-                        if step_end == suffix_req_end:
-                            sampling_metadata = self.input_batch.sampling_metadata
-                            if sampling_metadata is not None:
-                                beam_indices = torch.arange(1, beam_width + 1, dtype=torch.long, device=self.device)
-                                leaf_indices = token_offset + (prefix_len + beam_indices * decode_steps - 1) - computed
-                                sampling_metadata.selected_token_indices = leaf_indices
+                if beam_width > 0 and decode_steps > 0:
+                    req_positions = []
+                    leaf_token_ids = []
+                    beam_0_uncached = max(0, prefix_len + decode_steps - cache_len)
+                    curr_offset = token_offset
+                    for b in range(beam_width):
+                        b_uncached = beam_0_uncached if b == 0 else decode_steps
+                        if b_uncached > 0:
+                            # Compute shared positional IDs
+                            b_start_pos = prefix_len + decode_steps - b_uncached if b == 0 else prefix_len
+                            b_pos = torch.arange(b_start_pos, b_start_pos + b_uncached, device=self.device, dtype=torch.long)
+                            req_positions.append(b_pos)
 
-                                from vllm.sampling_params import SamplingType
-                                sample_routing = [[b, b] for b in range(beam_width)]
-                                
-                                if not hasattr(sampling_metadata, 'categorized_sample_indices'):
-                                    sampling_metadata.categorized_sample_indices = {}
-                                sampling_metadata.categorized_sample_indices[SamplingType.GREEDY] = torch.tensor(
-                                    sample_routing, dtype=torch.int32, device=self.device)
-            
+                            # Pin active leaf logit row offsets
+                            new_logits_indices.append(curr_offset + b_uncached - 1)
+                            curr_offset += b_uncached
+
+                            # Map logit calculations back to this specific request's batch slot
+                            sample_routing.append([logit_row_idx, i])
+                            logit_row_idx += 1
+
+                        # Unified Strided Logprob Lookup (Resolves multi-beam chunk offsets)
+                        leaf_idx = prefix_len + (b + 1) * decode_steps - 1
+                        if leaf_idx < request.num_tokens:
+                            tok_id = request.get_token_id(leaf_idx)
+                            if tok_id >= 0:
+                                leaf_token_ids.append(tok_id)
+
+                    # # Commit layout geometries to memory channels concurrently
+                    # if req_positions:
+                    #     correct_suffix_positions = torch.cat(req_positions)
+                    #     self.positions.gpu[token_offset:token_offset + seq_len] = correct_suffix_positions
+                    #     self.positions.cpu[token_offset:token_offset + seq_len] = correct_suffix_positions.cpu()
+            # ---------------------------------------------------------------------
+            # PATH B: Standard Request Native Processing (Fallback)
+            # ---------------------------------------------------------------------
+            else:
+                if seq_len > 0:
+                    new_logits_indices.append(token_offset + seq_len - 1)
+                    for _ in range(req_n):
+                        sample_routing.append([logit_row_idx, i])
+                    logit_row_idx += 1
+
+            # Advance sequence offsets gracefully
+            sample_slot_offset += req_n
             token_offset += seq_len
 
-        return logits_indices, spec_decode_metadata
+        # # 4. Finalize Sampler Metadata Enforcements
+        # if new_logits_indices:
+        #     logits_indices = torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device)
+        #     sampling_metadata = self.input_batch.sampling_metadata
+        #     if sampling_metadata is not None:
+        #         if not hasattr(sampling_metadata, 'categorized_sample_indices'):
+        #             sampling_metadata.categorized_sample_indices = {}
 
+        #         if sample_routing:
+        #             routing_tensor = torch.tensor(sample_routing, dtype=torch.int32, device=self.device)
+        #             sampling_metadata.logits_indices = logits_indices
+        #             sampling_metadata.categorized_sample_indices[SamplingType.GREEDY] = routing_tensor
+        #             sampling_metadata.categorized_sample_indices[SamplingType.RANDOM] = routing_tensor
+        #             sampling_metadata.categorized_sample_indices[SamplingType.RANDOM_SEED] = routing_tensor
+
+        return logits_indices, spec_decode_metadata
+  
     GPUModelRunner.execute_model = patched_execute_model
     GPUModelRunner._prepare_inputs = patched_prepare_inputs
     GPUModelRunner._patched_for_mega_beam_pos_ids = True
