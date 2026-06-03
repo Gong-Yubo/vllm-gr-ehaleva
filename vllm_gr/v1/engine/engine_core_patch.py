@@ -240,25 +240,28 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
-        output = _original_schedule(self)
-        
-        # Propagate mega request attributes from Request objects to SchedulerOutput
-        mega_data = {}
-        if hasattr(output, "num_scheduled_tokens"):
-            for req_id in output.num_scheduled_tokens.keys():
-                req = self.requests.get(req_id)
-                if req and getattr(req, 'is_mega_decode', False):
-                    mega_data[req_id] = {
-                        "is_mega_decode": True,
-                        "mega_beam_width": getattr(req, "mega_beam_width", 1),
-                        "mega_decode_steps": getattr(req, "mega_decode_steps", 0),
-                        "prefix_len": getattr(req, "prefix_len", 0),
-                        "cache_len":req.num_computed_tokens - output.num_scheduled_tokens[req_id],
-                    }
-                # if req:
-                #     print(f"Req {req_id}: Mega {mega_data.get(req_id, {})}, computed={req.num_computed_tokens}, schedule={output.num_scheduled_tokens[req_id]}")
-        output.mega_data = mega_data
-        return output
+        import torch
+        torch.cuda.nvtx.range_push("Scheduler.schedule")
+        try:
+            output = _original_schedule(self)
+            
+            # Propagate mega request attributes from Request objects to SchedulerOutput
+            mega_data = {}
+            if hasattr(output, "num_scheduled_tokens"):
+                for req_id in output.num_scheduled_tokens.keys():
+                    req = self.requests.get(req_id)
+                    if req and getattr(req, 'is_mega_decode', False):
+                        mega_data[req_id] = {
+                            "is_mega_decode": True,
+                            "mega_beam_width": getattr(req, "mega_beam_width", 1),
+                            "mega_decode_steps": getattr(req, "mega_decode_steps", 0),
+                            "prefix_len": getattr(req, "prefix_len", 0),
+                            "cache_len":req.num_computed_tokens - output.num_scheduled_tokens[req_id],
+                        }
+            output.mega_data = mega_data
+            return output
+        finally:
+            torch.cuda.nvtx.range_pop()
 
     Scheduler.schedule = patched_schedule
     Scheduler._patched_for_mega_requests = True

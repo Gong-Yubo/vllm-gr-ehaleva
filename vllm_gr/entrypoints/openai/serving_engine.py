@@ -193,7 +193,7 @@ async def _mega_request_step(
                 prompt_logprobs=None
             )
         )
-    print("mocked_outputs", mocked_outputs)
+    # print("mocked_outputs", mocked_outputs)
     return mocked_outputs, child_beam_ids
 
 async def _mega_request_cleanup(engine_client, session_id, final_ids, rank):

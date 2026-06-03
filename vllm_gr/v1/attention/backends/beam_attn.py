@@ -225,6 +225,7 @@ class BeamAttentionMetadata:
     mega_suffix_seq_lens: torch.Tensor | None = None
     mega_suffix_max_q_len: int = 0
     mega_suffix_max_seq_len: int = 0
+    mega_suffix_total_tokens: int = 0
 
     # Unified Suffix physical index coordinates
     mega_suffix_seq_idx: torch.Tensor | None = None
@@ -232,6 +233,7 @@ class BeamAttentionMetadata:
     mega_suffix_out_offset: torch.Tensor | None = None
 
     scheduler_metadata: dict | None = None
+    prefix_scheduler_metadata: dict | None = None
     max_num_splits: int = 0
 
 
@@ -258,19 +260,79 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
         self.max_num_splits = 0
+        self.aot_schedule = False
 
-    def build(
+        self.use_full_cuda_graph = self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
+
+        if self.use_full_cuda_graph and self.aot_schedule:
+            self.scheduler_metadata = torch.zeros(
+                vllm_config.scheduler_config.max_num_seqs + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            if hasattr(vllm_config, "attention_config") and hasattr(vllm_config.attention_config, "flash_attn_max_num_splits_for_cuda_graph"):
+                self.max_num_splits = vllm_config.attention_config.flash_attn_max_num_splits_for_cuda_graph
+
+        self.aot_sliding_window: tuple[int, int] | None = None
+
+    def _update_aot_schedule(self, fast_build: bool):
+        """Updates AOT schedule flags and sliding window configs."""
+        self.aot_schedule = self.aot_schedule and not fast_build
+        if self.aot_sliding_window is None:
+            self.aot_sliding_window = (-1, -1)
+
+    def _get_max_num_splits(self, num_actual_tokens: int) -> int:
+        """Determines the maximum number of splits for Cuda Graph."""
+        max_num_splits = 0
+        if (
+            self.use_full_cuda_graph
+            and self.max_cudagraph_size is not None
+            and num_actual_tokens <= self.max_cudagraph_size
+        ):
+            max_num_splits = self.max_num_splits
+
+        if vllm_is_batch_invariant():
+            max_num_splits = 1
+        return max_num_splits
+
+    def _get_schedule(
         self,
-        common_prefix_len: int,
-        common_attn_metadata: CommonAttentionMetadata,
-        fast_build: bool = False,
-    ) -> BeamAttentionMetadata:
-        device = self.device
-        num_reqs = common_attn_metadata.num_reqs
-        mega_info = MEGA_DATA_VAR.get()
-        mega_data = mega_info["mega_data"] if mega_info else {}
-        req_ids = mega_info["req_ids"] if mega_info else []
+        batch_size: int,
+        cu_query_lens: torch.Tensor,
+        max_query_len: int,
+        seqlens: torch.Tensor,
+        max_seq_len: int,
+        causal: bool,
+        max_num_splits: int,
+    ) -> dict | None:
+        """Generates scheduler metadata for FlashAttention v3."""
+        if not self.aot_schedule:
+            return None
 
+        cache_dtype = self.cache_config.cache_dtype
+        if cache_dtype.startswith("fp8"):
+            qkv_dtype = BeamAttentionBackend.get_fp8_dtype_for_flashattn(cache_dtype)
+        else:
+            qkv_dtype = self.kv_cache_dtype
+
+        return get_scheduler_metadata(
+            batch_size=batch_size,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_seq_len,
+            num_heads_q=self.num_heads_q,
+            num_heads_kv=self.num_heads_kv,
+            headdim=self.headdim,
+            cache_seqlens=seqlens,
+            qkv_dtype=qkv_dtype,
+            cu_seqlens_q=cu_query_lens,
+            page_size=self.block_size,
+            causal=causal,
+            window_size=self.aot_sliding_window,
+            num_splits=max_num_splits,
+        )
+
+    def _segment_requests(self, num_reqs: int, req_ids: list, mega_data: dict):
         std_req_idxs = []
         mega_req_idxs = []
         mega_prefix_lens = []
@@ -278,7 +340,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         mega_decode_steps = []
         mega_cache_lens = []
 
-        # 1. Segment standard requests and optimized mega requests
         for i in range(num_reqs):
             req_id = req_ids[i] if i < len(req_ids) else None
             mdata = mega_data.get(req_id, {}) if req_id else {}
@@ -291,21 +352,24 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             else:
                 std_req_idxs.append(i)
 
-        q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
+        return std_req_idxs, mega_req_idxs, mega_prefix_lens, mega_beam_widths, mega_decode_steps, mega_cache_lens
 
+    def _build_std_mappings(self, std_req_idxs: list, q_starts: list):
         std_indices = []
         std_q_lens = []
-        std_seq_lens_list = []
-        std_block_tables = []
 
         for i in std_req_idxs:
             q_start = q_starts[i]
             q_end = q_starts[i+1]
             std_indices.extend(range(q_start, q_end))
             std_q_lens.append(q_end - q_start)
-            std_seq_lens_list.append(common_attn_metadata.seq_lens[i].item())
-            std_block_tables.append(common_attn_metadata.block_table_tensor[i])
 
+        return std_indices, std_q_lens
+
+    def _build_mega_mappings(
+        self, mega_req_idxs, mega_prefix_lens, mega_beam_widths,
+        mega_decode_steps, mega_cache_lens, q_starts, common_attn_metadata
+    ):
         mega_prefix_indices = []
         mega_prefix_q_lens = []
         mega_prefix_seq_lens_list = []
@@ -318,7 +382,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         mega_prefix_block_tables = []
         
         offset = 0
-        for req_idx, prefix_len, w, steps, cache_len in zip(mega_req_idxs, mega_prefix_lens, mega_beam_widths, mega_decode_steps, mega_cache_lens):
+        max_prefix_len = max(mega_prefix_lens) if mega_prefix_lens else 0
+        max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
+
+        for req_idx, prefix_len, w, steps, cache_len in zip(
+            mega_req_idxs, mega_prefix_lens, mega_beam_widths,
+            mega_decode_steps, mega_cache_lens
+        ):
             q_start = q_starts[req_idx]
             q_end = q_starts[req_idx+1]
             q_len = q_end - q_start
@@ -329,45 +399,106 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             q_curr = q_start
             bt = common_attn_metadata.block_table_tensor[req_idx]
             
+            # chunk_budget enforces the maximum number of new query tokens allowed in this iteration.
+            chunk_budget = q_len
+            # delta represents how many suffix tokens have already been cached across all beams
+            # (i.e., we are past the shared prefix computation phase).
+            delta = max(0, cache_len - prefix_len)
+
             # Unified mapping: process ALL beams (0..W-1) through the split attention passes
             for b in range(w):
-                if b == 0:
-                    b_uncached = max(0, prefix_len + steps - cache_len)
-                    b_cache_len = min(cache_len, prefix_len + steps)
-                    b_suffix_start = b_cache_len
+                if chunk_budget <= 0:
+                    break
+                    
+                b_uncached = 0
+                b_cache_len = 0
+                b_suffix_start = 0
+                b_suffix_len = 0
+                
+                if prefix_len >= cache_len:
+                    # Scenario A: Prefix Incomplete
+                    # Motivation: The shared prefix (prompt) is not fully computed or cached yet. 
+                    # To avoid W beams doing redundant work, we elect Beam 0 as the "Leader".
+                    remaining_prefix = prefix_len - cache_len
+                    if b == 0:
+                        # Leader Beam computes the remaining shared prefix on behalf of all beams, 
+                        # plus its own unique suffix tokens if there is leftover chunk budget.
+                        b_uncached = min(chunk_budget, remaining_prefix + steps)
+                        b_cache_len = cache_len
+                        b_suffix_start = cache_len
+                        b_suffix_len = b_uncached
+                    else:
+                        # Follower Beams (1 to W-1) cannot compute shared prefix tokens.
+                        # They must wait until the prefix is fully resolved. They are only allowed 
+                        # to compute their unique suffixes if the prefix finishes within this chunk.
+                        if remaining_prefix <= q_len:
+                            b_uncached = min(chunk_budget, steps)
+                            b_cache_len = prefix_len
+                            b_suffix_start = prefix_len + b * steps
+                            b_suffix_len = b_uncached
                 else:
-                    b_uncached = steps
-                    b_cache_len = prefix_len
-                    b_suffix_start = prefix_len + b * steps
+                    # Scenario B: Prefix Complete
+                    # Motivation: The shared prefix is fully safely stored in the KV cache.
+                    # Beam 0 drops its leader role, and all beams independently decode their unique suffixes.
+                    
+                    # Distribute the overall 'delta' of cached suffix tokens across the sequential layout 
+                    # to determine exactly how many suffix tokens for *this specific beam* are already cached.
+                    past_suffix_b = max(0, min(steps, delta - b * steps))
+                    remaining_suffix_b = steps - past_suffix_b
+                    
+                    b_uncached = min(chunk_budget, remaining_suffix_b)
+                    
+                    if b_uncached > 0:
+                        # Attend to the full shared prefix safely located in the cache.
+                        b_cache_len = prefix_len
+                        # Causal self-attention starts exactly where this beam's unique suffix begins.
+                        b_suffix_start = prefix_len + b * steps
+                        # Total suffix length includes past cached tokens + newly computed ones.
+                        b_suffix_len = past_suffix_b + b_uncached
                 
-                if b_uncached == 0:
+                if b_uncached <= 0:
                     continue
-                
+
                 mega_prefix_indices.extend(range(q_curr, q_curr + b_uncached))
                 mega_prefix_q_lens.append(b_uncached)
                 mega_prefix_seq_lens_list.append(b_cache_len)
                 
                 mega_suffix_q_lens.append(b_uncached)
-                mega_suffix_seq_lens_list.append(b_uncached)
+                mega_suffix_seq_lens_list.append(b_suffix_len)
                 mega_suffix_seq_idx.append(req_idx)
                 mega_suffix_start_tok.append(b_suffix_start)
                 mega_suffix_out_offset.append(offset)
                 
-                offset += b_uncached
+                offset += b_suffix_len
                 q_curr += b_uncached
-                mega_prefix_block_tables.append(bt)
+                chunk_budget -= b_uncached
+                mega_prefix_block_tables.append(bt[:max_prefix_blocks_count])
 
+        return (
+            mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
+            mega_suffix_q_lens, mega_suffix_seq_lens_list, mega_suffix_seq_idx,
+            mega_suffix_start_tok, mega_suffix_out_offset, mega_prefix_block_tables
+        )
+
+    def _create_std_tensors(self, std_indices, std_q_lens, std_req_idxs, common_attn_metadata, device):
         if std_q_lens:
             std_indices_tensor = torch.tensor(std_indices, dtype=torch.long, device=device)
-            std_seq_lens = torch.tensor(std_seq_lens_list, dtype=torch.int32, device=device)
             std_cu_seqlens_q = torch.tensor([0] + std_q_lens, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
-            std_max_q_len = max(std_q_lens) if std_q_lens else 0
-            std_max_seq_len = max(std_seq_lens_list) if std_seq_lens_list else 0
-            std_block_table = torch.stack(std_block_tables).contiguous()
+            std_seq_lens = common_attn_metadata.seq_lens[std_req_idxs]
+            std_max_q_len = max(std_q_lens)
+            std_max_seq_len = common_attn_metadata.max_seq_len
+            std_block_table = common_attn_metadata.block_table_tensor[std_req_idxs].contiguous()
         else:
             std_indices_tensor = std_seq_lens = std_cu_seqlens_q = std_block_table = None
             std_max_q_len = std_max_seq_len = 0
+            
+        return std_indices_tensor, std_cu_seqlens_q, std_seq_lens, std_max_q_len, std_max_seq_len, std_block_table
 
+    def _create_mega_tensors(
+        self, mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
+        mega_suffix_q_lens, mega_suffix_seq_lens_list, mega_suffix_seq_idx,
+        mega_suffix_start_tok, mega_suffix_out_offset, mega_prefix_block_tables, device, max_num_splits: int
+    ):
         if mega_prefix_q_lens:
             mega_prefix_indices_tensor = torch.tensor(mega_prefix_indices, dtype=torch.long, device=device)
             mega_prefix_seq_lens = torch.tensor(mega_prefix_seq_lens_list, dtype=torch.int32, device=device)
@@ -375,30 +506,90 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_prefix_cu_seqlens_q = torch.tensor([0] + mega_prefix_q_lens, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
             mega_prefix_max_q_len = max(mega_prefix_q_lens) if mega_prefix_q_lens else 0
             mega_prefix_block_table = torch.stack(mega_prefix_block_tables).contiguous()
-            
             mega_suffix_seq_lens = torch.tensor(mega_suffix_seq_lens_list, dtype=torch.int32, device=device)
             mega_suffix_max_seq_len = max(mega_suffix_seq_lens_list) if mega_suffix_seq_lens_list else 0
+            mega_suffix_total_tokens = sum(mega_suffix_seq_lens_list)
             
             mega_suffix_cu_seqlens_q = torch.tensor([0] + mega_suffix_q_lens, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
             mega_suffix_cu_seqlens_k = torch.tensor([0] + mega_suffix_seq_lens_list, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
             mega_suffix_max_q_len = max(mega_suffix_q_lens) if mega_suffix_q_lens else 0
             
-            mega_suffix_seq_idx = torch.tensor(mega_suffix_seq_idx, dtype=torch.int32, device=device)
-            mega_suffix_start_tok = torch.tensor(mega_suffix_start_tok, dtype=torch.int32, device=device)
-            mega_suffix_out_offset = torch.tensor(mega_suffix_out_offset, dtype=torch.int32, device=device)
+            mega_suffix_seq_idx_tensor = torch.tensor(mega_suffix_seq_idx, dtype=torch.int32, device=device)
+            mega_suffix_start_tok_tensor = torch.tensor(mega_suffix_start_tok, dtype=torch.int32, device=device)
+            mega_suffix_out_offset_tensor = torch.tensor(mega_suffix_out_offset, dtype=torch.int32, device=device)
+
+            prefix_scheduler_metadata = self._get_schedule(
+                batch_size=len(mega_prefix_q_lens),
+                cu_query_lens=mega_prefix_cu_seqlens_q,
+                max_query_len=mega_prefix_max_q_len,
+                seqlens=mega_prefix_seq_lens,
+                max_seq_len=mega_prefix_max_seq_len,
+                causal=False,
+                max_num_splits=max_num_splits,
+            )
         else:
             mega_prefix_indices_tensor = mega_prefix_seq_lens = mega_prefix_cu_seqlens_q = mega_prefix_block_table = None
             mega_prefix_max_q_len = mega_prefix_max_seq_len = 0
             mega_suffix_cu_seqlens_q = mega_suffix_cu_seqlens_k = mega_suffix_seq_lens = None
-            mega_suffix_max_q_len = mega_suffix_max_seq_len = 0
-            mega_suffix_seq_idx = mega_suffix_start_tok = mega_suffix_out_offset = None
+            mega_suffix_max_q_len = mega_suffix_max_seq_len = mega_suffix_total_tokens = 0
+            mega_suffix_seq_idx_tensor = mega_suffix_start_tok_tensor = mega_suffix_out_offset_tensor = None
+            prefix_scheduler_metadata = None
+            
+        return (
+            mega_prefix_indices_tensor, mega_prefix_seq_lens, mega_prefix_max_seq_len,
+            mega_prefix_cu_seqlens_q, mega_prefix_max_q_len, mega_prefix_block_table,
+            mega_suffix_seq_lens, mega_suffix_max_seq_len, mega_suffix_total_tokens,
+            mega_suffix_cu_seqlens_q, mega_suffix_cu_seqlens_k, mega_suffix_max_q_len,
+            mega_suffix_seq_idx_tensor, mega_suffix_start_tok_tensor, mega_suffix_out_offset_tensor,
+            prefix_scheduler_metadata
+        )
 
-        # print("std_indices", std_indices)
-        # print("mega_prefix_indices", mega_prefix_indices)
-        # print(f"std_seq_lens={std_seq_lens}, std_cu_seqlens_q={std_cu_seqlens_q}")
-        # print(f"mega_prefix_seq_lens={mega_prefix_seq_lens}, mega_prefix_cu_seqlens_q={mega_prefix_cu_seqlens_q}")
-        # print(f"mega_suffix_seq_lens={mega_suffix_seq_lens}, mega_suffix_cu_seqlens_q={mega_suffix_cu_seqlens_q}")
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> BeamAttentionMetadata:
+        torch.cuda.nvtx.range_push("BeamAttentionMetadataBuilder.build")
+        self._update_aot_schedule(fast_build)
+        max_num_splits = self._get_max_num_splits(common_attn_metadata.num_actual_tokens)
+        device = self.device
+        num_reqs = common_attn_metadata.num_reqs
+        mega_info = MEGA_DATA_VAR.get()
+        mega_data = mega_info["mega_data"] if mega_info else {}
+        req_ids = mega_info["req_ids"] if mega_info else []
 
+        (std_req_idxs, mega_req_idxs, mega_prefix_lens, mega_beam_widths,
+         mega_decode_steps, mega_cache_lens) = self._segment_requests(num_reqs, req_ids, mega_data)
+
+        q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
+
+        std_indices, std_q_lens = self._build_std_mappings(std_req_idxs, q_starts)
+
+        (mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
+         mega_suffix_q_lens, mega_suffix_seq_lens_list, mega_suffix_seq_idx,
+         mega_suffix_start_tok, mega_suffix_out_offset, mega_prefix_block_tables) = self._build_mega_mappings(
+            mega_req_idxs, mega_prefix_lens, mega_beam_widths,
+            mega_decode_steps, mega_cache_lens, q_starts, common_attn_metadata
+        )
+
+        (std_indices_tensor, std_cu_seqlens_q, std_seq_lens,
+         std_max_q_len, std_max_seq_len, std_block_table) = self._create_std_tensors(
+            std_indices, std_q_lens, std_req_idxs, common_attn_metadata, device
+        )
+
+        (mega_prefix_indices_tensor, mega_prefix_seq_lens, mega_prefix_max_seq_len,
+         mega_prefix_cu_seqlens_q, mega_prefix_max_q_len, mega_prefix_block_table,
+         mega_suffix_seq_lens, mega_suffix_max_seq_len, mega_suffix_total_tokens,
+         mega_suffix_cu_seqlens_q, mega_suffix_cu_seqlens_k, mega_suffix_max_q_len,
+         mega_suffix_seq_idx_tensor, mega_suffix_start_tok_tensor,
+         mega_suffix_out_offset_tensor, prefix_scheduler_metadata) = self._create_mega_tensors(
+            mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
+            mega_suffix_q_lens, mega_suffix_seq_lens_list, mega_suffix_seq_idx,
+            mega_suffix_start_tok, mega_suffix_out_offset, mega_prefix_block_tables, device, max_num_splits
+        )
+
+        torch.cuda.nvtx.range_pop()
         return BeamAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
@@ -420,14 +611,17 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_prefix_max_q_len=mega_prefix_max_q_len,
             mega_prefix_max_seq_len=mega_prefix_max_seq_len,
             mega_prefix_block_table=mega_prefix_block_table,
+            prefix_scheduler_metadata=prefix_scheduler_metadata,
             mega_suffix_cu_seqlens_q=mega_suffix_cu_seqlens_q,
             mega_suffix_cu_seqlens_k=mega_suffix_cu_seqlens_k,
             mega_suffix_seq_lens=mega_suffix_seq_lens,
             mega_suffix_max_q_len=mega_suffix_max_q_len,
             mega_suffix_max_seq_len=mega_suffix_max_seq_len,
-            mega_suffix_seq_idx=mega_suffix_seq_idx,
-            mega_suffix_start_tok=mega_suffix_start_tok,
-            mega_suffix_out_offset=mega_suffix_out_offset,
+            mega_suffix_total_tokens=mega_suffix_total_tokens,
+            mega_suffix_seq_idx=mega_suffix_seq_idx_tensor,
+            mega_suffix_start_tok=mega_suffix_start_tok_tensor,
+            mega_suffix_out_offset=mega_suffix_out_offset_tensor,
+            max_num_splits=max_num_splits,
         )
 
     def update_block_table(
@@ -498,20 +692,6 @@ class BeamAttentionImpl(AttentionImpl):
         self.supports_quant_query_input = True
         self.use_cascade = True
 
-    def _execute_standard_attention_pass(self, query, key_cache, value_cache, output, attn_metadata, sliding_window_size):
-        """Isolated standard sequence batch execution (Zero footprint mutation impact)"""
-        std_query = query[attn_metadata.std_indices]
-        std_out = torch.empty_like(std_query)
-        flash_attn_varlen_func(
-            q=std_query, k=key_cache, v=value_cache, out=std_out,
-            cu_seqlens_q=attn_metadata.std_cu_seqlens_q, max_seqlen_q=attn_metadata.std_max_q_len,
-            seqused_k=attn_metadata.std_seq_lens, max_seqlen_k=attn_metadata.std_max_seq_len,
-            softmax_scale=self.scale, causal=attn_metadata.causal, alibi_slopes=self.alibi_slopes,
-            window_size=sliding_window_size, block_table=attn_metadata.std_block_table,
-            softcap=self.logits_soft_cap, fa_version=self.vllm_flash_attn_version,
-        )
-        output[attn_metadata.std_indices] = std_out
-
     @staticmethod
     def cascade_attention(
         output: torch.Tensor,
@@ -523,22 +703,53 @@ class BeamAttentionImpl(AttentionImpl):
         scale: float,
         logits_soft_cap: float,
         vllm_flash_attn_version: int,
+        s_aux: torch.Tensor | None = None,
         alibi_slopes: torch.Tensor | None = None,
     ):
+        # ---------------------------------------------------------------------
+        # DISPATCH TRACK 1: Standard Mixed Batch Elements
+        # ---------------------------------------------------------------------        
+        if attn_metadata.std_indices is not None:
+            std_query = query[attn_metadata.std_indices]
+            std_out = torch.empty_like(std_query)
+            flash_attn_varlen_func(
+                q=std_query, k=key_cache, v=value_cache, out=std_out,
+                cu_seqlens_q=attn_metadata.std_cu_seqlens_q, max_seqlen_q=attn_metadata.std_max_q_len,
+                seqused_k=attn_metadata.std_seq_lens, max_seqlen_k=attn_metadata.std_max_seq_len,
+                softmax_scale=scale, causal=attn_metadata.causal, alibi_slopes=alibi_slopes,
+                window_size=sliding_window_size, block_table=attn_metadata.std_block_table,
+                softcap=logits_soft_cap, fa_version=vllm_flash_attn_version,
+            # scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
+            # num_splits=1 if self.batch_invariant_enabled else attn_metadata.max_num_splits,
+            )
+            output[attn_metadata.std_indices] = std_out
+
         if attn_metadata.mega_prefix_indices is not None:
             mega_query = query[attn_metadata.mega_prefix_indices]
-            
+
             # Exec pass over the immutable shared prefix background
             mega_prefix_out, mega_prefix_lse = flash_attn_varlen_func(
-                q=mega_query, k=key_cache, v=value_cache,
-                cu_seqlens_q=attn_metadata.mega_prefix_cu_seqlens_q, seqused_k=attn_metadata.mega_prefix_seq_lens,
-                max_seqlen_q=attn_metadata.mega_prefix_max_q_len, max_seqlen_k=attn_metadata.mega_prefix_max_seq_len,
-                softmax_scale=scale, causal=False, alibi_slopes=alibi_slopes,
-                window_size=sliding_window_size, block_table=attn_metadata.mega_prefix_block_table,
-                softcap=logits_soft_cap, return_softmax_lse=True, fa_version=vllm_flash_attn_version,
+                q=mega_query,
+                k=key_cache,
+                v=value_cache,
+                cu_seqlens_q=attn_metadata.mega_prefix_cu_seqlens_q,
+                seqused_k=attn_metadata.mega_prefix_seq_lens,
+                max_seqlen_q=attn_metadata.mega_prefix_max_q_len,
+                max_seqlen_k=attn_metadata.mega_prefix_max_seq_len,
+                softmax_scale=scale,
+                causal=False,
+                alibi_slopes=alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=attn_metadata.mega_prefix_block_table,
+                softcap=logits_soft_cap,
+                return_softmax_lse=True,
+                fa_version=vllm_flash_attn_version,
+                scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=s_aux,
             )
             
-            total_suffix_tokens = attn_metadata.mega_suffix_seq_lens.sum().item()
+            total_suffix_tokens = attn_metadata.mega_suffix_total_tokens
             block_size = key_cache.shape[1]
             
             contig_k, contig_v = extract_suffix_kv(
@@ -608,17 +819,6 @@ class BeamAttentionImpl(AttentionImpl):
 
         sliding_window_size = list(self.sliding_window) if self.sliding_window is not None else None
 
-        # ---------------------------------------------------------------------
-        # DISPATCH TRACK 1: Standard Mixed Batch Elements
-        # ---------------------------------------------------------------------        
-        if attn_metadata.std_indices is not None:
-            self._execute_standard_attention_pass(
-                query, key_cache, value_cache, output, attn_metadata, sliding_window_size
-            )
-
-        # ---------------------------------------------------------------------
-        # DISPATCH TRACK 2: Mega-Request Optimized Execution
-        # ---------------------------------------------------------------------
         BeamAttentionImpl.cascade_attention(
             output=output,
             query=query,
@@ -629,6 +829,7 @@ class BeamAttentionImpl(AttentionImpl):
             scale=self.scale,
             logits_soft_cap=self.logits_soft_cap,
             vllm_flash_attn_version=self.vllm_flash_attn_version,
+            s_aux=self.sinks,
             alibi_slopes=self.alibi_slopes,
         )
 
