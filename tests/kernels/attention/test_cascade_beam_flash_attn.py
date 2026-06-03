@@ -334,6 +334,11 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
         builder = BeamAttentionMetadataBuilder.__new__(BeamAttentionMetadataBuilder)
         builder.device = device
         builder.block_size = inputs.block_size
+        builder.aot_schedule = False
+        builder.aot_sliding_window = None
+        builder.use_full_cuda_graph = False
+        builder.max_cudagraph_size = None
+        builder.max_num_splits = 0
         
         attn_metadata = builder.build(
             common_prefix_len=inputs.shared_tokens_len,
@@ -375,13 +380,14 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
     return output
 
 
-@pytest.mark.parametrize("batch_size", [8])  # type: ignore
+@pytest.mark.parametrize("batch_size", [1, 4])  # type: ignore
 @pytest.mark.parametrize("beam_width", [16, 32])  # type: ignore
 @pytest.mark.parametrize("seq_lens_and_common_prefix", CASES)  # type: ignore
 @pytest.mark.parametrize("num_heads", NUM_HEADS)  # type: ignore
 @pytest.mark.parametrize("head_size", HEAD_SIZES)  # type: ignore
 @pytest.mark.parametrize("dtype", DTYPES)  # type: ignore
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)  # type: ignore
+@pytest.mark.parametrize("soft_cap", [None, 50])  # type: ignore
 @pytest.mark.parametrize("fa_version", [2, 3])  # type: ignore
 @torch.inference_mode()  # type: ignore
 def test_beam_cascade(

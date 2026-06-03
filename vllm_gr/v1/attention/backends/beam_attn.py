@@ -405,6 +405,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # (i.e., we are past the shared prefix computation phase).
             delta = max(0, cache_len - prefix_len)
 
+            prefix_groups = []
+
             # Unified mapping: process ALL beams (0..W-1) through the split attention passes
             for b in range(w):
                 if chunk_budget <= 0:
@@ -459,9 +461,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 if b_uncached <= 0:
                     continue
 
-                mega_prefix_indices.extend(range(q_curr, q_curr + b_uncached))
-                mega_prefix_q_lens.append(b_uncached)
-                mega_prefix_seq_lens_list.append(b_cache_len)
+                if prefix_groups:
+                    prefix_groups[-1][1] += b_uncached
+                else:
+                    prefix_groups.append([q_curr, b_uncached, b_cache_len])
                 
                 mega_suffix_q_lens.append(b_uncached)
                 mega_suffix_seq_lens_list.append(b_suffix_len)
@@ -472,6 +475,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 offset += b_suffix_len
                 q_curr += b_uncached
                 chunk_budget -= b_uncached
+
+            for group_q_start, group_q_len, group_cache_len in prefix_groups:
+                mega_prefix_indices.extend(range(group_q_start, group_q_start + group_q_len))
+                mega_prefix_q_lens.append(group_q_len)
+                mega_prefix_seq_lens_list.append(group_cache_len)
                 mega_prefix_block_tables.append(bt[:max_prefix_blocks_count])
 
         return (
