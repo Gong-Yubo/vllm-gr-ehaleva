@@ -392,12 +392,20 @@ def apply_worker_patches():
                         b_uncached = min(chunk_budget, remaining_suffix_b)
 
                     if b_uncached > 0:
-                        # -------------------------------------------------
-                        # IN-PLACE CPU_GPU_BUFFER POSITION OVERWRITES
-                        # -------------------------------------------------
+                        # Determine the true starting index for this chunk segment:
+                        if prefix_len >= cache_len:
+                            # Scenario A: Prefix Incomplete
+                            # Beam 0 starts from cache_len to fill the gaps.
+                            # Follower beams (b > 0) start at prefix_len for their suffix.
+                            st = cache_len if b == 0 else prefix_len
+                        else:
+                            # Scenario B: Prefix Complete
+                            # Every beam starts from its own unique historical suffix boundary.
+                            # past_suffix_b represents how many tokens for this beam are already cached.
+                            st = prefix_len + (b * decode_steps) + past_suffix_b
+
                         if gpu_positions is not None:
                             # Generate parallel timeline segments matching current chunk slice
-                            st = cache_len if (b == 0 and cache_len < prefix_len) else prefix_len
                             beam_positions_gpu = torch.arange(
                                 st, 
                                 st + b_uncached, 

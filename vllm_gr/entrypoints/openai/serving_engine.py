@@ -171,7 +171,7 @@ async def _mega_request_step(
     single_output = await _collect_beam_result(q)
 
     # -------------------------------------------------------------------------
-    # BACKWARD-COMPATIBLE DEMULTIPLEXING PASS
+    # BACKWARD-COMPATIBLE DEMULTIPLEXING PASS (DUPLICATE-STRIPPED)
     # -------------------------------------------------------------------------
     # Map the single RequestOutput containing 1 CompletionOutput back into 
     # an array of W independent virtual RequestOutputs to preserve accuracy downstream.
@@ -181,21 +181,24 @@ async def _mega_request_step(
     completion_out_base = single_output.outputs[0]
     flat_logprobs = completion_out_base.logprobs
 
-    # Dynamically calculate K (the logprobs count per individual beam, e.g., 5)
+    # Dynamically calculate K (the complete logprobs stride per individual beam, e.g., 5)
     if flat_logprobs is not None and flat_logprobs.token_ids:
         K = len(flat_logprobs.token_ids) // W
     else:
         K = len(fork_info) + 1
 
+    # The clean target choice length (e.g., 5 total items - 1 duplicate = 4 alternatives)
+    target_K = K - 1
+
     for b in range(W):
         # 1. Create a shallow copy of the parent CompletionOutput wrapper
         completion_out = copy.copy(completion_out_base)
         
-        # 2. Compute the precise slice boundaries for this specific beam branch
+        # 2. Compute the exact slice boundaries for this specific beam branch
         start_offset = b * K
         end_offset = start_offset + K
         
-        # 3. Extract the unique generated token ID for this beam from the front of its logprob chunk
+        # 3. Extract the unique generated token ID for this beam from the true front
         if flat_logprobs is not None and len(flat_logprobs.token_ids) >= end_offset:
             beam_token_id = flat_logprobs.token_ids[start_offset]
         else:
@@ -204,26 +207,29 @@ async def _mega_request_step(
             
         completion_out.token_ids = [beam_token_id]
 
-        # 4. Isolate and slice the logprob metadata structures per beam
+        # 4. Isolate and slice the logprob metadata structures per beam (Skipping the duplicate)
         if flat_logprobs is not None:
             # Create a separate copy of the FlatLogprobs container to prevent shared mutations
             completion_out.logprobs = copy.copy(flat_logprobs)
             
-            # Slice the 20-element source arrays into distinct 5-element blocks
-            completion_out.logprobs.token_ids = flat_logprobs.token_ids[start_offset:end_offset]
-            completion_out.logprobs.logprobs = flat_logprobs.logprobs[start_offset:end_offset]
+            # CRITICAL SHIFT: Skip index [start_offset] (the duplicate token) and slice 
+            # from [start_offset + 1] to [end_offset] to grab only the remaining clean options.
+            clean_start = start_offset + 1
             
-            if hasattr(flat_logprobs, 'ranks') and flat_logprobs.ranks is not None:
-                completion_out.logprobs.ranks = flat_logprobs.ranks[start_offset:end_offset]
+            completion_out.logprobs.token_ids = flat_logprobs.token_ids[clean_start:end_offset]
+            completion_out.logprobs.logprobs = flat_logprobs.logprobs[clean_start:end_offset]
+            
+            if hasattr(flat_logprobs, 'ranks') and flat_logprobs.ranks is not None and len(flat_logprobs.ranks) > 0:
+                completion_out.logprobs.ranks = flat_logprobs.ranks[clean_start:end_offset]
                 
-            if hasattr(flat_logprobs, 'decoded_tokens') and flat_logprobs.decoded_tokens is not None:
-                completion_out.logprobs.decoded_tokens = flat_logprobs.decoded_tokens[start_offset:end_offset]
+            if hasattr(flat_logprobs, 'decoded_tokens') and flat_logprobs.decoded_tokens is not None and len(flat_logprobs.decoded_tokens) > 0:
+                completion_out.logprobs.decoded_tokens = flat_logprobs.decoded_tokens[clean_start:end_offset]
             
-            # Reset internal indexing descriptors to match the new isolated length
+            # Reset internal indexing descriptors to match the new isolated target length (4)
             if hasattr(flat_logprobs, 'start_indices'):
                 completion_out.logprobs.start_indices = [0]
             if hasattr(flat_logprobs, 'end_indices'):
-                completion_out.logprobs.end_indices = [K]
+                completion_out.logprobs.end_indices = [target_K]
 
         mocked_outputs.append(
             RequestOutput(
