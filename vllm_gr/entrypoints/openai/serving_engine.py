@@ -127,7 +127,7 @@ async def _mega_request_step(
     # CRITICAL SWITCH: Set n=W strictly for the decode phase
     # -------------------------------------------------------------------------
     decode_sampling_params = copy.copy(beam_search_params)
-    decode_sampling_params.n = 1
+    decode_sampling_params.n = 1#len(fork_info)*len(fork_info)#1
 
     # -------------------------------------------------------------------------
     # PERSISTENT SINGLE QUEUE MONITORING
@@ -176,12 +176,54 @@ async def _mega_request_step(
     # Map the single RequestOutput containing 1 CompletionOutput back into 
     # an array of W independent virtual RequestOutputs to preserve accuracy downstream.
     mocked_outputs = []
-    W = len(fork_info)
-    for b in range(W):
-        completion_out = copy.copy(single_output.outputs[0])
+    W = len(fork_info) # Active beam width (e.g., 4)
+    
+    completion_out_base = single_output.outputs[0]
+    flat_logprobs = completion_out_base.logprobs
 
-        if len(completion_out.token_ids) >= W:
-            completion_out.token_ids = [completion_out.token_ids[-W + b]]
+    # Dynamically calculate K (the logprobs count per individual beam, e.g., 5)
+    if flat_logprobs is not None and flat_logprobs.token_ids:
+        K = len(flat_logprobs.token_ids) // W
+    else:
+        K = len(fork_info) + 1
+
+    for b in range(W):
+        # 1. Create a shallow copy of the parent CompletionOutput wrapper
+        completion_out = copy.copy(completion_out_base)
+        
+        # 2. Compute the precise slice boundaries for this specific beam branch
+        start_offset = b * K
+        end_offset = start_offset + K
+        
+        # 3. Extract the unique generated token ID for this beam from the front of its logprob chunk
+        if flat_logprobs is not None and len(flat_logprobs.token_ids) >= end_offset:
+            beam_token_id = flat_logprobs.token_ids[start_offset]
+        else:
+            # Fallback to base token if logprobs are missing
+            beam_token_id = completion_out_base.token_ids[0] if completion_out_base.token_ids else 0
+            
+        completion_out.token_ids = [beam_token_id]
+
+        # 4. Isolate and slice the logprob metadata structures per beam
+        if flat_logprobs is not None:
+            # Create a separate copy of the FlatLogprobs container to prevent shared mutations
+            completion_out.logprobs = copy.copy(flat_logprobs)
+            
+            # Slice the 20-element source arrays into distinct 5-element blocks
+            completion_out.logprobs.token_ids = flat_logprobs.token_ids[start_offset:end_offset]
+            completion_out.logprobs.logprobs = flat_logprobs.logprobs[start_offset:end_offset]
+            
+            if hasattr(flat_logprobs, 'ranks') and flat_logprobs.ranks is not None:
+                completion_out.logprobs.ranks = flat_logprobs.ranks[start_offset:end_offset]
+                
+            if hasattr(flat_logprobs, 'decoded_tokens') and flat_logprobs.decoded_tokens is not None:
+                completion_out.logprobs.decoded_tokens = flat_logprobs.decoded_tokens[start_offset:end_offset]
+            
+            # Reset internal indexing descriptors to match the new isolated length
+            if hasattr(flat_logprobs, 'start_indices'):
+                completion_out.logprobs.start_indices = [0]
+            if hasattr(flat_logprobs, 'end_indices'):
+                completion_out.logprobs.end_indices = [K]
 
         mocked_outputs.append(
             RequestOutput(
@@ -193,7 +235,6 @@ async def _mega_request_step(
                 prompt_logprobs=None
             )
         )
-    # print("mocked_outputs", mocked_outputs)
     return mocked_outputs, child_beam_ids
 
 async def _mega_request_cleanup(engine_client, session_id, final_ids, rank):
