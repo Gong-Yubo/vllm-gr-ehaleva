@@ -240,8 +240,20 @@ def apply_scheduler_patch():
 
     @wraps(_original_schedule)
     def patched_schedule(self):
-        import torch
-        torch.cuda.nvtx.range_push("Scheduler.schedule")
+        
+        _original_get_computed_blocks = self.kv_cache_manager.get_computed_blocks
+        block_size = self.cache_config.block_size
+        # TODO: Add support for cache > prefix
+        def patch_get_computed_blocks(req):
+            bn, tn = _original_get_computed_blocks(req)
+            if req and getattr(req, 'is_mega_decode', False):
+                pn = getattr(req, "prefix_len", 0) // block_size * block_size
+                if tn > pn:
+                    sliced_blocks = tuple(group[:pn//block_size] for group in bn.blocks)
+                    return self.kv_cache_manager.create_kv_cache_blocks(sliced_blocks), pn
+            return bn, tn
+
+        self.kv_cache_manager.get_computed_blocks = patch_get_computed_blocks
         try:
             output = _original_schedule(self)
             
@@ -261,21 +273,21 @@ def apply_scheduler_patch():
             output.mega_data = mega_data
             return output
         finally:
-            torch.cuda.nvtx.range_pop()
+            self.kv_cache_manager.get_computed_blocks = _original_get_computed_blocks
 
     Scheduler.schedule = patched_schedule
     Scheduler._patched_for_mega_requests = True
     logger.debug("Scheduler.schedule patched for mega-requests propagation.")
 
-
 def apply_worker_patches():
     """Monkey-patch GPUModelRunner to fix position IDs, sampling metadata, and bookkeeping for mega-requests."""
     try:
         import torch
-        import copy
         from vllm.v1.worker.gpu_input_batch import InputBatch
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-        from vllm.sampling_params import SamplingType
+        from vllm_gr.v1.attention.backends.beam_attn import MEGA_DATA_VAR
+        from typing import Any, Dict, List, Optional, Tuple
+
     except ImportError:
         logger.warning("Failed to import GPUModelRunner components, skipping worker patches.")
         return
@@ -291,15 +303,177 @@ def apply_worker_patches():
     _original_prepare_inputs = GPUModelRunner._prepare_inputs
     _original_bookkeeping_sync = GPUModelRunner._bookkeeping_sync
 
+
+    def _get_positions_buffers(runner: GPUModelRunner) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Safely extracts underlying PyTorch data tensors from the CpuGpuBuffer container."""
+        gpu_positions = None
+        cpu_positions = None
+        if hasattr(runner, "positions") and runner.positions is not None:
+            gpu_positions = getattr(runner.positions, "gpu", None)
+            cpu_positions = getattr(runner.positions, "cpu", None)
+        return gpu_positions, cpu_positions
+
+
+    def _compute_beam_bounds(
+        b: int, 
+        prefix_len: int, 
+        cache_len: int, 
+        decode_steps: int, 
+        chunk_budget: int, 
+        delta: int
+        ) -> Tuple[int, int]:
+        """
+        Calculates how many uncached tokens a specific beam needs to compute 
+        AND extracts its historical progression count within the KV cache.
+        
+        Returns:
+            (b_uncached, past_suffix_b)
+        """
+
+        # Calculate how many historical tokens belong specifically to this beam runway
+        past_suffix_b = max(0, min(decode_steps, delta - b * decode_steps))
+        if prefix_len >= cache_len:
+            # ---------------------------------------------------------------------
+            # Scenario A: Shared Prefix is Incomplete (Prefill Phase or tail last un cached block)
+            # ---------------------------------------------------------------------
+            remaining_prefix = prefix_len - cache_len
+            if b == 0:
+                # Beam 0 is the dedicated worker clearing out the rest of the prompt prefix
+                b_uncached = min(chunk_budget, remaining_prefix + decode_steps)
+                return b_uncached, past_suffix_b
+            else:
+                # Follower Beams: Beam 0 has already mutated chunk_budget in the outer loop.
+                # If chunk_budget is still > 0, it means Beam 0 cleared the prefix AND 
+                # there are slots left over. Follower beams can execute immediately!
+                b_uncached = min(chunk_budget, decode_steps)
+                return b_uncached, past_suffix_b
+                
+        else:
+            # ---------------------------------------------------------------------
+            # Scenario B: Shared Prefix is Complete (True Lookahead Decode Phase)
+            # ---------------------------------------------------------------------
+            remaining_suffix_b = decode_steps - past_suffix_b
+            b_uncached = min(chunk_budget, remaining_suffix_b)
+            return b_uncached, past_suffix_b
+
+
+
+
+    def _overwrite_position_ids(st: int, b_uncached: int, curr_offset: int, 
+                                gpu_positions: Optional[torch.Tensor], cpu_positions: Optional[torch.Tensor]) -> None:
+        """Overwrites positional indexing sequences for execution hardware layers in-place."""
+        if gpu_positions is not None:
+            beam_positions_gpu = torch.arange(
+                st, st + b_uncached, 
+                dtype=gpu_positions.dtype, device=gpu_positions.device
+            )
+            gpu_positions[curr_offset : curr_offset + b_uncached] = beam_positions_gpu
+
+        if cpu_positions is not None:
+            beam_positions_cpu = torch.arange(
+                st, st + b_uncached, 
+                dtype=cpu_positions.dtype, device=torch.device("cpu")
+            )
+            cpu_positions[curr_offset : curr_offset + b_uncached] = beam_positions_cpu
+
+
+    def _process_mega_decode_request(
+        mdata: Dict[str, Any],
+        seq_len: int,
+        token_offset: int,
+        gpu_positions: Optional[torch.Tensor],
+        cpu_positions: Optional[torch.Tensor],
+        new_logits_indices: List[int]
+    ) -> Tuple[int, int]:
+        """Traces memory allocation layouts and mutates position buffers for a single mega-request."""
+        # Shared Prefix len
+        prefix_len = mdata['prefix_len']
+        # Beam width of request
+        beam_width = mdata['mega_beam_width']
+        # decode step
+        decode_steps = mdata['mega_decode_steps']
+        # Current Tokens in KV cache
+        cache_len = mdata['cache_len']
+
+        chunk_budget = seq_len
+        # Delta measures the total number of unique suffix tokens generated across all beams combined that currently exist in the KV cache  
+        delta = max(0, cache_len - prefix_len)
+
+        curr_offset = token_offset
+        valid_rows_for_req = 0
+        full_valid_rows_for_req = 0
+
+        # Distribute workloads or adjust position indexes per parallel beam line
+        for b in range(beam_width):
+            if chunk_budget <= 0:
+                break
+                
+            b_uncached, past_suffix_b = _compute_beam_bounds(b, prefix_len, cache_len, decode_steps, chunk_budget, delta)
+
+            if b_uncached > 0:
+                # Determine true continuous timeline starting position
+                if prefix_len >= cache_len:
+                    st = cache_len if b == 0 else prefix_len
+                else:
+                    st = prefix_len + past_suffix_b  # <-- Pure logical position
+
+                _overwrite_position_ids(st, b_uncached, curr_offset, gpu_positions, cpu_positions)
+
+                # Only command a logit prediction calculation if this specific chunk 
+                # block completes the final lookahead decode step of the beam trajectory.
+                if past_suffix_b + b_uncached >= decode_steps:
+                    new_logits_indices.append(curr_offset + b_uncached - 1)
+                    full_valid_rows_for_req += 1
+                valid_rows_for_req += 1
+                curr_offset += b_uncached
+                chunk_budget -= b_uncached
+
+        return max(1, valid_rows_for_req), max(1, full_valid_rows_for_req), curr_offset
+
+
+    def _remux_logprobs_tensors(request_row_configs: List[Tuple[Any, int, int]], max_chained_dim: int, K: int,
+                                orig_lps: torch.Tensor, orig_lp_ids: Optional[torch.Tensor], orig_ranks: Optional[torch.Tensor],
+                                st_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Slices, reshapes, and chains fragmented multi-beam output arrays back into a unified block structure."""
+        new_st_ids_list = []
+        new_lps_list = []
+        new_lp_ids_list = []
+        new_ranks_list = []
+
+        for req_id, start_row, W in request_row_configs:
+            # Retain original sampled token ID baseline references
+            new_st_ids_list.append(st_ids[start_row : start_row + 1, :])
+
+            # Flatten multi-row beams into a single continuous sequence row
+            req_lps = orig_lps[start_row : start_row + W, :].reshape(1, W * K)
+            if W * K < max_chained_dim:
+                req_lps = torch.nn.functional.pad(req_lps, (0, max_chained_dim - W * K), value=float('-inf'))
+            new_lps_list.append(req_lps)
+
+            if orig_lp_ids is not None:
+                req_lp_ids = orig_lp_ids[start_row : start_row + W, :].reshape(1, W * K)
+                if W * K < max_chained_dim:
+                    req_lp_ids = torch.nn.functional.pad(req_lp_ids, (0, max_chained_dim - W * K), value=0)
+                new_lp_ids_list.append(req_lp_ids)
+
+            if orig_ranks is not None:
+                req_ranks = orig_ranks[start_row : start_row + W].reshape(1, W)
+                if W < max_chained_dim:
+                    req_ranks = torch.nn.functional.pad(req_ranks, (0, max_chained_dim - W), value=0)
+                new_ranks_list.append(req_ranks)
+
+        final_st_ids = torch.cat(new_st_ids_list, dim=0)
+        final_lps = torch.cat(new_lps_list, dim=0)
+        final_lp_ids = torch.cat(new_lp_ids_list, dim=0) if orig_lp_ids is not None else None
+        final_ranks = torch.cat(new_ranks_list, dim=0) if orig_ranks is not None else None
+
+        return final_st_ids, final_lps, final_lp_ids, final_ranks
+
     def patched_execute_model(self, scheduler_output, *args, **kwargs):
-        # Stash the mega_data temporarily on the runner instance for the lifecycle turn
+        """Turn-scoped execution manager to hook variables onto the runtime runner lifecycle."""
         self._current_mega_data = getattr(scheduler_output, "mega_data", {})
-        self._current_scheduler_output = scheduler_output
-        from vllm_gr.v1.attention.backends.beam_attn import MEGA_DATA_VAR
-        mega_info = {
-            "mega_data": self._current_mega_data,
-            "req_ids": []
-        }
+
+        mega_info = {"mega_data": self._current_mega_data, "req_ids": []}
         token = MEGA_DATA_VAR.set(mega_info)
         self._current_mega_info = mega_info
         
@@ -307,12 +481,11 @@ def apply_worker_patches():
             return _original_execute_model(self, scheduler_output, *args, **kwargs)
         finally:
             self._current_mega_data = {}
-            self._current_scheduler_output = None
             self._current_mega_info = None
             MEGA_DATA_VAR.reset(token)
 
     def patched_prepare_inputs(self, scheduler_output, num_scheduled_tokens):
-        # Initialize native vLLM parameters and populate baseline states
+        """Alters position structures and deploys row translation wrappers right before layer passes."""
         logits_indices, spec_decode_metadata = _original_prepare_inputs(
             self, scheduler_output, num_scheduled_tokens
         )
@@ -321,30 +494,31 @@ def apply_worker_patches():
             self._current_mega_info["req_ids"] = self.input_batch.req_ids
 
         mega_data = getattr(scheduler_output, "mega_data", {})
+        print("req num", len(self.input_batch.req_ids))
         if not mega_data:
+            print(f"no mega data")
             return logits_indices, spec_decode_metadata
-
+        
         self.input_batch.logprob_token_ids = {}
         new_logits_indices = []
 
-        token_offset = 0
-        sample_slot_offset = 0
-        
-        # ---------------------------------------------------------------------
-        # PHASE 1: PRE-COMPUTE DYNAMIC ROW MAPS & CPU_GPU_BUFFER POSITION IDS
-        # ---------------------------------------------------------------------
         orig_req_ids = self.input_batch.req_ids
-        row_to_req_id = []     
-        row_to_batch_idx = []   
+        
+        # A running counter tracking the cumulative number of flattened tokens processed across the entire shared workspace batch up to this point.
+        # It tells the logic where the token slices for the current request begin in memory
+        token_offset = 0    
+        # A translation list mapping the physical tensor row index back to its string-based Request ID
+        row_to_req_id = []
+        # A translation list mapping the physical tensor row index back to the index it occupied inside vLLM's original scheduler array  
+        row_to_batch_idx = []
+        # A layout metadata catalog storing tuples of (request_id, start_row, W). It records exactly where a request's physical block starts in the tensor and how many parallel beam rows ($W$) it spans   
         request_row_configs = []
+        # A strict monotonic counter tracking the absolute current physical row index inside the tensor block
         input_row_idx = 0
 
-        gpu_positions = None
-        cpu_positions = None
-        if hasattr(self, "positions") and self.positions is not None:
-            gpu_positions = getattr(self.positions, "gpu", None)
-            cpu_positions = getattr(self.positions, "cpu", None)
+        gpu_positions, cpu_positions = _get_positions_buffers(self)
 
+        # Build dynamic allocation matrices across all active request batches
         for batch_idx, req_id in enumerate(orig_req_ids):
             seq_len = num_scheduled_tokens[batch_idx] if batch_idx < len(num_scheduled_tokens) else 0
             if req_id is None:
@@ -354,72 +528,18 @@ def apply_worker_patches():
                 token_offset += seq_len
                 continue
                 
-            request = self.requests[req_id]
-            req_n = request.sampling_params.n if request.sampling_params else 1
             mdata = mega_data.get(req_id)
-
             if mdata and mdata.get('is_mega_decode', False):
-                prefix_len = mdata['prefix_len']
-                beam_width = mdata['mega_beam_width']
-                decode_steps = mdata['mega_decode_steps']
-                cache_len = mdata['cache_len']
-
-                chunk_budget = seq_len  
-                delta = max(0, cache_len - prefix_len)
-                
-                req_n = beam_width
-                mdata['sample_slot_offset'] = sample_slot_offset
-
-                curr_offset = token_offset
-                valid_rows_for_req = 0
-
-                for b in range(beam_width):
-                    if chunk_budget <= 0:
-                        break
-                        
-                    b_uncached = 0
-                    if prefix_len >= cache_len:
-                        remaining_prefix = prefix_len - cache_len
-                        if b == 0:
-                            b_uncached = min(chunk_budget, remaining_prefix + decode_steps)
-                        else:
-                            if remaining_prefix <= seq_len:
-                                b_uncached = min(chunk_budget, decode_steps)
-                    else:
-                        past_suffix_b = max(0, min(decode_steps, delta - b * decode_steps))
-                        remaining_suffix_b = decode_steps - past_suffix_b
-                        b_uncached = min(chunk_budget, remaining_suffix_b)
-
-                    if b_uncached > 0:
-                        if prefix_len >= cache_len:
-                            st = cache_len if b == 0 else prefix_len
-                        else:
-                            st = prefix_len + (b * decode_steps) + past_suffix_b
-
-                        if gpu_positions is not None:
-                            beam_positions_gpu = torch.arange(
-                                st, st + b_uncached, 
-                                dtype=gpu_positions.dtype, device=gpu_positions.device
-                            )
-                            gpu_positions[curr_offset : curr_offset + b_uncached] = beam_positions_gpu
-
-                        if cpu_positions is not None:
-                            beam_positions_cpu = torch.arange(
-                                st, st + b_uncached, 
-                                dtype=cpu_positions.dtype, device=torch.device("cpu")
-                            )
-                            cpu_positions[curr_offset : curr_offset + b_uncached] = beam_positions_cpu
-
-                        new_logits_indices.append(curr_offset + b_uncached - 1)
-                        curr_offset += b_uncached
-                        chunk_budget -= b_uncached
-                        valid_rows_for_req += 1
-
-                W = max(1, valid_rows_for_req)
+                W, W_full, next_offset = _process_mega_decode_request(
+                    mdata, seq_len, token_offset, gpu_positions,
+                    cpu_positions, new_logits_indices
+                )
+                print(f"mega W={W}, seq_len={seq_len}")
                 row_to_req_id.extend([req_id] * W)
                 row_to_batch_idx.extend([batch_idx] * W)
                 input_row_idx += W
             else:
+                print("regular seq_len=", seq_len)
                 if seq_len > 0:
                     new_logits_indices.append(token_offset + seq_len - 1)
                 W = 1
@@ -428,22 +548,23 @@ def apply_worker_patches():
                 input_row_idx += W
 
             request_row_configs.append((req_id, input_row_idx - W, W))
-            sample_slot_offset += req_n
             token_offset += seq_len
+        
+        print(f"row_to_batch_idx {row_to_batch_idx[:32]} len {len(row_to_batch_idx)}")
+        print(f"new_logits_indices {new_logits_indices[:32]} {len(new_logits_indices)}")
+        print(f"cpu_positions {cpu_positions[:32]} len {len(cpu_positions)}")
 
         # ---------------------------------------------------------------------
-        # PHASE 2: ROW-MAPPED INTERCEPTOR PROTECTION PROXIES
+        # INLINE DATA-STRUCT DESCRIPTOR PROXIES
         # ---------------------------------------------------------------------
         class MegaReqIdsProxy(list):
             def __init__(self, original_list, req_id_map):
                 super().__init__(original_list)
                 self.req_id_map = req_id_map
             def __getitem__(self, index):
-                if index < len(self.req_id_map):
-                    return self.req_id_map[index]
+                if index < len(self.req_id_map): return self.req_id_map[index]
                 return self.req_id_map[-1] if self.req_id_map else None
-            def copy(self):
-                return list(self.req_id_map)
+            def copy(self): return list(self.req_id_map)
 
         class Mock1DArray:
             def __init__(self, original, batch_idx_map):
@@ -464,71 +585,48 @@ def apply_worker_patches():
                 idx, slc = key
                 actual_idx = self.batch_idx_map[idx] if idx < len(self.batch_idx_map) else 0
                 self.original[actual_idx, slc] = value
-            def __getattr__(self, name):
-                return getattr(self.original, name)
+            def __getattr__(self, name): return getattr(self.original, name)
             def __getitem__(self, key):
                 idx, slc = key
                 actual_idx = self.batch_idx_map[idx] if idx < len(self.batch_idx_map) else 0
                 return self.original[actual_idx, slc]
 
         class InputBatchProxy:
-            def __init__(self, obj, req_map, idx_map, runner):
+            def __init__(self, obj, req_map, idx_map, scheduler_output):
                 object.__setattr__(self, "_obj", obj)
                 object.__setattr__(self, "_req_id_map", req_map)
                 object.__setattr__(self, "_batch_idx_map", idx_map)
-                object.__setattr__(self, "_runner", runner)
+                object.__setattr__(self, "_scheduler_output", scheduler_output)
             def __getattr__(self, name):
                 obj = object.__getattribute__(self, "_obj")
                 req_map = object.__getattribute__(self, "_req_id_map")
                 idx_map = object.__getattribute__(self, "_batch_idx_map")
-                runner = object.__getattribute__(self, "_runner")
+                sched_out = object.__getattribute__(self, "_scheduler_output")
                 
                 if name == "sampling_metadata":
                     s_meta = getattr(obj, "sampling_metadata", None)
+                    if s_meta is None or idx_map is None:
+                        return s_meta
                     
-                    # DYNAMIC RESOLUTION PASS: Calculate the row structure dynamically 
-                    # whenever sampling_metadata is read to eliminate lifecycle races.
-                    active_expansion = []
-                    sched_out = getattr(runner, "_current_scheduler_output", None)
-                    mega_data_ctx = getattr(runner, "_current_mega_data", {})
-                    
-                    if sched_out is not None and hasattr(obj, "req_ids"):
-                        for b_idx, r_id in enumerate(obj.req_ids):
-                            m_data = mega_data_ctx.get(r_id) if r_id else None
-                            if m_data and m_data.get('is_mega_decode', False):
-                                # Determine rows based on valid un-budgeted chunks
-                                # If prepare_inputs has not changed the allocation grid yet,
-                                # fall back gracefully to standard full beam-width allocation footprints.
-                                num_allocated_rows = m_data.get('mega_beam_width', 1)
-                                active_expansion.extend([b_idx] * num_allocated_rows)
-                            else:
-                                active_expansion.append(b_idx)
-                    else:
-                        active_expansion = idx_map
-
-                    if s_meta is not None and active_expansion:
-                        for attr in ["temperature", "top_p", "top_k", "min_p"]:
-                            val = getattr(s_meta, attr, None)
-                            if isinstance(val, torch.Tensor) and val.numel() > 0:
-                                if val.shape[0] != len(active_expansion):
-                                    object.__setattr__(s_meta, attr, val[active_expansion])
+                    num_of_logprobs = len(idx_map)
+                    for attr in ["temperature", "top_p", "top_k", "min_p", "frequency_penalties", "presence_penalties", "repetition_penalties"]:
+                        val = getattr(s_meta, attr, None)
+                        if isinstance(val, torch.Tensor) and val.numel() > 0:
+                            if val.shape[0] != num_of_logprobs:
+                                expanded_tensor = val[idx_map]
+                                object.__setattr__(s_meta, attr, expanded_tensor)
                     return s_meta
-                elif name == "req_ids":
-                    return MegaReqIdsProxy(obj.req_ids, req_map)
-                elif name == "num_tokens_no_spec":
-                    return Mock1DArray(obj.num_tokens_no_spec, idx_map)
-                elif name == "token_ids_cpu":
-                    return Mock2DArray(obj.token_ids_cpu, idx_map)
-                elif name == "is_token_ids":
-                    return Mock2DArray(obj.is_token_ids, idx_map) if hasattr(obj, 'is_token_ids') else Mock2DArray(obj.token_ids_cpu, idx_map)
+                elif name == "req_ids": return MegaReqIdsProxy(obj.req_ids, req_map)
+                elif name == "num_tokens_no_spec": return Mock1DArray(obj.num_tokens_no_spec, idx_map)
+                elif name == "token_ids_cpu": return Mock2DArray(obj.token_ids_cpu, idx_map)
+                elif name == "is_token_ids": return Mock2DArray(obj.is_token_ids, idx_map) if hasattr(obj, 'is_token_ids') else Mock2DArray(obj.token_ids_cpu, idx_map)
                 return getattr(obj, name)
             def __setattr__(self, name, value):
                 obj = object.__getattribute__(self, "_obj")
                 setattr(obj, name, value)
 
-        # Hot-swap input batch parameters with our context-isolated proxy wrapper
-        self.input_batch = InputBatchProxy(self.input_batch, row_to_req_id, row_to_batch_idx, self)
-        
+        # Intercept native context calls with our structural layout proxy wrappers
+        self.input_batch = InputBatchProxy(self.input_batch, row_to_req_id, row_to_batch_idx, scheduler_output)
         self.input_batch._gr_request_row_configs = request_row_configs
         self.input_batch._gr_input_row_idx = input_row_idx
         
@@ -536,14 +634,13 @@ def apply_worker_patches():
         return logits_indices, spec_decode_metadata
   
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
+        """Synchronizes and maps tensor arrays back to the expected shape format before return lines."""
         mega_data = getattr(scheduler_output, "mega_data", {})
-        
         if not mega_data or not hasattr(self.input_batch, "_gr_request_row_configs"):
             return _original_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
 
         request_row_configs = self.input_batch._gr_request_row_configs
         input_row_idx = self.input_batch._gr_input_row_idx
-
         orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
         
         try:
@@ -555,7 +652,7 @@ def apply_worker_patches():
          prompt_logprobs_dict, req_ids_output_copy, req_id_to_index_output_copy, invalid_req_indices) = res
 
         # ---------------------------------------------------------------------
-        # PHASE 3: ORIGINAL IN-PLACE DATA ASSIGNMENT (.DATA MUTATIONS UNCHANGED)
+        # MUTATION LAYER: MERGE FRAGMENTED TENSOR ROWS BACK TO LOGICAL SLOTS
         # ---------------------------------------------------------------------
         sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
         if sampler_output is not None:
@@ -570,36 +667,12 @@ def apply_worker_patches():
                 
                 max_chained_dim = max(W * K for _, _, W in request_row_configs)
 
-                new_st_ids_list = []
-                new_lps_list = []
-                new_lp_ids_list = []
-                new_ranks_list = []
+                # Remap the split tensor frames securely
+                final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
+                    request_row_configs, max_chained_dim, K, orig_lps, orig_lp_ids, orig_ranks, st_ids
+                )
 
-                for req_id, start_row, W in request_row_configs:
-                    new_st_ids_list.append(st_ids[start_row : start_row + 1, :])
-
-                    req_lps = orig_lps[start_row : start_row + W, :].reshape(1, W * K)
-                    if W * K < max_chained_dim:
-                        req_lps = torch.nn.functional.pad(req_lps, (0, max_chained_dim - W * K), value=float('-inf'))
-                    new_lps_list.append(req_lps)
-
-                    if orig_lp_ids is not None:
-                        req_lp_ids = orig_lp_ids[start_row : start_row + W, :].reshape(1, W * K)
-                        if W * K < max_chained_dim:
-                            req_lp_ids = torch.nn.functional.pad(req_lp_ids, (0, max_chained_dim - W * K), value=0)
-                        new_lp_ids_list.append(req_lp_ids)
-
-                    if orig_ranks is not None:
-                        req_ranks = orig_ranks[start_row : start_row + W].reshape(1, W)
-                        if W < max_chained_dim:
-                            req_ranks = torch.nn.functional.pad(req_ranks, (0, max_chained_dim - W), value=0)
-                        new_ranks_list.append(req_ranks)
-
-                final_st_ids = torch.cat(new_st_ids_list, dim=0)
-                final_lps = torch.cat(new_lps_list, dim=0)
-                final_lp_ids = torch.cat(new_lp_ids_list, dim=0) if orig_lp_ids is not None else None
-                final_ranks = torch.cat(new_ranks_list, dim=0) if orig_ranks is not None else None
-
+                # Inject unified tensors into the output object properties via .data pointers
                 st_ids.data = final_st_ids.data
                 orig_lps.data = final_lps.data
                 
@@ -616,9 +689,7 @@ def apply_worker_patches():
                     if request.sampling_params:
                         request.sampling_params.logprobs = max_chained_dim
 
-                # -----------------------------------------------------------------
-                # PHASE 4: SYNCHRONOUS LIST DATA RE-PACKAGING (FALLBACK)
-                # -----------------------------------------------------------------
+                # Synchronous fallback tracking lists re-packaging
                 if valid_sampled_token_ids and len(valid_sampled_token_ids) == input_row_idx:
                     new_valid_tokens = []
                     new_logprobs_lists = [] if logprobs_lists is not None else None

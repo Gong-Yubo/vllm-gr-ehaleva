@@ -430,14 +430,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                         b_suffix_start = cache_len
                         b_suffix_len = b_uncached
                     else:
-                        # Follower Beams (1 to W-1) cannot compute shared prefix tokens.
-                        # They must wait until the prefix is fully resolved. They are only allowed 
-                        # to compute their unique suffixes if the prefix finishes within this chunk.
-                        if remaining_prefix <= q_len:
-                            b_uncached = min(chunk_budget, steps)
-                            b_cache_len = prefix_len
-                            b_suffix_start = prefix_len + b * steps
-                            b_suffix_len = b_uncached
+                        # If chunk_budget is still > 0, it means Beam 0 cleared the prefix AND 
+                        # there are slots left over. Follower beams can execute immediately!
+                        b_uncached = min(chunk_budget, steps)
+                        b_cache_len = prefix_len
+                        b_suffix_start = prefix_len + b * steps
+                        b_suffix_len = b_uncached
                 else:
                     # Scenario B: Prefix Complete
                     # Motivation: The shared prefix is fully safely stored in the KV cache.
