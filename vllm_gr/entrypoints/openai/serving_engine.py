@@ -398,12 +398,6 @@ async def beam_search(
                     logprobs_pos = raw_logprobs[start_offset:end_offset]
                     ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
                     decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
-
-                    from collections import Counter
-
-                    counts = Counter(token_ids_pos)
-                    duplicates = [tid for tid, c in counts.items() if c > 1]
-                    if duplicates: print("duplicates:", duplicates)
                     
                     if valid_tokens_sets is not None:
                         valid_tokens_set = valid_tokens_sets[b_idx]
