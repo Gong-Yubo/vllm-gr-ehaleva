@@ -431,32 +431,43 @@ def apply_worker_patches():
         return max(1, valid_rows_for_req), max(1, full_valid_rows_for_req), curr_offset
 
 
-    def _remux_logprobs_tensors(request_row_configs: List[Tuple[Any, int, int]], max_chained_dim: int, K: int,
-                                orig_lps: torch.Tensor, orig_lp_ids: Optional[torch.Tensor], orig_ranks: Optional[torch.Tensor],
-                                st_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Slices, reshapes, and chains fragmented multi-beam output arrays back into a unified block structure."""
+    def _remux_logprobs_tensors(
+        request_row_configs: List[Tuple[Any, int, int]], 
+        max_chained_dim: int, 
+        target_K: int,  # Pass the explicit, true logprobs target count from sampling_params
+        orig_lps: torch.Tensor, 
+        orig_lp_ids: Optional[torch.Tensor], 
+        orig_ranks: Optional[torch.Tensor],
+        st_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Slices, reshapes, and chains fragmented multi-beam output arrays using strict target layout constraints."""
         new_st_ids_list = []
         new_lps_list = []
         new_lp_ids_list = []
         new_ranks_list = []
 
         for req_id, start_row, W in request_row_configs:
-            # Retain original sampled token ID baseline references
+            # 1. Retain leader beam references
             new_st_ids_list.append(st_ids[start_row : start_row + 1, :])
 
-            # Flatten multi-row beams into a single continuous sequence row
-            req_lps = orig_lps[start_row : start_row + W, :].reshape(1, W * K)
-            if W * K < max_chained_dim:
-                req_lps = torch.nn.functional.pad(req_lps, (0, max_chained_dim - W * K), value=float('-inf'))
+            # ---------------------------------------------------------------------
+            # CORRECTION: Force explicit slicing along dimension 1 using target_K
+            # ---------------------------------------------------------------------
+            # Instead of taking [:, :], strictly slice down to target_K elements 
+            # to strip away any dynamic runtime adjustments made by vLLM.
+            req_lps = orig_lps[start_row : start_row + W, :target_K].reshape(1, W * target_K)
+            if W * target_K < max_chained_dim:
+                req_lps = torch.nn.functional.pad(req_lps, (0, max_chained_dim - W * target_K), value=float('-inf'))
             new_lps_list.append(req_lps)
 
             if orig_lp_ids is not None:
-                req_lp_ids = orig_lp_ids[start_row : start_row + W, :].reshape(1, W * K)
-                if W * K < max_chained_dim:
-                    req_lp_ids = torch.nn.functional.pad(req_lp_ids, (0, max_chained_dim - W * K), value=0)
+                req_lp_ids = orig_lp_ids[start_row : start_row + W, :target_K].reshape(1, W * target_K)
+                if W * target_K < max_chained_dim:
+                    req_lp_ids = torch.nn.functional.pad(req_lp_ids, (0, max_chained_dim - W * target_K), value=0)
                 new_lp_ids_list.append(req_lp_ids)
 
             if orig_ranks is not None:
+                # Ranks is 1D, so slice along dimension 0 securely
                 req_ranks = orig_ranks[start_row : start_row + W].reshape(1, W)
                 if W < max_chained_dim:
                     req_ranks = torch.nn.functional.pad(req_ranks, (0, max_chained_dim - W), value=0)
@@ -494,9 +505,9 @@ def apply_worker_patches():
             self._current_mega_info["req_ids"] = self.input_batch.req_ids
 
         mega_data = getattr(scheduler_output, "mega_data", {})
-        print("req num", len(self.input_batch.req_ids))
+        # print("req num", len(self.input_batch.req_ids))
         if not mega_data:
-            print(f"no mega data")
+            # print(f"no mega data")
             return logits_indices, spec_decode_metadata
         
         self.input_batch.logprob_token_ids = {}
@@ -534,12 +545,12 @@ def apply_worker_patches():
                     mdata, seq_len, token_offset, gpu_positions,
                     cpu_positions, new_logits_indices
                 )
-                print(f"mega W={W}, seq_len={seq_len}")
+                # print(f"mega W={W}, seq_len={seq_len}")
                 row_to_req_id.extend([req_id] * W)
                 row_to_batch_idx.extend([batch_idx] * W)
                 input_row_idx += W
             else:
-                print("regular seq_len=", seq_len)
+                # print("regular seq_len=", seq_len)
                 if seq_len > 0:
                     new_logits_indices.append(token_offset + seq_len - 1)
                 W = 1
@@ -550,9 +561,9 @@ def apply_worker_patches():
             request_row_configs.append((req_id, input_row_idx - W, W))
             token_offset += seq_len
         
-        print(f"row_to_batch_idx {row_to_batch_idx[:32]} len {len(row_to_batch_idx)}")
-        print(f"new_logits_indices {new_logits_indices[:32]} {len(new_logits_indices)}")
-        print(f"cpu_positions {cpu_positions[:32]} len {len(cpu_positions)}")
+        # print(f"row_to_batch_idx {row_to_batch_idx[:32]} len {len(row_to_batch_idx)}")
+        # print(f"new_logits_indices {new_logits_indices[:32]} {len(new_logits_indices)}")
+        # print(f"cpu_positions {cpu_positions[:32]} len {len(cpu_positions)}")
 
         # ---------------------------------------------------------------------
         # INLINE DATA-STRUCT DESCRIPTOR PROXIES
@@ -663,31 +674,41 @@ def apply_worker_patches():
                 orig_lps = lp_tensors.logprobs
                 orig_lp_ids = lp_tensors.logprob_token_ids
                 orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
-                K = orig_lps.shape[1] 
                 
-                max_chained_dim = max(W * K for _, _, W in request_row_configs)
+                # Grab the true target logprobs value upfront from the configured structures
+                first_req_id = request_row_configs[0][0]
+                target_K = self.requests[first_req_id].sampling_params.logprobs  # e.g., 16 or 128
+                
+                # ---------------------------------------------------------------------
+                # WORKER FIX: STRIP NATIVE EXTRA PREPENDED COLUMNS (INDEX 0 WINNER TRAP)
+                # ---------------------------------------------------------------------
+                # If vLLM's bookkeeping has expanded the tensor width to target_K + 1,
+                # strip away index 0 to return to pristine, unshifted, unique top-K states.
+                if orig_lps.shape[1] == target_K + 1:
+                    orig_lps = orig_lps[:, 1:]
+                    if orig_lp_ids is not None:
+                        orig_lp_ids = orig_lp_ids[:, 1:]
+                    if orig_ranks is not None:
+                        orig_ranks = orig_ranks[:, 1:] if orig_ranks.ndim > 1 else orig_ranks
 
-                # Remap the split tensor frames securely
+                max_chained_dim = max(W * target_K for _, _, W in request_row_configs)
+
+                # Pass target_K explicitly to enforce strict uniform boundary layouts
                 final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
-                    request_row_configs, max_chained_dim, K, orig_lps, orig_lp_ids, orig_ranks, st_ids
+                    request_row_configs, max_chained_dim, target_K, orig_lps, orig_lp_ids, orig_ranks, st_ids
                 )
-
+                
                 # Inject unified tensors into the output object properties via .data pointers
                 st_ids.data = final_st_ids.data
-                orig_lps.data = final_lps.data
+                lp_tensors.logprobs.data = final_lps.data
                 
-                if orig_lp_ids is not None:
-                    orig_lp_ids.data = final_lp_ids.data
-                if orig_ranks is not None:
-                    orig_ranks.data = final_ranks.view(-1).data
+                if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
+                    lp_tensors.logprob_token_ids.data = final_lp_ids.data
+                if orig_ranks is not None and final_ranks is not None:
+                    lp_tensors.selected_token_ranks.data = final_ranks.view(-1).data
 
                 if getattr(orig_input_batch, "prev_sampled_token_ids", None) is not None:
                     orig_input_batch.prev_sampled_token_ids.data = final_st_ids.data
-
-                for req_id, _, _ in request_row_configs:
-                    request = self.requests[req_id]
-                    if request.sampling_params:
-                        request.sampling_params.logprobs = max_chained_dim
 
                 # Synchronous fallback tracking lists re-packaging
                 if valid_sampled_token_ids and len(valid_sampled_token_ids) == input_row_idx:
@@ -709,6 +730,23 @@ def apply_worker_patches():
                     
                     valid_sampled_token_ids = new_valid_tokens
                     logprobs_lists = new_logprobs_lists
+
+                # ---------------------------------------------------------------------
+                # COLLAPSE METADATA ARRAYS TO MATCH REMUXED TENSORS
+                # ---------------------------------------------------------------------
+                collapsed_req_ids_copy = []
+                collapsed_req_id_to_index = {}
+                
+                # Loop over the logical configurations to build clean 1-to-1 mappings
+                for logical_idx, (req_id, start_row, W) in enumerate(request_row_configs):
+                    if req_id is not None:
+                        collapsed_req_ids_copy.append(req_id)
+                        # Point the request directly to its new collapsed logical row index
+                        collapsed_req_id_to_index[req_id] = logical_idx
+                
+                # Overwrite the output pointers with our perfectly aligned structures
+                req_ids_output_copy = collapsed_req_ids_copy
+                req_id_to_index_output_copy = collapsed_req_id_to_index
 
         return (num_nans_in_logits, logprobs_lists, valid_sampled_token_ids,
                 prompt_logprobs_dict, req_ids_output_copy, req_id_to_index_output_copy, invalid_req_indices)

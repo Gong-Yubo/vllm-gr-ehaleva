@@ -120,7 +120,7 @@ async def _mega_request_step(
         beam_tokens.append(full_tokens[prefix_len:])
 
     # -------------------------------------------------------------------------
-    # OPTIMIZATION: Declare true active beam sizing directly to the core sampler
+    # Declare true active beam sizing directly to the core sampler
     # -------------------------------------------------------------------------
     decode_sampling_params = copy.copy(beam_search_params)
     decode_sampling_params.n = W  # Explicitly tell the engine we have W beams
@@ -162,15 +162,6 @@ async def _mega_request_step(
 
     # Await the singular unified engine execution response block
     single_output = await _collect_beam_result(q)
-
-    # -------------------------------------------------------------------------
-    # STRIDE INJECTION: Inject layout structural attributes directly onto the object
-    # -------------------------------------------------------------------------
-    if single_output.outputs and single_output.outputs[0].logprobs is not None:
-        flat_lps = single_output.outputs[0].logprobs
-        # Stash the stride length and beam width directly on the instance annotations
-        flat_lps.stride = len(flat_lps.token_ids) // W if flat_lps.token_ids else (W + 1)
-        flat_lps.beam_width = W
 
     # Return the singular raw output instance wrapped as a single-element list 
     # to maintain backward-compatible pipeline execution with the loop below
@@ -387,26 +378,42 @@ async def beam_search(
 
             flat = mega_result.outputs[0].logprobs
             if flat is not None:
-                stride_K = getattr(flat, 'stride', logprobs_num + 1)
+                # ---------------------------------------------------------------------
+                # FIX: EXACT DYNAMIC TRACKING FILTERING (REPLACES HARDCODED STRIDE 17)
+                # ---------------------------------------------------------------------
+                # Extract tracking attributes cleanly
+                raw_token_ids = flat.token_ids
+                raw_logprobs = flat.logprobs
+                raw_ranks = getattr(flat, 'ranks', None)
+                raw_decoded = getattr(flat, 'decoded_tokens', None)
                 
-                # Directly unpack the linear arrays in single stride loops
+                # print("flat.token_ids len", len(flat.token_ids))
+
+                # print("flat.logprobs len", len(flat.logprobs))
+                # print("logprobs_num", logprobs_num)
+                # print("beams", len(fork_info))
+
+                # Each logical beam block (W=16) should extract its top choices natively
                 for b_idx in range(len(fork_info)):
                     current_beam = all_beams[b_idx]
-                    start_offset = b_idx * stride_K
-                    end_offset = start_offset + stride_K
                     
-                    # Strip the duplicate item: skip the leading token for choice mapping
-                    clean_start = start_offset + 1
+                    # Compute the true exact allocation footprint boundaries 
+                    # from the flat remuxed vector block for this specific beam
+                    start_offset = b_idx * logprobs_num
+                    end_offset = start_offset + logprobs_num
                     
-                    token_ids_pos = flat.token_ids[clean_start:end_offset]
-                    logprobs_pos = flat.logprobs[clean_start:end_offset]
-                    ranks_pos = flat.ranks[clean_start:end_offset] if getattr(flat, 'ranks', None) else None
-                    decoded_pos = flat.decoded_tokens[clean_start:end_offset] if getattr(flat, 'decoded_tokens', None) else None
+                    # Extract the precise segment dedicated to this beam's top alternative choices
+                    token_ids_pos = raw_token_ids[start_offset:end_offset]
+                    logprobs_pos = raw_logprobs[start_offset:end_offset]
+                    # print("token_ids_pos", token_ids_pos)
+                    ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
+                    decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
                     
                     if valid_tokens_sets is not None:
                         valid_tokens_set = valid_tokens_sets[b_idx]
                         logprobs_pos = [lp if tid in valid_tokens_set else -float("inf") for tid, lp in zip(token_ids_pos, logprobs_pos)]
                         
+                    # Save the clean segment safely into the historical timeline cache
                     beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
                     all_beams_token_id.extend(token_ids_pos)
                     all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
