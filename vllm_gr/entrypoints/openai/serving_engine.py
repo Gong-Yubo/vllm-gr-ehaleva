@@ -378,20 +378,11 @@ async def beam_search(
 
             flat = mega_result.outputs[0].logprobs
             if flat is not None:
-                # ---------------------------------------------------------------------
-                # FIX: EXACT DYNAMIC TRACKING FILTERING (REPLACES HARDCODED STRIDE 17)
-                # ---------------------------------------------------------------------
                 # Extract tracking attributes cleanly
                 raw_token_ids = flat.token_ids
                 raw_logprobs = flat.logprobs
                 raw_ranks = getattr(flat, 'ranks', None)
                 raw_decoded = getattr(flat, 'decoded_tokens', None)
-                
-                # print("flat.token_ids len", len(flat.token_ids))
-
-                # print("flat.logprobs len", len(flat.logprobs))
-                # print("logprobs_num", logprobs_num)
-                # print("beams", len(fork_info))
 
                 # Each logical beam block (W=16) should extract its top choices natively
                 for b_idx in range(len(fork_info)):
@@ -405,9 +396,14 @@ async def beam_search(
                     # Extract the precise segment dedicated to this beam's top alternative choices
                     token_ids_pos = raw_token_ids[start_offset:end_offset]
                     logprobs_pos = raw_logprobs[start_offset:end_offset]
-                    # print("token_ids_pos", token_ids_pos)
                     ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
                     decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
+
+                    from collections import Counter
+
+                    counts = Counter(token_ids_pos)
+                    duplicates = [tid for tid, c in counts.items() if c > 1]
+                    if duplicates: print("duplicates:", duplicates)
                     
                     if valid_tokens_sets is not None:
                         valid_tokens_set = valid_tokens_sets[b_idx]
