@@ -666,16 +666,6 @@ def apply_worker_patches():
                     request_row_configs, max_chained_dim, target_K, orig_lps, orig_lp_ids, orig_ranks, st_ids
                 )
                 
-                # st_ids.data = final_st_ids.data
-                # lp_tensors.logprobs.data = final_lps.data
-                
-                # if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
-                #     lp_tensors.logprob_token_ids.data = final_lp_ids.data
-                # if orig_ranks is not None and final_ranks is not None:
-                #     lp_tensors.selected_token_ranks.data = final_ranks[:num_logical_requests, 0].contiguous().data
-
-
-                
                 # Safely resizes the original tensor wrapper and copies the elements in place
                 st_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
                 lp_tensors.logprobs.resize_(final_lps.shape).copy_(final_lps)
@@ -683,10 +673,11 @@ def apply_worker_patches():
                 if lp_tensors.logprob_token_ids is not None and final_lp_ids is not None:
                     lp_tensors.logprob_token_ids.resize_(final_lp_ids.shape).copy_(final_lp_ids)
                 if orig_ranks is not None and final_ranks is not None:
-                    lp_tensors.selected_token_ranks.data = final_ranks[:num_logical_requests, 0].contiguous().data
-
+                    clean_ranks_slice = final_ranks[:num_logical_requests, 0].contiguous()
+                    lp_tensors.selected_token_ranks.resize_(clean_ranks_slice.shape).copy_(clean_ranks_slice)
+                            
                 if getattr(orig_input_batch, "prev_sampled_token_ids", None) is not None:
-                    orig_input_batch.prev_sampled_token_ids.data = final_st_ids.data
+                    orig_input_batch.prev_sampled_token_ids.resize_(final_st_ids.shape).copy_(final_st_ids)
 
         return (
             num_nans_in_logits,
