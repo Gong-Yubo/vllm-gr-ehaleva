@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_gr.v1.engine.types import BeamStepUpdate, MegaRequestStepUpdate
+from vllm_gr.v1.engine.types import MegaRequestStepUpdate
 
 logger = init_logger(__name__)
 
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     pass
 
 # ---------------------------------------------------------------------------
-# AsyncLLM methods for ADD_BATCH / BEAM_FORK
+# AsyncLLM methods for ADD_BATCH / MEGA_REQUEST_STEP_UPDATE
 # ---------------------------------------------------------------------------
 
 
@@ -143,7 +143,7 @@ def register_beam_output_fn(
 ):
     """Register output queue for a beam fork child (no ZMQ send).
 
-    The actual request will be created by EngineCore's BEAM_FORK handler.
+    The actual request will be created by EngineCore's MEGA_REQUEST_STEP_UPDATE handler.
     We just need a queue in OutputProcessor to receive outputs."""
     from vllm.v1.engine import EngineCoreRequest
     from vllm.v1.engine.output_processor import RequestOutputCollector
@@ -170,14 +170,6 @@ def register_beam_output_fn(
     queue = RequestOutputCollector(sampling_params.output_kind, request_id)
     self.output_processor.add_request(ec_request, None, None, 0, queue)
     return queue
-
-
-async def beam_step_update_fn(self, step_update: BeamStepUpdate) -> None:
-    """Send BEAM_STEP_UPDATE to EngineCore (new persistent-session path).
-
-    Replace the per-step ADD_BATCH + BEAM_FORK pair with a single message.
-    """
-    await self.engine_core.beam_step_update_async(step_update)
 
 
 async def mega_request_step_update_fn(self, update: MegaRequestStepUpdate) -> None:

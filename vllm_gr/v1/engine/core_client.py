@@ -4,7 +4,7 @@
 import msgspec
 from vllm.v1.engine import EngineCoreRequestType
 
-from vllm_gr.v1.engine.types import BeamStepUpdate, MegaRequestStepUpdate
+from vllm_gr.v1.engine.types import MegaRequestStepUpdate
 
 # ---------------------------------------------------------------------------
 # AsyncMPClient.add_requests_async  (new method — ADD_BATCH path)
@@ -48,36 +48,6 @@ async def add_requests_async(self, requests, force_batch=False):
         await to_await
     else:
         await self._send_input(EngineCoreRequestType.ADD_BATCH, requests)
-    self._ensure_output_queue_task()
-
-
-# ---------------------------------------------------------------------------
-# AsyncMPClient.beam_step_update_async  (new method — BEAM_STEP_UPDATE path)
-# ---------------------------------------------------------------------------
-
-
-async def beam_step_update_async(self, step_update: BeamStepUpdate) -> None:
-    """Send BEAM_STEP_UPDATE to EngineCore.
-
-    Replaces the per-step ADD_BATCH + BEAM_FORK pair with a single message.
-    Routes to the engine that is running this session (determined by
-    data_parallel_rank stored on the update, same convention as BEAM_FORK).
-    """
-    step_update.client_index = self.client_index
-    if hasattr(self, "current_wave"):
-        step_update.current_wave = self.current_wave
-
-    engine = None
-    if (hasattr(self, "get_core_engine_for_request")
-            and step_update.data_parallel_rank is not None):
-        engine = self.core_engines[step_update.data_parallel_rank]
-
-    to_await = self._send_input(EngineCoreRequestType.BEAM_STEP_UPDATE, step_update, engine)
-    # Notify coordinator when engines are idle (mirrors add_request_async).
-    if hasattr(self, "first_req_send_socket") and not self.engines_running:
-        req_msg = msgspec.msgpack.encode(("FIRST_REQ", engine))
-        await self.first_req_send_socket.send(req_msg)
-    await to_await
     self._ensure_output_queue_task()
 
 

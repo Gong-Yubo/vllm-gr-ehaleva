@@ -166,7 +166,7 @@ def process_input_sockets(
     ready_event,
 ):
     """Replacement for EngineCoreProc.process_input_sockets with
-    ADD_BATCH and BEAM_FORK decoders."""
+    ADD_BATCH and MEGA_REQUEST_STEP_UPDATE decoders."""
     from contextlib import ExitStack
 
     import zmq

@@ -14,7 +14,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
 
 # ---------------------------------------------------------------------------
-# BeamForkRequest — lightweight beam fork (ADD_BATCH + BEAM_FORK path)
+# BeamForkRequest — lightweight beam fork (ADD_BATCH + MEGA_REQUEST_STEP_UPDATE path)
 # ---------------------------------------------------------------------------
 
 
@@ -34,30 +34,6 @@ class BeamForkRequest(
     child_ids: list[str]
     token_ids: list[int]
     abort_ids: list[str]
-    sampling_params: SamplingParams
-    eos_token_id: int | None = None
-    client_index: int = 0
-    current_wave: int = 0
-    priority: int = 0
-    data_parallel_rank: int | None = None
-    lora_request: LoRARequest | None = None
-    cache_salt: str | None = None
-    trace_headers: Mapping[str, str] | None = None
-
-
-class BeamStepUpdate(
-    msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,
-):  # type: ignore[call-arg]
-    """Single-message step update for a Frontend-Driven Persistent Session."""
-
-    session_id: str
-    survivor_ids: list[str]
-    survivor_tokens: list[int]
-    pruned_ids: list[str]
-    prefix_len: int
     sampling_params: SamplingParams
     eos_token_id: int | None = None
     client_index: int = 0

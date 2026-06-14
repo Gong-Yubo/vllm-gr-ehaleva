@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Monkey-patches for EngineCore / EngineCoreProc to support
-ADD_BATCH and BEAM_FORK."""
+ADD_BATCH and MEGA_REQUEST_STEP_UPDATE."""
 
 from __future__ import annotations
 from functools import wraps
@@ -117,7 +117,7 @@ def apply_engine_core_child_patches():
 
     # Add new enum members: ADD_BATCH, MEGA_REQUEST_STEP_UPDATE
     _add_enum_member("ADD_BATCH", b"\x05")
-    _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x08")
+    _add_enum_member("MEGA_REQUEST_STEP_UPDATE", b"\x06")
 
     # Wrap EngineCore.__init__ to add beam state
     EngineCore.__init__ = make_patched_engine_core_init(EngineCore.__init__)
