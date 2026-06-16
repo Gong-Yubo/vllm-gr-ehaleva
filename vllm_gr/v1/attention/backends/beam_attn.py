@@ -88,6 +88,8 @@ def paged_kv_to_contig_suffix_kernel(
         tl.load(SLOT_MAPPING_PTR + shared_gap_len + (pid_beam * (suffix_len - shared_gap_len)) + (pid_tok - shared_gap_len))
     )
     
+    # tl.static_print("Debg: Slot Index:", slot_idx, " pid_beam:", pid_beam, "pid_tok:", pid_tok)
+
     d_offsets = tl.arange(0, head_dim)
     k_ptrs = K_CACHE_PTR + slot_idx//16 * stride_kb + (slot_idx%16) * stride_kt + pid_h * stride_kh + d_offsets * stride_kd
     v_ptrs = V_CACHE_PTR + slot_idx//16 * stride_vb + (slot_idx%16) * stride_vt + pid_h * stride_vh + d_offsets * stride_vd
@@ -168,6 +170,8 @@ class BeamAttentionMetadata:
     mega_suffix_max_q_len: int = 0
     mega_suffix_max_seq_len: int = 0
     mega_suffix_total_tokens: int = 0
+    mega_suffix_shared_gap: int = 0
+    mega_suffix_bw: int = 0
 
     mega_suffix_out_offset: torch.Tensor | None = None
 
@@ -314,7 +318,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         mega_suffix_seq_lens_list = []
         mega_suffix_out_offset = []
         mega_prefix_block_tables = []
-        
+        mega_suffix_bw_list = []
+        mega_suffix_shared_gap_list = []
         offset = 0
         max_prefix_len = max(mega_prefix_lens) if mega_prefix_lens else 0
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
@@ -326,10 +331,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             q_start = q_starts[req_idx]
             q_end = q_starts[req_idx+1]
             q_len = q_end - q_start
-            
             if w == 0 or steps == 0:
                 continue
             
+            mega_suffix_bw_list.append(w)
             q_curr = q_start
             bt = common_attn_metadata.block_table_tensor[req_idx]
             
@@ -344,10 +349,10 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 b_uncached = 0
                 b_cache_len = 0
                 b_suffix_len = 0
-                
                 if prefix_len >= cache_len:
                     # Scenario A: Prefix Incomplete
                     remaining_prefix = prefix_len - cache_len
+                    mega_suffix_shared_gap_list.append(remaining_prefix)
                     if b == 0:
                         b_uncached = min(chunk_budget, remaining_prefix + steps)
                     else:
@@ -389,7 +394,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         return (
             mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
             mega_suffix_q_lens, mega_suffix_seq_lens_list,
-            mega_suffix_out_offset, mega_prefix_block_tables
+            mega_suffix_out_offset, mega_prefix_block_tables, mega_suffix_bw_list, mega_suffix_shared_gap_list
         )
 
     def _create_std_tensors(self, std_indices, std_q_lens, std_req_idxs, common_attn_metadata, device):
@@ -476,7 +481,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         (mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
          mega_suffix_q_lens, mega_suffix_seq_lens_list,
-         mega_suffix_out_offset, mega_prefix_block_tables) = self._build_mega_mappings(
+         mega_suffix_out_offset, mega_prefix_block_tables, 
+         mega_suffix_bw_list, mega_suffix_shared_gap_list) = self._build_mega_mappings(
             mega_req_idxs, mega_prefix_lens, mega_beam_widths,
             mega_decode_steps, mega_cache_lens, q_starts, common_attn_metadata
         )
@@ -526,6 +532,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_max_seq_len=mega_suffix_max_seq_len,
             mega_suffix_total_tokens=mega_suffix_total_tokens,
             mega_suffix_out_offset=mega_suffix_out_offset_tensor,
+            mega_suffix_shared_gap=mega_suffix_shared_gap_list[0] if mega_suffix_shared_gap_list else 0,
+            mega_suffix_bw = mega_suffix_bw_list[0] if mega_suffix_bw_list else 0,
             max_num_splits=max_num_splits,
         )
 
@@ -660,14 +668,16 @@ class BeamAttentionImpl(AttentionImpl):
             print("attn_metadata.mega_suffix_out_offset", attn_metadata.mega_suffix_out_offset)
             print("total_suffix_tokens", total_suffix_tokens)
             print("attn_metadata.mega_suffix_max_seq_len", attn_metadata.mega_suffix_max_seq_len)
+            print("attn_metadata.mega_suffix_bw", attn_metadata.mega_suffix_bw)
+            print("attn_metadata.mega_suffix_shared_gap", attn_metadata.mega_suffix_shared_gap)
 
             contig_k, contig_v = extract_suffix_kv(
             key_cache, value_cache, 
             attn_metadata.slot_mapping, # Global flat tensor
             attn_metadata.mega_suffix_seq_lens,
             attn_metadata.mega_suffix_out_offset,
-            shared_gap_len=15,
-            num_beams=16, # todo
+            shared_gap_len=attn_metadata.mega_suffix_shared_gap,
+            num_beams=attn_metadata.mega_suffix_bw,
             max_suffix_len=attn_metadata.mega_suffix_max_seq_len
             )
             
