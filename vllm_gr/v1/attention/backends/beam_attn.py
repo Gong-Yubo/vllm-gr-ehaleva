@@ -89,8 +89,8 @@ def paged_kv_to_contig_suffix_kernel(
     )
     
     d_offsets = tl.arange(0, head_dim)
-    k_ptrs = K_CACHE_PTR + slot_idx * stride_kb + pid_h * stride_kh + d_offsets * stride_kd + pid_tok * stride_kt
-    v_ptrs = V_CACHE_PTR + slot_idx * stride_vb + pid_h * stride_vh + d_offsets * stride_vd + pid_tok * stride_vt
+    k_ptrs = K_CACHE_PTR + slot_idx//16 * stride_kb + (slot_idx%16) * stride_kt + pid_h * stride_kh + d_offsets * stride_kd
+    v_ptrs = V_CACHE_PTR + slot_idx//16 * stride_vb + (slot_idx%16) * stride_vt + pid_h * stride_vh + d_offsets * stride_vd
 
     k = tl.load(k_ptrs)
     v = tl.load(v_ptrs)
@@ -659,6 +659,7 @@ class BeamAttentionImpl(AttentionImpl):
             print("attn_metadata.mega_suffix_seq_lens", attn_metadata.mega_suffix_seq_lens)
             print("attn_metadata.mega_suffix_out_offset", attn_metadata.mega_suffix_out_offset)
             print("total_suffix_tokens", total_suffix_tokens)
+            print("attn_metadata.mega_suffix_max_seq_len", attn_metadata.mega_suffix_max_seq_len)
 
             contig_k, contig_v = extract_suffix_kv(
             key_cache, value_cache, 
@@ -667,7 +668,7 @@ class BeamAttentionImpl(AttentionImpl):
             attn_metadata.mega_suffix_out_offset,
             shared_gap_len=15,
             num_beams=16, # todo
-            max_suffix_len=attn_metadata.mega_suffix_max_q_len
+            max_suffix_len=attn_metadata.mega_suffix_max_seq_len
             )
             
             if total_suffix_tokens > 0:
