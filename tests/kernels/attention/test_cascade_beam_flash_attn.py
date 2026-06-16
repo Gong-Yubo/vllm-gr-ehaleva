@@ -60,6 +60,7 @@ CASES = [
     # Scenario: Partial block-alignment anomaly.
     # Tests memory boundary safety when sequence lengths are prime/unaligned numbers.
     (4, 32, 7),
+
 ]
 
 
@@ -185,7 +186,7 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
         w = inputs.beam_width
         q_len = inputs.q_seq_len * inputs.beam_width
         
-        cache_len = prefix_len
+        cache_len = prefix_len // inputs.block_size * inputs.block_size
         
         # chunk_budget enforces the maximum number of new query tokens allowed in this iteration.
         chunk_budget = q_len
@@ -212,15 +213,16 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
                     b_cache_len = cache_len
                     b_suffix_start = cache_len
                     b_suffix_len = b_uncached
+                    leader_suffix_len = b_suffix_len
                 else:
                     # Follower Beams (1 to W-1) cannot compute shared prefix tokens.
                     # They must wait until the prefix is fully resolved. They are only allowed 
                     # to compute their unique suffixes if the prefix finishes within this chunk.
-                    if remaining_prefix <= q_len:
-                        b_uncached = min(chunk_budget, steps)
-                        b_cache_len = prefix_len
-                        b_suffix_start = prefix_len + b * steps
-                        b_suffix_len = b_uncached
+                    # if remaining_prefix <= q_len:
+                    b_uncached = min(chunk_budget, steps)
+                    b_cache_len = cache_len
+                    b_suffix_start = prefix_len + b * steps
+                    b_suffix_len = leader_suffix_len
             else:
                 # Scenario B: Prefix Complete
                 past_suffix_b = max(0, min(steps, delta - b * steps))
@@ -319,13 +321,14 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
         "req_ids": [f"req_{i}" for i in range(inputs.num_reqs)]
     }
     
+    print(f"inputs.shared_tokens_len {inputs.shared_tokens_len}, cache={inputs.shared_tokens_len // inputs.block_size * inputs.block_size}")
     for i in range(inputs.num_reqs):
         mega_info["mega_data"][f"req_{i}"] = {
             "is_mega_decode": True,
             "prefix_len": inputs.shared_tokens_len,
             "mega_beam_width": inputs.beam_width,
             "mega_decode_steps": inputs.suffix_kv_len,
-            "cache_len": inputs.shared_tokens_len,
+            "cache_len": inputs.shared_tokens_len // inputs.block_size * inputs.block_size,
         }
         
     token = MEGA_DATA_VAR.set(mega_info)

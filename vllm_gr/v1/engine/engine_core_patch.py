@@ -348,8 +348,8 @@ def _process_mega_decode_request(
     delta = max(0, cache_len - prefix_len)
     curr_offset = token_offset
     valid_rows_for_req = 0
-    full_valid_rows_for_req = 0
-
+    logits_row_cnt = 0
+    # print(f"prefix_len={prefix_len}, cache_len={cache_len}, decode_steps={decode_steps}")
     for b in range(beam_width):
         if chunk_budget <= 0:
             break
@@ -366,13 +366,14 @@ def _process_mega_decode_request(
 
             if past_suffix_b + b_uncached >= decode_steps:
                 new_logits_indices.append(curr_offset + b_uncached - 1)
-                full_valid_rows_for_req += 1
+                logits_row_cnt += 1
                 
+            # print(f"\tb={b}, b_uncached={b_uncached}, past_suffix_b={past_suffix_b}, st={st}, curr_offset={curr_offset} logit {curr_offset + b_uncached - 1}")
             valid_rows_for_req += 1
             curr_offset += b_uncached
             chunk_budget -= b_uncached
 
-    return valid_rows_for_req, full_valid_rows_for_req, curr_offset
+    return valid_rows_for_req, logits_row_cnt, curr_offset
 
 
 # ============================================================================
@@ -416,7 +417,6 @@ def _remux_logprobs_tensors(
         # Retain leader token track identity
         new_st_ids.append(st_ids[gpu_row_cursor : gpu_row_cursor + 1, :])
 
-        # RESTORED ACCURACY FIX: Slice the full width of W_logits rows from the GPU logs
         req_lps = orig_lps[gpu_row_cursor : gpu_row_cursor + W_logits, :target_K].reshape(1, W_logits * target_K)
         if W_logits * target_K < max_chained_dim:
             req_lps = torch.nn.functional.pad(req_lps, (0, max_chained_dim - (W_logits * target_K)), value=float('-inf'))
@@ -592,12 +592,13 @@ def apply_worker_patches():
                 row_to_batch_idx.extend([batch_idx] * W)
                 logits_to_batch_idx.extend([batch_idx] * W_logits)
                 
-                # RESTORED ACCURACY FIX: Store the true integer count of W_logits rows produced
                 request_row_configs.append((req_id, input_row_idx, W_logits))
                 input_row_idx += W
+                if(W_logits != mdata['mega_beam_width']):print("Capture W_logits ", W_logits)
             else:
                 num_computed_tokens = self.input_batch.num_computed_tokens_cpu[batch_idx]
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[batch_idx]
+
 
                 is_last_chunk_prefill = bool(num_computed_tokens < num_prompt_tokens and num_computed_tokens + seq_len >= num_prompt_tokens)
                 W_logits_count = 0
@@ -606,7 +607,8 @@ def apply_worker_patches():
                     new_logits_indices.append(token_offset + seq_len - 1)
                     W_logits_count = 1
                     logits_to_batch_idx.extend([batch_idx] * W)
-                
+                else:
+                    print("Chunk Prefill")
                 row_to_req_id.extend([req_id] * W)
                 row_to_batch_idx.extend([batch_idx] * W)
                 
@@ -616,17 +618,25 @@ def apply_worker_patches():
             token_offset += seq_len
         
         self.input_batch = InputBatchProxy(self.input_batch, row_to_req_id, row_to_batch_idx, logits_to_batch_idx)
-        self.input_batch._gr_request_row_configs = request_row_configs
+        scheduler_output._gr_request_row_configs = request_row_configs
         
         return torch.tensor(new_logits_indices, dtype=torch.int32, device=self.device), spec_decode_metadata
   
     @wraps(_original_bookkeeping_sync)
     def patched_bookkeeping_sync(self, scheduler_output, *args, **kwargs):
         mega_data = getattr(scheduler_output, "mega_data", {})
-        if not mega_data or not hasattr(self.input_batch, "_gr_request_row_configs"):
-            return _original_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
+        if not mega_data or not hasattr(scheduler_output, "_gr_request_row_configs"):
+            res = _original_bookkeeping_sync(self, scheduler_output, *args, **kwargs)
+            sampler_output = kwargs.get("sampler_output") or (args[0] if args else None)
+            if sampler_output is not None:
+                st_ids = sampler_output.sampled_token_ids
+                lp_tensors = sampler_output.logprobs_tensors
+                print("st_ids: ", st_ids)
+                print("lp_tensors: ", lp_tensors)
+            return res
+        
 
-        request_row_configs = self.input_batch._gr_request_row_configs
+        request_row_configs = scheduler_output._gr_request_row_configs
         orig_input_batch = object.__getattribute__(self.input_batch, "_obj")
         
         try:
@@ -645,25 +655,17 @@ def apply_worker_patches():
         if sampler_output is not None:
             st_ids = sampler_output.sampled_token_ids
             lp_tensors = sampler_output.logprobs_tensors
-            
+            print("st_ids: ", st_ids)
+            print("lp_tensors: ", lp_tensors)
             if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
                 orig_lps = lp_tensors.logprobs
                 orig_lp_ids = lp_tensors.logprob_token_ids
-                orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)
-                
-                first_req_id = request_row_configs[0][0]
-                target_K = self.requests[first_req_id].sampling_params.logprobs  
-                
-                if orig_lps.shape[1] == target_K + 1:
-                    orig_lps = orig_lps[:, 1:]
-                    if orig_lp_ids is not None: orig_lp_ids = orig_lp_ids[:, 1:]
-                    if orig_ranks is not None: orig_ranks = orig_ranks[:, 1:] if orig_ranks.ndim > 1 else orig_ranks
-
-                # RESTORED ACCURACY FIX: Correct max_chained_dim calculation mapping across the true configuration widths
-                max_chained_dim = max(W * target_K for _, _, W in request_row_configs)
+                orig_ranks = getattr(lp_tensors, "selected_token_ranks", None)                
+                actual_K = orig_lps.shape[1]
+                max_chained_dim = max(W * actual_K for _, _, W in request_row_configs)
 
                 final_st_ids, final_lps, final_lp_ids, final_ranks = _remux_logprobs_tensors(
-                    request_row_configs, max_chained_dim, target_K, orig_lps, orig_lp_ids, orig_ranks, st_ids
+                    request_row_configs, max_chained_dim, actual_K, orig_lps, orig_lp_ids, orig_ranks, st_ids
                 )
                 
                 # Safely resizes the original tensor wrapper and copies the elements in place

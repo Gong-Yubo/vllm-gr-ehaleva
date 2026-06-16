@@ -85,7 +85,7 @@ class MockRequestOutput:
 
 
 def run_api_inference(
-    prompts: List[str], model: str, api_url: str, api_key: str, gen_config: Dict[str, Any]
+    prompts: List[str], model: str, api_url: str, api_key: str, gen_config: Dict[str, Any], max_concurrency: int = 1
 ) -> List[MockRequestOutput]:
     headers = {
         "Content-Type": "application/json",
@@ -136,8 +136,8 @@ def run_api_inference(
             return MockRequestOutput(prompt, [MockCompletionOutput("")])
 
     # Run in parallel
-    logger.info(f"Sending {len(prompts)} requests to {api_url}...")
-    with ThreadPoolExecutor(max_workers=min(len(prompts), 16)) as executor:
+    logger.info(f"Sending {len(prompts)} requests to {api_url} with max_concurrency={max_concurrency}...")
+    with ThreadPoolExecutor(max_workers=min(len(prompts), max_concurrency)) as executor:
         results = list(executor.map(_send_request, prompts))
 
     return results
@@ -179,6 +179,9 @@ def main():
         help="Directory to save debug evaluation files.",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug mode for evaluators.")
+    parser.add_argument(
+        "--max-concurrency", type=int, default=1, help="Maximum concurrency for API requests."
+    )
 
     args = parser.parse_args()
 
@@ -258,7 +261,7 @@ def main():
     gen_start = time.perf_counter()
     if args.endpoint:
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
-        outputs = run_api_inference(prompts, args.model, api_url, args.api_key, gen_config)
+        outputs = run_api_inference(prompts, args.model, api_url, args.api_key, gen_config, max_concurrency=args.max_concurrency)
     else:
         params = BeamSearchParams(
             beam_width=gen_config["num_beams"],

@@ -188,6 +188,28 @@ async def _mega_request_cleanup(engine_client, session_id, final_ids, rank):
     except Exception as e:
         logger.error("Failed to clear mega_request cache for session %s: %s", session_id, e)
 
+def _extract_and_dedup_segment(
+    raw_token_ids, raw_logprobs, raw_ranks, raw_decoded, start_offset: int, end_offset: int, logprobs_num: int
+):
+    # Extract the precise segment dedicated to this beam's top alternative choices
+    token_ids_pos = raw_token_ids[start_offset:end_offset]
+    logprobs_pos = raw_logprobs[start_offset:end_offset]
+    ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
+    decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
+    
+    # Dedup the sampled token (index 0) if it appears in the top-K
+    if len(token_ids_pos) > logprobs_num:
+        if any(token_ids_pos[0] == token_ids_pos[j] for j in range(1, logprobs_num + 1)):
+            s = slice(1, logprobs_num + 1)
+        else:
+            s = slice(logprobs_num)
+        token_ids_pos = token_ids_pos[s]
+        logprobs_pos = logprobs_pos[s]
+        ranks_pos = ranks_pos[s] if ranks_pos is not None else None
+        decoded_pos = decoded_pos[s] if decoded_pos is not None else None
+        
+    return token_ids_pos, logprobs_pos, ranks_pos, decoded_pos
+
 async def beam_search(
     self,
     prompt: PromptType,
@@ -214,25 +236,45 @@ async def beam_search(
     ):
         data_parallel_size = self.engine_client.vllm_config.parallel_config.data_parallel_size
         if data_parallel_size is not None and data_parallel_size > 1:
+            # In DP mode, we assign ranks to beam search requests in a round-robin manner.
             rank = await _next_data_parallel_rank(data_parallel_size)
+            logger.debug(
+                f"rank for beam search: {rank} out of data_parallel_size: {data_parallel_size}"
+            )
 
     include_stop_str_in_output = params.include_stop_str_in_output
     if beam_width == 0:
-        raise VLLMValidationError("Beam width must be greater than 0", parameter="beam_width", value=0)
-        
+        raise VLLMValidationError(
+            "Beam width must be greater than 0", parameter="beam_width", value=0
+        )
     input_processor = self.input_processor
     tokenizer = input_processor.tokenizer
     if tokenizer is None:
-        raise VLLMValidationError("You cannot use beam search when `skip_tokenizer_init=True`", parameter="skip_tokenizer_init", value=True)
+        raise VLLMValidationError(
+            "You cannot use beam search when `skip_tokenizer_init=True`",
+            parameter="skip_tokenizer_init",
+            value=True,
+        )
 
     eos_token_id: int = tokenizer.eos_token_id
     sid_begin_token_id: int | None = None
     if begin_token is not None:
         sid_begin_token_id = tokenizer.convert_tokens_to_ids(begin_token)
-        
+        if sid_begin_token_id is None or sid_begin_token_id == -1:
+            raise VLLMValidationError(
+                "begin_token must be a valid token in the tokenizer vocabulary",
+                parameter="begin_token",
+                value=begin_token,
+            )
     sid_end_token_id: int | None = None
     if end_token is not None:
         sid_end_token_id = tokenizer.convert_tokens_to_ids(end_token)
+        if sid_end_token_id is None or sid_end_token_id == -1:
+            raise VLLMValidationError(
+                "end_token must be a valid token in the tokenizer vocabulary",
+                parameter="end_token",
+                value=end_token,
+            )
 
     if is_explicit_encoder_decoder_prompt(prompt):
         raise NotImplementedError
@@ -253,6 +295,12 @@ async def beam_search(
         flat_logprobs=True,
     )
     initial_tokens = list(prompt_token_ids)
+    # NOTE: FlatLogprobs intentionally passed where BeamSearchSequence
+    # expects list[dict[int, Logprob]].  Intermediate logprobs are never
+    # read as dicts; the final beam.logprobs is replaced during
+    # reconstruction at the end.
+    # This reference is shared read-only across all beams — do not mutate
+    # after the initial append below.
     initial_logprobs = FlatLogprobs()
     if sid_begin_token_id is not None:
         initial_tokens.append(sid_begin_token_id)
@@ -268,6 +316,12 @@ async def beam_search(
             lora_request=lora_request,
         )
     ]
+    # Deferred logprobs: instead of copying 6 FlatLogprobs lists per beam
+    # per step (O(beams * steps^2)), store parent pointers and reconstruct
+    # only for the final best beams at the end.
+    # These dynamic attrs live on BeamSearchSequence (a plain @dataclass
+    # without __slots__).  If upstream adds __slots__, these will break —
+    # upstream the fields if that happens.
     all_beams[0]._lp_parent = None
     all_beams[0]._lp_step_data = None
     completed = []
@@ -276,7 +330,14 @@ async def beam_search(
     pre_calc = 0 if sid_begin_token_id is None else 1
     if sid_end_token_id is not None:
         pre_calc += 1
+    if max_tokens - pre_calc < 0:
+        raise VLLMValidationError(
+            f"max tokens should be not lower than {pre_calc} to accomedate reserved begin/end tokens.",
+            parameter="max_tokens",
+            value=max_tokens,
+        )
 
+    # Check once if the engine supports batch submission / beam fork.
     use_batch = hasattr(self.engine_client, "prepare_request")
     use_mega_request = hasattr(self.engine_client, "mega_request_step_update")
 
@@ -305,8 +366,10 @@ async def beam_search(
             num_generation_tokens += len(all_beams)
         request_id_batch = f"{request_id}-{random_uuid()}"
 
+        # Launch catalog filtering in parallel with the engine step.
         catalog_task = None
         if self.models.catalog is not None:
+
             def get_valid_tokens_set(beam) -> set[int]:
                 generated_tokens = beam.tokens[len(prompt_token_ids) :]
                 return self.models.catalog.valid(generated_tokens)
@@ -359,10 +422,14 @@ async def beam_search(
             valid_tokens_sets = await catalog_task
         if token > 0:
             generation_time += time.perf_counter() - gen_start
-            
         new_beams = []
+        # Store all new tokens generated by beam
         all_beams_token_id = []
+        # Store the cumulative probability of all tokens
+        # generated by beam search
         all_beams_logprob = []
+        # Per-beam flat data cache: (token_ids, logprobs, ranks, decoded_tokens)
+        # Used to build logprobs_entry dicts without calling FlatLogprobs.__getitem__
         beam_flat_cache: list[tuple | None] = []
 
         # -------------------------------------------------------------------------
@@ -383,6 +450,11 @@ async def beam_search(
                 raw_logprobs = flat.logprobs
                 raw_ranks = getattr(flat, 'ranks', None)
                 raw_decoded = getattr(flat, 'decoded_tokens', None)
+                total_logprobs = len(raw_token_ids)
+                if (total_logprobs != (len(fork_info) * len(fork_info) + len(fork_info))):
+                    print("ASSERT FORK ILLEGAL INPUT MISMATCH ", total_logprobs)
+
+                stride_k = total_logprobs // len(fork_info)
 
                 # Each logical beam block (W=16) should extract its top choices natively
                 for b_idx in range(len(fork_info)):
@@ -390,15 +462,13 @@ async def beam_search(
                     
                     # Compute the true exact allocation footprint boundaries 
                     # from the flat remuxed vector block for this specific beam
-                    start_offset = b_idx * logprobs_num
-                    end_offset = start_offset + logprobs_num
+                    start_offset = b_idx * stride_k
+                    end_offset = start_offset + stride_k
                     
-                    # Extract the precise segment dedicated to this beam's top alternative choices
-                    token_ids_pos = raw_token_ids[start_offset:end_offset]
-                    logprobs_pos = raw_logprobs[start_offset:end_offset]
-                    ranks_pos = raw_ranks[start_offset:end_offset] if raw_ranks is not None else None
-                    decoded_pos = raw_decoded[start_offset:end_offset] if raw_decoded is not None else None
-                    
+                    token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = _extract_and_dedup_segment(
+                        raw_token_ids, raw_logprobs, raw_ranks, raw_decoded, start_offset, end_offset, logprobs_num
+                    )
+
                     if valid_tokens_sets is not None:
                         valid_tokens_set = valid_tokens_sets[b_idx]
                         logprobs_pos = [lp if tid in valid_tokens_set else -float("inf") for tid, lp in zip(token_ids_pos, logprobs_pos)]
@@ -419,27 +489,34 @@ async def beam_search(
 
                 if result.outputs[0].logprobs is not None:
                     flat = result.outputs[0].logprobs
+
                     token_ids_pos, logprobs_pos, ranks_pos, decoded_pos = extract_and_dedup_flat_logprobs(flat, logprobs_num)
                     if valid_tokens_sets is not None:
                         valid_tokens_set = valid_tokens_sets[i]
                         logprobs_pos = [lp if tid in valid_tokens_set else -float("inf") for tid, lp in zip(token_ids_pos, logprobs_pos)]
+                    if (logprobs_num != len(token_ids_pos)):
+                        print("ASSERT ILLEGAL INPUT MISMATCH ", len(token_ids_pos))
                     beam_flat_cache.append((token_ids_pos, logprobs_pos, ranks_pos, decoded_pos))
                     all_beams_token_id.extend(token_ids_pos)
                     all_beams_logprob.extend(current_beam.cum_logprob + lp for lp in logprobs_pos)
                 else:
                     beam_flat_cache.append(None)
 
+        # Handle the token for the end of sentence (EOS)
         all_beams_token_id = np.array(all_beams_token_id)
         all_beams_logprob = np.array(all_beams_logprob)
 
         if not ignore_eos:
+            # Get the index position of eos token in all generated results
             eos_idx = np.where(all_beams_token_id == eos_token_id)[0]
             for idx in eos_idx:
                 current_beam = all_beams[idx // logprobs_num]
                 cached = beam_flat_cache[idx // logprobs_num]
                 assert cached is not None
                 eos_beam = BeamSearchSequence(
-                    tokens=current_beam.tokens + [eos_token_id] if include_stop_str_in_output else current_beam.tokens,
+                    tokens=current_beam.tokens + [eos_token_id]
+                    if include_stop_str_in_output
+                    else current_beam.tokens,
                     logprobs=initial_logprobs,
                     cum_logprob=float(all_beams_logprob[idx]),
                     finish_reason="stop",
@@ -448,8 +525,12 @@ async def beam_search(
                 eos_beam._lp_parent = current_beam
                 eos_beam._lp_step_data = cached
                 completed.append(eos_beam)
+            # After processing, set the log probability of the eos condition
+            # to negative infinity.
             all_beams_logprob[eos_idx] = -np.inf
 
+        # Processing non-EOS tokens
+        # Get indices of the top beam_width probabilities
         if all_beams_logprob.size > beam_width:
             topn_idx = np.argpartition(np.negative(all_beams_logprob), beam_width)[:beam_width]
         else:
@@ -472,6 +553,7 @@ async def beam_search(
             new_beam._lp_step_data = cached
             new_beams.append(new_beam)
 
+        # Build fork_info for next iteration's BEAM_FORK.
         if use_mega_request:
             fork_info = [(idx // logprobs_num, int(all_beams_token_id[idx])) for idx in topn_idx]
 
@@ -487,6 +569,9 @@ async def beam_search(
     sorted_completed = sorted(completed, key=lambda x: x.cum_logprob, reverse=True)
     best_beams = sorted_completed[:beam_width]
 
+    # Reconstruct full logprobs only for the final best beams by walking
+    # the parent-pointer tree.  This replaces the O(beams * steps^2)
+    # per-step copying with a single O(beams * steps) pass at the end.
     for beam in best_beams:
         reconstruct_beam_logprobs(beam, initial_logprobs, sid_end_token_id)
 
@@ -496,7 +581,11 @@ async def beam_search(
 
     beam_search_decode_time = time.perf_counter() - beam_search_start
     beam_search_overhead = beam_search_decode_time - generation_time
-    metrics = RequestStateStats(beam_search_overhead=beam_search_overhead, beam_search_decode_time=beam_search_decode_time, num_generation_tokens=num_generation_tokens)
+    metrics = RequestStateStats(
+        beam_search_overhead=beam_search_overhead,
+        beam_search_decode_time=beam_search_decode_time,
+        num_generation_tokens=num_generation_tokens,
+        )
 
     yield RequestOutput(
         request_id=request_id,
