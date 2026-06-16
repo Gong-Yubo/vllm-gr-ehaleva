@@ -66,6 +66,8 @@ def paged_kv_to_contig_suffix_kernel(
     stride_vb, stride_vt, stride_vh, stride_vd,
     stride_ok_tok, stride_ok_h, stride_ok_d,
     stride_ov_tok, stride_ov_h, stride_ov_d,  # Ensure this is here
+    DEBUG_BUF_PTR,
+    DEBUG_OUT_OFFSET_BUF_PTR,
     num_beams: tl.constexpr, max_suffix_len: tl.constexpr,
     n_kv_heads: tl.constexpr, head_dim: tl.constexpr,shared_gap_len: tl.constexpr
 ):
@@ -88,7 +90,12 @@ def paged_kv_to_contig_suffix_kernel(
         tl.load(SLOT_MAPPING_PTR + shared_gap_len + (pid_beam * (suffix_len - shared_gap_len)) + (pid_tok - shared_gap_len))
     )
     
-    # tl.static_print("Debg: Slot Index:", slot_idx, " pid_beam:", pid_beam, "pid_tok:", pid_tok)
+    out_offset = tl.load(OUT_OFFSETS_PTR + pid_beam)
+
+    if pid_h == 0:
+        debug_offset = pid_beam * max_suffix_len + pid_tok
+        tl.store(DEBUG_BUF_PTR + debug_offset, slot_idx)
+        tl.store(DEBUG_OUT_OFFSET_BUF_PTR + debug_offset, out_offset + pid_tok)
 
     d_offsets = tl.arange(0, head_dim)
     k_ptrs = K_CACHE_PTR + slot_idx//16 * stride_kb + (slot_idx%16) * stride_kt + pid_h * stride_kh + d_offsets * stride_kd
@@ -97,7 +104,6 @@ def paged_kv_to_contig_suffix_kernel(
     k = tl.load(k_ptrs)
     v = tl.load(v_ptrs)
 
-    out_offset = tl.load(OUT_OFFSETS_PTR + pid_beam)
     ok_ptrs = OUT_K_PTR + (out_offset + pid_tok) * stride_ok_tok + pid_h * stride_ok_h + d_offsets * stride_ok_d
     ov_ptrs = OUT_V_PTR + (out_offset + pid_tok) * stride_ov_tok + pid_h * stride_ov_h + d_offsets * stride_ov_d
     
@@ -118,6 +124,9 @@ def extract_suffix_kv(
     out_k = torch.empty((total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype)
     out_v = torch.empty((total_tokens, nheads, head_dim), device=v_cache.device, dtype=v_cache.dtype)
     
+    debug_buf = torch.full((num_beams, max_suffix_len), -1, device=k_cache.device, dtype=torch.int64)
+    debug_out_offset_buf = torch.full((num_beams, max_suffix_len), -1, device=k_cache.device, dtype=torch.int64)
+
     grid = (num_beams, max_suffix_len, nheads)
     
     paged_kv_to_contig_suffix_kernel[grid](
@@ -126,11 +135,17 @@ def extract_suffix_kv(
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
         out_k.stride(0), out_k.stride(1), out_k.stride(2),
         out_v.stride(0), out_v.stride(1), out_v.stride(2), # <--- THIS IS stride_ov_d
+        debug_buf,
+        debug_out_offset_buf,
         num_beams=num_beams,
         max_suffix_len=max_suffix_len,
         n_kv_heads=nheads,
         head_dim=head_dim, shared_gap_len=shared_gap_len
     )
+    # print("Debug: slot_idx per beam (row) and token (col):")
+    # print(debug_buf)
+    # print("Debug: out_offset + pid_tok per beam (row) and token (col):")
+    # print(debug_out_offset_buf)
     return out_k, out_v
 
 # ---------------------------------------------------------------------------
@@ -503,7 +518,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         )
 
         torch.cuda.nvtx.range_pop()
-        return BeamAttentionMetadata(
+        meta = BeamAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             max_query_len=common_attn_metadata.max_query_len,
             query_start_loc=common_attn_metadata.query_start_loc,
@@ -536,6 +551,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_bw = mega_suffix_bw_list[0] if mega_suffix_bw_list else 0,
             max_num_splits=max_num_splits,
         )
+        print(meta)
+        return meta
 
     def update_block_table(
         self,
@@ -658,18 +675,6 @@ class BeamAttentionImpl(AttentionImpl):
             
             total_suffix_tokens = attn_metadata.mega_suffix_total_tokens
             block_size = key_cache.shape[1]
-
-            print("attn_metadata.mega_prefix_cu_seqlens_q", attn_metadata.mega_prefix_cu_seqlens_q)
-            print("attn_metadata.mega_prefix_seq_lens", attn_metadata.mega_prefix_seq_lens)
-            print("attn_metadata.mega_suffix_cu_seqlens_q", attn_metadata.mega_suffix_cu_seqlens_q)
-            print("attn_metadata.mega_suffix_seq_lens", attn_metadata.mega_suffix_seq_lens)
-            print("attn_metadata.slot_mapping", attn_metadata.slot_mapping)
-            print("attn_metadata.mega_suffix_seq_lens", attn_metadata.mega_suffix_seq_lens)
-            print("attn_metadata.mega_suffix_out_offset", attn_metadata.mega_suffix_out_offset)
-            print("total_suffix_tokens", total_suffix_tokens)
-            print("attn_metadata.mega_suffix_max_seq_len", attn_metadata.mega_suffix_max_seq_len)
-            print("attn_metadata.mega_suffix_bw", attn_metadata.mega_suffix_bw)
-            print("attn_metadata.mega_suffix_shared_gap", attn_metadata.mega_suffix_shared_gap)
 
             contig_k, contig_v = extract_suffix_kv(
             key_cache, value_cache, 
