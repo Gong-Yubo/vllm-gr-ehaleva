@@ -85,6 +85,7 @@ class BeamAttnInputs:
     fa_version: int
     shared_tokens_len: int
     suffix_kv_len: int
+    slot_mapping: torch.Tensor
 
 
 def prepare_inputs(
@@ -145,6 +146,22 @@ def prepare_inputs(
             
     seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
 
+    # Calculate slot_mapping using the full block table slice approach
+    num_actual_tokens = num_seqs * q_seq_len
+    slot_mapping = torch.zeros(num_actual_tokens, dtype=torch.long, device=device)
+    
+    chunk_budget = beam_width * q_seq_len
+    cache_len = (shared_tokens_len // block_size) * block_size
+    remaining_prefix = shared_tokens_len - cache_len
+    total_uncached_req = remaining_prefix + beam_width * suffix_kv_len
+    write_len = min(total_uncached_req, chunk_budget)
+    
+    for i in range(num_reqs):
+        physical_slots = (block_tables[i].to(torch.long).unsqueeze(-1) * block_size + torch.arange(block_size, device=device)).view(-1)
+        req_slots = physical_slots[cache_len : cache_len + write_len]
+        q_start = i * chunk_budget
+        slot_mapping[q_start : q_start + write_len] = req_slots
+
     logits_soft_cap = soft_cap if soft_cap is not None else 0
     return BeamAttnInputs(
         query=query,
@@ -166,6 +183,7 @@ def prepare_inputs(
         fa_version=fa_version,
         shared_tokens_len=shared_tokens_len,
         suffix_kv_len=suffix_kv_len,
+        slot_mapping=slot_mapping,
     )
 
 
@@ -311,8 +329,9 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
             self.num_actual_tokens = inputs.num_seqs * inputs.q_seq_len
             self.max_query_len = inputs.q_seq_len * inputs.beam_width
             self.max_seq_len = inputs.max_seq_len
-            self.slot_mapping = torch.empty(0)
             self.causal = True
+
+                self.slot_mapping = inputs.slot_mapping
 
     common_attn_metadata = MockCommonAttentionMetadata(inputs)
     

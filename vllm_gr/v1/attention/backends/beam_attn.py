@@ -7,6 +7,7 @@ import copy
 from dataclasses import dataclass
 from itertools import compress
 from typing import ClassVar, Any
+import numpy as np
 
 import torch
 import triton
@@ -60,52 +61,32 @@ MEGA_DATA_VAR = contextvars.ContextVar("mega_data", default=None)
 
 @triton.jit
 def paged_kv_to_contig_suffix_kernel(
-    K_CACHE_PTR, V_CACHE_PTR, SLOT_MAPPING_PTR,
-    SUFFIX_LENS_PTR, OUT_K_PTR, OUT_V_PTR, OUT_OFFSETS_PTR,
+    K_CACHE_PTR, V_CACHE_PTR, # KV cache
+    SLOT_MAPPING_PTR, # len is input tokens
+    SLOT_MAPPING_OUT_PTR, # len is output token 
+    OUT_K_PTR, OUT_V_PTR, #Contig KV cache for suffix pass
     stride_kb, stride_kt, stride_kh, stride_kd,
     stride_vb, stride_vt, stride_vh, stride_vd,
     stride_ok_tok, stride_ok_h, stride_ok_d,
-    stride_ov_tok, stride_ov_h, stride_ov_d,  # Ensure this is here
-    DEBUG_BUF_PTR,
-    DEBUG_OUT_OFFSET_BUF_PTR,
-    num_beams: tl.constexpr, max_suffix_len: tl.constexpr,
-    n_kv_heads: tl.constexpr, head_dim: tl.constexpr,shared_gap_len: tl.constexpr
+    stride_ov_tok, stride_ov_h, stride_ov_d,
+    n_kv_heads: tl.constexpr, head_dim: tl.constexpr
 ):
-    pid_beam = tl.program_id(0)
-    pid_tok = tl.program_id(1)
-    pid_h = tl.program_id(2)
-
-    suffix_len = tl.load(SUFFIX_LENS_PTR + pid_beam)
-    if pid_tok >= suffix_len:
-        return
-
-    # LOGIC:
-    # 0 to shared_gap_len-1: Load from the start of slot_mapping (Shared)
-    # shared_gap_len to end: Load from beam-specific offsets
-    is_shared = pid_tok < shared_gap_len
+    pid_tok = tl.program_id(0)
+    pid_h = tl.program_id(1)
     
-    slot_idx = tl.where(
-        is_shared,
-        tl.load(SLOT_MAPPING_PTR + pid_tok),
-        tl.load(SLOT_MAPPING_PTR + shared_gap_len + (pid_beam * (suffix_len - shared_gap_len)) + (pid_tok - shared_gap_len))
-    )
-    
-    out_offset = tl.load(OUT_OFFSETS_PTR + pid_beam)
-
-    if pid_h == 0:
-        debug_offset = pid_beam * max_suffix_len + pid_tok
-        tl.store(DEBUG_BUF_PTR + debug_offset, slot_idx)
-        tl.store(DEBUG_OUT_OFFSET_BUF_PTR + debug_offset, out_offset + pid_tok)
+    src_idx = tl.load(SLOT_MAPPING_OUT_PTR + pid_tok)
+    slot_idx =  tl.load(SLOT_MAPPING_PTR + src_idx)
 
     d_offsets = tl.arange(0, head_dim)
-    k_ptrs = K_CACHE_PTR + slot_idx//16 * stride_kb + (slot_idx%16) * stride_kt + pid_h * stride_kh + d_offsets * stride_kd
-    v_ptrs = V_CACHE_PTR + slot_idx//16 * stride_vb + (slot_idx%16) * stride_vt + pid_h * stride_vh + d_offsets * stride_vd
+    k_ptrs = K_CACHE_PTR + slot_idx * stride_kt + pid_h * stride_kh + d_offsets * stride_kd
+    v_ptrs = V_CACHE_PTR + slot_idx * stride_vt + pid_h * stride_vh + d_offsets * stride_vd
+
 
     k = tl.load(k_ptrs)
     v = tl.load(v_ptrs)
 
-    ok_ptrs = OUT_K_PTR + (out_offset + pid_tok) * stride_ok_tok + pid_h * stride_ok_h + d_offsets * stride_ok_d
-    ov_ptrs = OUT_V_PTR + (out_offset + pid_tok) * stride_ov_tok + pid_h * stride_ov_h + d_offsets * stride_ov_d
+    ok_ptrs = OUT_K_PTR + pid_tok * stride_ok_tok + pid_h * stride_ok_h + d_offsets * stride_ok_d
+    ov_ptrs = OUT_V_PTR + pid_tok * stride_ov_tok + pid_h * stride_ov_h + d_offsets * stride_ov_d
     
     tl.store(ok_ptrs, k)
     tl.store(ov_ptrs, v)
@@ -114,38 +95,25 @@ def paged_kv_to_contig_suffix_kernel(
 # Python Launcher (Updated)
 # ---------------------------------------------------------------------------
 def extract_suffix_kv(
-    k_cache, v_cache, slot_mapping, suffix_lens, out_offsets, 
-    shared_gap_len, max_suffix_len, num_beams
+    k_cache, v_cache, slot_mapping, slot_mapping_out, out_token_num
 ):
     nheads = k_cache.shape[2]
     head_dim = k_cache.shape[3]
-    total_tokens = suffix_lens.sum().item()
+    total_tokens = out_token_num
     
     out_k = torch.empty((total_tokens, nheads, head_dim), device=k_cache.device, dtype=k_cache.dtype)
     out_v = torch.empty((total_tokens, nheads, head_dim), device=v_cache.device, dtype=v_cache.dtype)
     
-    debug_buf = torch.full((num_beams, max_suffix_len), -1, device=k_cache.device, dtype=torch.int64)
-    debug_out_offset_buf = torch.full((num_beams, max_suffix_len), -1, device=k_cache.device, dtype=torch.int64)
-
-    grid = (num_beams, max_suffix_len, nheads)
-    
+    grid = (total_tokens, nheads)    
     paged_kv_to_contig_suffix_kernel[grid](
-        k_cache, v_cache, slot_mapping, suffix_lens, out_k, out_v, out_offsets,
+        k_cache, v_cache, slot_mapping, slot_mapping_out, out_k, out_v,
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
         out_k.stride(0), out_k.stride(1), out_k.stride(2),
-        out_v.stride(0), out_v.stride(1), out_v.stride(2), # <--- THIS IS stride_ov_d
-        debug_buf,
-        debug_out_offset_buf,
-        num_beams=num_beams,
-        max_suffix_len=max_suffix_len,
+        out_v.stride(0), out_v.stride(1), out_v.stride(2),
         n_kv_heads=nheads,
-        head_dim=head_dim, shared_gap_len=shared_gap_len
+        head_dim=head_dim
     )
-    # print("Debug: slot_idx per beam (row) and token (col):")
-    # print(debug_buf)
-    # print("Debug: out_offset + pid_tok per beam (row) and token (col):")
-    # print(debug_out_offset_buf)
     return out_k, out_v
 
 # ---------------------------------------------------------------------------
@@ -185,10 +153,7 @@ class BeamAttentionMetadata:
     mega_suffix_max_q_len: int = 0
     mega_suffix_max_seq_len: int = 0
     mega_suffix_total_tokens: int = 0
-    mega_suffix_shared_gap: int = 0
-    mega_suffix_bw: int = 0
-
-    mega_suffix_out_offset: torch.Tensor | None = None
+    mega_suffix_slot_mapping_out: torch.Tensor | None = None
 
     scheduler_metadata: dict | None = None
     prefix_scheduler_metadata: dict | None = None
@@ -331,14 +296,14 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         
         mega_suffix_q_lens = []
         mega_suffix_seq_lens_list = []
-        mega_suffix_out_offset = []
         mega_prefix_block_tables = []
-        mega_suffix_bw_list = []
-        mega_suffix_shared_gap_list = []
+        mega_suffix_slot_mapping_out_list = []
+
         offset = 0
         max_prefix_len = max(mega_prefix_lens) if mega_prefix_lens else 0
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
+        out_slot = 0
         for req_idx, prefix_len, w, steps, cache_len in zip(
             mega_req_idxs, mega_prefix_lens, mega_beam_widths,
             mega_decode_steps, mega_cache_lens
@@ -349,7 +314,6 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             if w == 0 or steps == 0:
                 continue
             
-            mega_suffix_bw_list.append(w)
             q_curr = q_start
             bt = common_attn_metadata.block_table_tensor[req_idx]
             
@@ -357,6 +321,11 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             delta = max(0, cache_len - prefix_len)
             prefix_groups = []
 
+            remaining_prefix = prefix_len - cache_len
+            assert(remaining_prefix>=0, f"prefix_len: {prefix_len}, cache_len: {cache_len}")
+
+            shared_mapping = np.arange(out_slot, out_slot + remaining_prefix)
+            out_slot += remaining_prefix
             for b in range(w):
                 if chunk_budget <= 0:
                     break
@@ -364,41 +333,38 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 b_uncached = 0
                 b_cache_len = 0
                 b_suffix_len = 0
-                if prefix_len >= cache_len:
-                    # Scenario A: Prefix Incomplete
-                    remaining_prefix = prefix_len - cache_len
-                    mega_suffix_shared_gap_list.append(remaining_prefix)
-                    if b == 0:
-                        b_uncached = min(chunk_budget, remaining_prefix + steps)
-                    else:
-                        b_uncached = min(chunk_budget, steps)
-                    
-                    b_cache_len = cache_len
-                    b_suffix_len = remaining_prefix + steps
+
+                
+                # Scenario A: Prefix Incomplete
+                if b == 0:
+                    b_uncached = min(chunk_budget, remaining_prefix + steps)
                 else:
-                    # Scenario B: Prefix Complete
-                    past_suffix_b = max(0, min(steps, delta - b * steps))
-                    remaining_suffix_b = steps - past_suffix_b
-                    b_uncached = min(chunk_budget, remaining_suffix_b)
-                    
-                    b_cache_len = prefix_len
-                    b_suffix_len = past_suffix_b + b_uncached
+                    b_uncached = min(chunk_budget, steps)
+                
+                b_cache_len = cache_len
+                b_suffix_len = remaining_prefix + steps
                 
                 if b_uncached <= 0:
                     continue
 
-                if prefix_groups and prefix_groups[-1][2] == b_cache_len:
+                if prefix_groups:
                     prefix_groups[-1][1] += b_uncached
                 else:
                     prefix_groups.append([q_curr, b_uncached, b_cache_len])
                 
+                
+                full_mapping = np.empty(remaining_prefix + steps, dtype=np.int32)
+                full_mapping[:remaining_prefix] = shared_mapping
+                full_mapping[remaining_prefix:] = np.arange(out_slot, out_slot + steps)
+                mega_suffix_slot_mapping_out_list.extend(full_mapping)
+
                 mega_suffix_q_lens.append(b_uncached)
                 mega_suffix_seq_lens_list.append(b_suffix_len)
-                mega_suffix_out_offset.append(offset)
                 
                 offset += b_suffix_len
                 q_curr += b_uncached
                 chunk_budget -= b_uncached
+                out_slot += steps
 
             for group_q_start, group_q_len, group_cache_len in prefix_groups:
                 mega_prefix_indices.extend(range(group_q_start, group_q_start + group_q_len))
@@ -409,7 +375,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         return (
             mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
             mega_suffix_q_lens, mega_suffix_seq_lens_list,
-            mega_suffix_out_offset, mega_prefix_block_tables, mega_suffix_bw_list, mega_suffix_shared_gap_list
+            mega_prefix_block_tables, mega_suffix_slot_mapping_out_list
         )
 
     def _create_std_tensors(self, std_indices, std_q_lens, std_req_idxs, common_attn_metadata, device):
@@ -425,8 +391,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
     def _create_mega_tensors(
         self, mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
-        mega_suffix_q_lens, mega_suffix_seq_lens_list,
-        mega_suffix_out_offset, mega_prefix_block_tables, device, max_num_splits: int
+        mega_suffix_q_lens, mega_suffix_seq_lens_list, mega_suffix_slot_mapping_out_list,
+        mega_prefix_block_tables, device, max_num_splits: int
     ):
         if mega_prefix_q_lens:
             mega_prefix_indices_tensor = torch.tensor(mega_prefix_indices, dtype=torch.long, device=device)
@@ -444,7 +410,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_cu_seqlens_k = torch.tensor([0] + mega_suffix_seq_lens_list, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
             mega_suffix_max_q_len = max(mega_suffix_q_lens) if mega_suffix_q_lens else 0
             
-            mega_suffix_out_offset_tensor = torch.tensor(mega_suffix_out_offset, dtype=torch.int32, device=device)
+            mega_suffix_slot_mapping_out = torch.tensor(mega_suffix_slot_mapping_out_list, dtype=torch.int32, device=device)
 
             prefix_scheduler_metadata = self._get_schedule(
                 batch_size=len(mega_prefix_q_lens),
@@ -459,17 +425,16 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             # Full structured initializations for profiling warm-up model passes
             mega_prefix_indices_tensor = mega_prefix_seq_lens = mega_prefix_cu_seqlens_q = mega_prefix_block_table = None
             mega_prefix_max_q_len = mega_prefix_max_seq_len = 0
-            mega_suffix_cu_seqlens_q = mega_suffix_cu_seqlens_k = mega_suffix_seq_lens = None
+            mega_suffix_cu_seqlens_q = mega_suffix_cu_seqlens_k = mega_suffix_seq_lens = mega_suffix_slot_mapping_out = None
             mega_suffix_max_q_len = mega_suffix_max_seq_len = mega_suffix_total_tokens = 0
-            mega_suffix_out_offset_tensor = None
             prefix_scheduler_metadata = None
-            
+
         return (
             mega_prefix_indices_tensor, mega_prefix_seq_lens, mega_prefix_max_seq_len,
             mega_prefix_cu_seqlens_q, mega_prefix_max_q_len, mega_prefix_block_table,
-            mega_suffix_seq_lens, mega_suffix_max_seq_len, mega_suffix_total_tokens,
-            mega_suffix_cu_seqlens_q, mega_suffix_cu_seqlens_k, mega_suffix_max_q_len,
-            mega_suffix_out_offset_tensor, prefix_scheduler_metadata
+            mega_suffix_seq_lens, mega_suffix_slot_mapping_out, mega_suffix_max_seq_len,
+            mega_suffix_total_tokens, mega_suffix_cu_seqlens_q, mega_suffix_cu_seqlens_k, mega_suffix_max_q_len,
+            prefix_scheduler_metadata
         )
 
     def build(
@@ -496,8 +461,8 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         (mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
          mega_suffix_q_lens, mega_suffix_seq_lens_list,
-         mega_suffix_out_offset, mega_prefix_block_tables, 
-         mega_suffix_bw_list, mega_suffix_shared_gap_list) = self._build_mega_mappings(
+         mega_prefix_block_tables, 
+         mega_suffix_slot_mapping_out_list) = self._build_mega_mappings(
             mega_req_idxs, mega_prefix_lens, mega_beam_widths,
             mega_decode_steps, mega_cache_lens, q_starts, common_attn_metadata
         )
@@ -509,12 +474,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
 
         (mega_prefix_indices_tensor, mega_prefix_seq_lens, mega_prefix_max_seq_len,
          mega_prefix_cu_seqlens_q, mega_prefix_max_q_len, mega_prefix_block_table,
-         mega_suffix_seq_lens, mega_suffix_max_seq_len, mega_suffix_total_tokens,
+         mega_suffix_seq_lens, mega_suffix_slot_mapping_out, mega_suffix_max_seq_len, mega_suffix_total_tokens,
          mega_suffix_cu_seqlens_q, mega_suffix_cu_seqlens_k, mega_suffix_max_q_len,
-         mega_suffix_out_offset_tensor, prefix_scheduler_metadata) = self._create_mega_tensors(
+         prefix_scheduler_metadata) = self._create_mega_tensors(
             mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
-            mega_suffix_q_lens, mega_suffix_seq_lens_list,
-            mega_suffix_out_offset, mega_prefix_block_tables, device, max_num_splits
+            mega_suffix_q_lens, mega_suffix_seq_lens_list, mega_suffix_slot_mapping_out_list,
+            mega_prefix_block_tables, device, max_num_splits
         )
 
         torch.cuda.nvtx.range_pop()
@@ -546,12 +511,9 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_max_q_len=mega_suffix_max_q_len,
             mega_suffix_max_seq_len=mega_suffix_max_seq_len,
             mega_suffix_total_tokens=mega_suffix_total_tokens,
-            mega_suffix_out_offset=mega_suffix_out_offset_tensor,
-            mega_suffix_shared_gap=mega_suffix_shared_gap_list[0] if mega_suffix_shared_gap_list else 0,
-            mega_suffix_bw = mega_suffix_bw_list[0] if mega_suffix_bw_list else 0,
+            mega_suffix_slot_mapping_out=mega_suffix_slot_mapping_out,
             max_num_splits=max_num_splits,
         )
-        print(meta)
         return meta
 
     def update_block_table(
@@ -651,7 +613,7 @@ class BeamAttentionImpl(AttentionImpl):
 
         if attn_metadata.mega_prefix_indices is not None:
             mega_query = query[attn_metadata.mega_prefix_indices]
-
+            slot_mapping = attn_metadata.slot_mapping[attn_metadata.mega_prefix_indices]
             mega_prefix_out, mega_prefix_lse = flash_attn_varlen_func(
                 q=mega_query,
                 k=key_cache,
@@ -673,20 +635,14 @@ class BeamAttentionImpl(AttentionImpl):
                 s_aux=s_aux,
             )
             
-            total_suffix_tokens = attn_metadata.mega_suffix_total_tokens
-            block_size = key_cache.shape[1]
-
             contig_k, contig_v = extract_suffix_kv(
             key_cache, value_cache, 
-            attn_metadata.slot_mapping, # Global flat tensor
-            attn_metadata.mega_suffix_seq_lens,
-            attn_metadata.mega_suffix_out_offset,
-            shared_gap_len=attn_metadata.mega_suffix_shared_gap,
-            num_beams=attn_metadata.mega_suffix_bw,
-            max_suffix_len=attn_metadata.mega_suffix_max_seq_len
+            slot_mapping,
+            attn_metadata.mega_suffix_slot_mapping_out,
+            attn_metadata.mega_suffix_total_tokens
             )
             
-            if total_suffix_tokens > 0:
+            if attn_metadata.mega_suffix_total_tokens > 0:
                 mega_suffix_out = torch.empty_like(mega_query)
                 mega_suffix_out, mega_suffix_lse = flash_attn_varlen_func(
                     q=mega_query, k=contig_k, v=contig_v, out=mega_suffix_out,

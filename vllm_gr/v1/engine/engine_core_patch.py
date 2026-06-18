@@ -594,7 +594,7 @@ def apply_worker_patches():
                 
                 request_row_configs.append((req_id, input_row_idx, W_logits))
                 input_row_idx += W
-                if(W_logits != mdata['mega_beam_width']):print("Capture W_logits ", W_logits)
+                #if(W_logits != mdata['mega_beam_width']):print("Capture W_logits ", W_logits)
             else:
                 num_computed_tokens = self.input_batch.num_computed_tokens_cpu[batch_idx]
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[batch_idx]
@@ -607,8 +607,8 @@ def apply_worker_patches():
                     new_logits_indices.append(token_offset + seq_len - 1)
                     W_logits_count = 1
                     logits_to_batch_idx.extend([batch_idx] * W)
-                else:
-                    print("Chunk Prefill")
+                # else:
+                #     print("Chunk Prefill")
                 row_to_req_id.extend([req_id] * W)
                 row_to_batch_idx.extend([batch_idx] * W)
                 
@@ -631,8 +631,8 @@ def apply_worker_patches():
             if sampler_output is not None:
                 st_ids = sampler_output.sampled_token_ids
                 lp_tensors = sampler_output.logprobs_tensors
-                print("st_ids: ", st_ids)
-                print("lp_tensors: ", lp_tensors)
+                # print("st_ids: ", st_ids)
+                # print("lp_tensors: ", lp_tensors)
             return res
         
 
@@ -655,8 +655,8 @@ def apply_worker_patches():
         if sampler_output is not None:
             st_ids = sampler_output.sampled_token_ids
             lp_tensors = sampler_output.logprobs_tensors
-            print("st_ids: ", st_ids)
-            print("lp_tensors: ", lp_tensors)
+            # print("st_ids: ", st_ids)
+            # print("lp_tensors: ", lp_tensors)
             if st_ids is not None and lp_tensors is not None and lp_tensors.logprobs is not None:
                 orig_lps = lp_tensors.logprobs
                 orig_lp_ids = lp_tensors.logprob_token_ids
