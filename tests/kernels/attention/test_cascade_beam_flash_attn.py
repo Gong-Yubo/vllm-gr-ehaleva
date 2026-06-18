@@ -34,6 +34,7 @@ NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
 BLOCK_SIZES = [16, 32]
 DTYPES = [torch.float16, torch.bfloat16]
+
 CASES = [
     # Scenario: Standard Prefix Complete.
     # The shared prefix is fully cached, and beams independently decode their full suffixes.
@@ -231,16 +232,29 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
                     b_cache_len = cache_len
                     b_suffix_start = cache_len
                     b_suffix_len = b_uncached
-                    leader_suffix_len = b_suffix_len
+                    
+                    prefix_k = k_seq[:b_cache_len]
+                    prefix_v = v_seq[:b_cache_len]
+                    suffix_k = k_seq[b_suffix_start:b_suffix_start + b_suffix_len]
+                    suffix_v = v_seq[b_suffix_start:b_suffix_start + b_suffix_len]
                 else:
                     # Follower Beams (1 to W-1) cannot compute shared prefix tokens.
                     # They must wait until the prefix is fully resolved. They are only allowed 
                     # to compute their unique suffixes if the prefix finishes within this chunk.
-                    # if remaining_prefix <= q_len:
                     b_uncached = min(chunk_budget, steps)
                     b_cache_len = cache_len
                     b_suffix_start = prefix_len + b * steps
-                    b_suffix_len = leader_suffix_len
+                    
+                    prefix_k = k_seq[:b_cache_len]
+                    prefix_v = v_seq[:b_cache_len]
+                    
+                    shared_suffix_k = k_seq[cache_len:cache_len + remaining_prefix]
+                    shared_suffix_v = v_seq[cache_len:cache_len + remaining_prefix]
+                    unique_suffix_k = k_seq[b_suffix_start:b_suffix_start + b_uncached]
+                    unique_suffix_v = v_seq[b_suffix_start:b_suffix_start + b_uncached]
+                    
+                    suffix_k = torch.cat([shared_suffix_k, unique_suffix_k], dim=0)
+                    suffix_v = torch.cat([shared_suffix_v, unique_suffix_v], dim=0)
             else:
                 # Scenario B: Prefix Complete
                 past_suffix_b = max(0, min(steps, delta - b * steps))
@@ -253,19 +267,16 @@ def run_reference_attention(inputs: BeamAttnInputs) -> torch.Tensor:
                     b_suffix_start = prefix_len + b * steps
                     # Total suffix length includes past cached tokens + newly computed ones.
                     b_suffix_len = past_suffix_b + b_uncached
+                    
+                    prefix_k = k_seq[:b_cache_len]
+                    prefix_v = v_seq[:b_cache_len]
+                    suffix_k = k_seq[b_suffix_start:b_suffix_start + b_suffix_len]
+                    suffix_v = v_seq[b_suffix_start:b_suffix_start + b_suffix_len]
             
             # If there's no uncached tokens to compute for this beam, skip it
             if b_uncached <= 0:
                 continue
                 
-            # Extract the shared prefix slice
-            prefix_k = k_seq[:b_cache_len]
-            prefix_v = v_seq[:b_cache_len]
-            
-            # Extract the unique suffix slice for the current beam
-            suffix_k = k_seq[b_suffix_start:b_suffix_start + b_suffix_len]
-            suffix_v = v_seq[b_suffix_start:b_suffix_start + b_suffix_len]
-
             # Concatenate prefix and suffix to form the contiguous beam key and value tensor
             beam_k = torch.cat([prefix_k, suffix_k], dim=0)
             beam_v = torch.cat([prefix_v, suffix_v], dim=0)
@@ -330,8 +341,7 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
             self.max_query_len = inputs.q_seq_len * inputs.beam_width
             self.max_seq_len = inputs.max_seq_len
             self.causal = True
-
-                self.slot_mapping = inputs.slot_mapping
+            self.slot_mapping = inputs.slot_mapping
 
     common_attn_metadata = MockCommonAttentionMetadata(inputs)
     
@@ -347,7 +357,7 @@ def run_cascade_beam_attention(inputs: BeamAttnInputs, shuffle_processing_order:
             "prefix_len": inputs.shared_tokens_len,
             "mega_beam_width": inputs.beam_width,
             "mega_decode_steps": inputs.suffix_kv_len,
-            "cache_len": inputs.shared_tokens_len // inputs.block_size * inputs.block_size,
+            "cache_len": 0#inputs.shared_tokens_len // inputs.block_size * inputs.block_size,
         }
         
     token = MEGA_DATA_VAR.set(mega_info)

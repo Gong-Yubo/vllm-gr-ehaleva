@@ -252,43 +252,74 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             num_splits=max_num_splits,
         )
 
-    def _segment_requests(self, num_reqs: int, req_ids: list, mega_data: dict):
-        std_req_idxs = []
+    def _segment_requests(self, num_reqs: int, req_ids: list, mega_data: dict, q_starts: list):
+        std_reqs = []
         mega_req_idxs = []
         mega_prefix_lens = []
         mega_beam_widths = []
         mega_decode_steps = []
         mega_cache_lens = []
+        mega_q_start_offsets = []
 
         for i in range(num_reqs):
             req_id = req_ids[i] if i < len(req_ids) else None
             mdata = mega_data.get(req_id, {}) if req_id else {}
             if mdata.get("is_mega_decode", False):
                 mega_req_idxs.append(i)
-                mega_prefix_lens.append(mdata["prefix_len"])
+                prefix_len = mdata["prefix_len"]
+                cache_len = mdata["cache_len"]
+                delta = prefix_len - cache_len
+                q_offset = 0
+                # if prefix was cached out - run standard attention till prefix size
+                if delta > 0 and delta >= 2 * self.block_size:
+                   q_len = q_starts[i+1] - q_starts[i]
+                   std_q_len = min(delta, q_len)
+                   std_kv_len = cache_len + std_q_len
+                   
+                   cache_len = cache_len + std_q_len
+                   mdata["cache_len"] = cache_len
+                   std_reqs.append((i, std_q_len, std_kv_len))
+                   q_offset = std_q_len
+
+                mega_prefix_lens.append(prefix_len)
                 mega_beam_widths.append(mdata["mega_beam_width"])
                 mega_decode_steps.append(mdata["mega_decode_steps"])
-                mega_cache_lens.append(mdata.get("cache_len", mdata["prefix_len"]))
+                mega_cache_lens.append(cache_len)
+                mega_q_start_offsets.append(q_offset)
             else:
-                std_req_idxs.append(i)
+                std_reqs.append((i, None, None))
 
-        return std_req_idxs, mega_req_idxs, mega_prefix_lens, mega_beam_widths, mega_decode_steps, mega_cache_lens
+        return std_reqs, mega_req_idxs, mega_prefix_lens, mega_beam_widths, mega_decode_steps, mega_cache_lens, mega_q_start_offsets
 
-    def _build_std_mappings(self, std_req_idxs: list, q_starts: list):
+    def _build_std_mappings(self, std_reqs: list, q_starts: list):
         std_indices = []
         std_q_lens = []
+        std_kv_lens = []
+        std_req_idxs = []
 
-        for i in std_req_idxs:
-            q_start = q_starts[i]
-            q_end = q_starts[i+1]
-            std_indices.extend(range(q_start, q_end))
-            std_q_lens.append(q_end - q_start)
+        for req_idx, std_q_len, std_kv_len in std_reqs:
+            q_start = q_starts[req_idx]
+            q_end = q_starts[req_idx+1]
+            
+            if std_q_len is None:
+                q_len = q_end - q_start
+            else:
+                q_len = std_q_len
+                
+            if q_len == 0:
+                continue
+                
+            std_indices.extend(range(q_start, q_start + q_len))
+            std_q_lens.append(q_len)
+            std_kv_lens.append(std_kv_len)
+            std_req_idxs.append(req_idx)
 
-        return std_indices, std_q_lens
+        return std_indices, std_q_lens, std_kv_lens, std_req_idxs
 
     def _build_mega_mappings(
         self, mega_req_idxs, mega_prefix_lens, mega_beam_widths,
-        mega_decode_steps, mega_cache_lens, q_starts, common_attn_metadata
+        mega_decode_steps, mega_cache_lens, mega_q_start_offsets,
+        q_starts, common_attn_metadata
     ):
         mega_prefix_indices = []
         mega_prefix_q_lens = []
@@ -304,28 +335,27 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         max_prefix_blocks_count = (max_prefix_len + self.block_size - 1) // self.block_size
 
         out_slot = 0
-        for req_idx, prefix_len, w, steps, cache_len in zip(
+        for req_idx, prefix_len, w, steps, cache_len, q_offset in zip(
             mega_req_idxs, mega_prefix_lens, mega_beam_widths,
-            mega_decode_steps, mega_cache_lens
+            mega_decode_steps, mega_cache_lens, mega_q_start_offsets
         ):
-            q_start = q_starts[req_idx]
+            q_start = q_starts[req_idx] + q_offset
             q_end = q_starts[req_idx+1]
             q_len = q_end - q_start
-            if w == 0 or steps == 0:
+            if w == 0 or steps == 0 or q_len <= 0:
                 continue
             
             q_curr = q_start
             bt = common_attn_metadata.block_table_tensor[req_idx]
             
             chunk_budget = q_len
-            delta = max(0, cache_len - prefix_len)
             prefix_groups = []
 
             remaining_prefix = prefix_len - cache_len
-            assert(remaining_prefix>=0, f"prefix_len: {prefix_len}, cache_len: {cache_len}")
+            assert remaining_prefix>=0, f"prefix_len: {prefix_len}, cache_len: {cache_len}"
 
+            # print("remaining_prefix ", remaining_prefix)
             shared_mapping = np.arange(out_slot, out_slot + remaining_prefix)
-            out_slot += remaining_prefix
             for b in range(w):
                 if chunk_budget <= 0:
                     break
@@ -338,11 +368,12 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 # Scenario A: Prefix Incomplete
                 if b == 0:
                     b_uncached = min(chunk_budget, remaining_prefix + steps)
+                    b_suffix_len = b_uncached
                 else:
                     b_uncached = min(chunk_budget, steps)
+                    b_suffix_len = remaining_prefix + b_uncached
                 
                 b_cache_len = cache_len
-                b_suffix_len = remaining_prefix + steps
                 
                 if b_uncached <= 0:
                     continue
@@ -352,10 +383,13 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 else:
                     prefix_groups.append([q_curr, b_uncached, b_cache_len])
                 
-                
-                full_mapping = np.empty(remaining_prefix + steps, dtype=np.int32)
-                full_mapping[:remaining_prefix] = shared_mapping
-                full_mapping[remaining_prefix:] = np.arange(out_slot, out_slot + steps)
+                if b == 0:
+                    full_mapping = np.arange(out_slot, out_slot + b_uncached, dtype=np.int32)
+                else:
+                    full_mapping = np.empty(b_suffix_len, dtype=np.int32)
+                    full_mapping[:remaining_prefix] = shared_mapping
+                    full_mapping[remaining_prefix:] = np.arange(out_slot, out_slot + b_uncached)
+                    
                 mega_suffix_slot_mapping_out_list.extend(full_mapping)
 
                 mega_suffix_q_lens.append(b_uncached)
@@ -364,7 +398,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
                 offset += b_suffix_len
                 q_curr += b_uncached
                 chunk_budget -= b_uncached
-                out_slot += steps
+                out_slot += b_uncached
 
             for group_q_start, group_q_len, group_cache_len in prefix_groups:
                 mega_prefix_indices.extend(range(group_q_start, group_q_start + group_q_len))
@@ -378,13 +412,19 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_prefix_block_tables, mega_suffix_slot_mapping_out_list
         )
 
-    def _create_std_tensors(self, std_indices, std_q_lens, std_req_idxs, common_attn_metadata, device):
+    def _create_std_tensors(self, std_indices, std_q_lens, std_kv_lens, std_req_idxs, common_attn_metadata, device):
         if std_q_lens:
             std_indices_tensor = torch.tensor(std_indices, dtype=torch.long, device=device)
             std_cu_seqlens_q = torch.tensor([0] + std_q_lens, dtype=torch.int32, device=device).cumsum(dim=0).to(torch.int32)
-            std_seq_lens = common_attn_metadata.seq_lens[std_req_idxs]
+            
+            std_seq_lens_list = [
+                common_attn_metadata.seq_lens[req_idx].item() if kv_len is None else kv_len
+                for req_idx, kv_len in zip(std_req_idxs, std_kv_lens)
+            ]
+            std_seq_lens = torch.tensor(std_seq_lens_list, dtype=torch.int32, device=device)
+            
             std_max_q_len = max(std_q_lens)
-            std_max_seq_len = common_attn_metadata.max_seq_len
+            std_max_seq_len = max(std_seq_lens_list)
             std_block_table = common_attn_metadata.block_table_tensor[std_req_idxs].contiguous()
             return std_indices_tensor, std_cu_seqlens_q, std_seq_lens, std_max_q_len, std_max_seq_len, std_block_table
         return None, None, None, 0, 0, None
@@ -452,24 +492,25 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
         mega_data = mega_info["mega_data"] if mega_info else {}
         req_ids = mega_info["req_ids"] if mega_info else []
 
-        (std_req_idxs, mega_req_idxs, mega_prefix_lens, mega_beam_widths,
-         mega_decode_steps, mega_cache_lens) = self._segment_requests(num_reqs, req_ids, mega_data)
-
         q_starts = common_attn_metadata.query_start_loc_cpu.tolist()
 
-        std_indices, std_q_lens = self._build_std_mappings(std_req_idxs, q_starts)
+        (std_reqs, mega_req_idxs, mega_prefix_lens, mega_beam_widths,
+         mega_decode_steps, mega_cache_lens, mega_q_start_offsets) = self._segment_requests(num_reqs, req_ids, mega_data, q_starts)
+
+        std_indices, std_q_lens, std_kv_lens, std_req_idxs = self._build_std_mappings(std_reqs, q_starts)
 
         (mega_prefix_indices, mega_prefix_q_lens, mega_prefix_seq_lens_list,
          mega_suffix_q_lens, mega_suffix_seq_lens_list,
          mega_prefix_block_tables, 
          mega_suffix_slot_mapping_out_list) = self._build_mega_mappings(
             mega_req_idxs, mega_prefix_lens, mega_beam_widths,
-            mega_decode_steps, mega_cache_lens, q_starts, common_attn_metadata
+            mega_decode_steps, mega_cache_lens, mega_q_start_offsets,
+            q_starts, common_attn_metadata
         )
 
         (std_indices_tensor, std_cu_seqlens_q, std_seq_lens,
          std_max_q_len, std_max_seq_len, std_block_table) = self._create_std_tensors(
-            std_indices, std_q_lens, std_req_idxs, common_attn_metadata, device
+            std_indices, std_q_lens, std_kv_lens, std_req_idxs, common_attn_metadata, device
         )
 
         (mega_prefix_indices_tensor, mega_prefix_seq_lens, mega_prefix_max_seq_len,
@@ -514,6 +555,7 @@ class BeamAttentionMetadataBuilder(AttentionMetadataBuilder[BeamAttentionMetadat
             mega_suffix_slot_mapping_out=mega_suffix_slot_mapping_out,
             max_num_splits=max_num_splits,
         )
+        # print(meta)
         return meta
 
     def update_block_table(
@@ -634,7 +676,6 @@ class BeamAttentionImpl(AttentionImpl):
                 num_splits=attn_metadata.max_num_splits,
                 s_aux=s_aux,
             )
-            
             contig_k, contig_v = extract_suffix_kv(
             key_cache, value_cache, 
             slot_mapping,
@@ -784,13 +825,22 @@ class BeamAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_combination(cls, head_size, dtype, kv_cache_dtype, block_size, use_mla, has_sink, use_sparse, device_capability) -> str | None:
-        if not is_flash_attn_varlen_func_available(): return "No FlashAttention varlen support."
-        if dtype not in cls.supported_dtypes: return f"Unsupported dtype {dtype}."
-        if not cls.supports_head_size(head_size): return f"Unsupported head_size={head_size}."
-        if not cls.supports_kv_cache_dtype(kv_cache_dtype): return f"Unsupported kv_cache_dtype={kv_cache_dtype}."
-        if block_size is not None and block_size % 16 != 0: return f"block_size={block_size} not multiple of 16."
-        if not cls.supports_compute_capability(device_capability): return f"Requires GPU compute capability >= 8.0."
-        if has_sink and not cls.supports_sink(): return "No FlashAttention sink support."
-        if use_mla: return "No MLA support."
-        if use_sparse: return "No sparse support."
+        if not is_flash_attn_varlen_func_available():
+            return "No FlashAttention varlen support."
+        if dtype not in cls.supported_dtypes:
+            return f"Unsupported dtype {dtype}."
+        if not cls.supports_head_size(head_size):
+            return f"Unsupported head_size={head_size}."
+        if not cls.supports_kv_cache_dtype(kv_cache_dtype):
+            return f"Unsupported kv_cache_dtype={kv_cache_dtype}."
+        if block_size is not None and block_size % 16 != 0:
+            return f"block_size={block_size} not multiple of 16."
+        if not cls.supports_compute_capability(device_capability):
+            return f"Requires GPU compute capability >= 8.0."
+        if has_sink and not cls.supports_sink():
+            return "No FlashAttention sink support."
+        if use_mla:
+            return "No MLA support."
+        if use_sparse:
+            return "No sparse support."
         return None
