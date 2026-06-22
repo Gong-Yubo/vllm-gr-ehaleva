@@ -1,0 +1,576 @@
+From 123a51d7e87d6d892b8054757958684c300eaa21 Mon Sep 17 00:00:00 2001
+From: zhangshucheng <zhangshucheng@huawei.com>
+Date: Mon, 22 Jun 2026 14:17:58 +0800
+Subject: [PATCH] split_qkv_rmsnorm_rope
+
+Signed-off-by: zhangshucheng <zhangshucheng@huawei.com>
+---
+ vllm_ascend/envs.py                           |   3 +
+ .../linearnorm/split_qkv_rmsnorm_rope.py      | 473 +++++++++++++++++-
+ 2 files changed, 451 insertions(+), 25 deletions(-)
+
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index 8298a5f5..6a3706c8 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -97,6 +97,9 @@ env_variables: dict[str, Callable[[], Any]] = {
+     # it will consume more NPU memory. If reducing NPU memory usage is a higher priority
+     # for your DeepSeek W8A8 scene, then disable it.
+     "VLLM_ASCEND_ENABLE_MLAPO": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MLAPO", "1"))),
++    "VLLM_ASCEND_USE_NEW_QKV_RMSNORM_ROPE_IMPL": lambda: bool(
++        int(os.getenv("VLLM_ASCEND_USE_NEW_QKV_RMSNORM_ROPE_IMPL", "0"))
++    ),
+     # Whether to enable weight cast format to FRACTAL_NZ.
+     # 0: close nz;
+     # 1: only quant case enable nz;
+diff --git a/vllm_ascend/ops/triton/linearnorm/split_qkv_rmsnorm_rope.py b/vllm_ascend/ops/triton/linearnorm/split_qkv_rmsnorm_rope.py
+index 14bae3b7..536b2f09 100644
+--- a/vllm_ascend/ops/triton/linearnorm/split_qkv_rmsnorm_rope.py
++++ b/vllm_ascend/ops/triton/linearnorm/split_qkv_rmsnorm_rope.py
+@@ -15,16 +15,43 @@
+ # This file is a part of the vllm-ascend project.
+ #
+ 
++from __future__ import annotations
++
+ import torch
+ import triton  # type: ignore
+ import triton.language as tl  # type: ignore
++from vllm.logger import logger
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
+-from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
++from vllm_ascend import envs as envs_ascend
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
++
++
++def _resolve_triton_op(op_name: str):
++    extension_module = None
++    try:  # pragma: no cover - depends on Triton Ascend packaging.
++        import triton.language.extra.cann.extension as extension_module  # type: ignore
++    except ImportError:
++        extension_module = None
++
++    if extension_module is not None:
++        extension_op = getattr(extension_module, op_name, None)
++        if extension_op is not None:
++            return extension_op
++
++    return getattr(tl, op_name, None)
++
++
++_extract_slice = _resolve_triton_op("extract_slice")
++_insert_slice = _resolve_triton_op("insert_slice")
++_get_element = _resolve_triton_op("get_element")
++
++if _extract_slice is None or _insert_slice is None or _get_element is None:
++    raise RuntimeError("split_qkv_rmsnorm_rope requires extract_slice/insert_slice/get_element Triton helpers.")
+ 
+ 
+ @triton.jit
+-def split_qkv_rmsnorm_rope_kernel(
++def split_qkv_rmsnorm_rope_kernel_legacy(
+     input_ptr,
+     sin_ptr,
+     cos_ptr,
+@@ -49,7 +76,6 @@ def split_qkv_rmsnorm_rope_kernel(
+     row_pid = tl.program_id(0)
+     col_pid = tl.program_id(1)
+     row_step = tl.num_programs(0)
+-    # q
+     weight_values = tl.load(q_weight_ptr + tl.arange(0, HEAD_DIM))
+     if BIAS:
+         bias_values = tl.load(q_bias_ptr + tl.arange(0, HEAD_DIM))
+@@ -68,7 +94,7 @@ def split_qkv_rmsnorm_rope_kernel(
+         squares = input_values * input_values
+         variances = tl.sum(squares, axis=1) / HEAD_DIM
+         reciprocal_std = (1 / tl.sqrt(variances + eps)).reshape(Q_BLOCK_SIZE // HEAD_DIM, 1)
+-        normalized_values = input_values * reciprocal_std  # (Q_BLOCK_SIZE//HEAD_DIM, HEAD_DIM)
++        normalized_values = input_values * reciprocal_std
+         if BIAS:
+             normalized_values = (normalized_values * weight_values + bias_values).to(tl.bfloat16)
+         else:
+@@ -130,7 +156,7 @@ def split_qkv_rmsnorm_rope_kernel(
+         squares = input_values * input_values
+         variances = tl.sum(squares, axis=1) / HEAD_DIM
+         reciprocal_std = (1 / tl.sqrt(variances + eps)).reshape(KV_BLOCK_SIZE // HEAD_DIM, 1)
+-        normalized_values = input_values * reciprocal_std  # (KV_BLOCK_SIZE/HEAD_DIM, HEAD_DIM)
++        normalized_values = input_values * reciprocal_std
+         if BIAS:
+             normalized_values = (normalized_values * weight_values + bias_values).to(tl.bfloat16)
+         else:
+@@ -186,7 +212,279 @@ def split_qkv_rmsnorm_rope_kernel(
+         output_offset += output_offset_step
+ 
+ 
+-def split_qkv_rmsnorm_rope_impl(
++@triton.jit
++def split_qkv_rmsnorm_rope_kernel_v2(
++    input_gm_ptr,
++    q_gm_ptr,
++    k_gm_ptr,
++    v_gm_ptr,
++    q_weight_ptr,
++    q_bias_ptr,
++    k_weight_ptr,
++    k_bias_ptr,
++    batch_size,
++    q_hidden_size: tl.constexpr,
++    kv_hidden_size: tl.constexpr,
++    total_hidden_size: tl.constexpr,
++    eps: tl.constexpr,
++    BIAS: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    ROPE_DIM: tl.constexpr,
++    HALF_ROPE_DIM: tl.constexpr,
++    IS_PARTIAL_ROPE: tl.constexpr,
++    num_vectorcore: tl.constexpr,
++    batch_size_per_iter_per_vec: tl.constexpr,
++    qk_head_nums_per_iter_per_vec: tl.constexpr,
++    q_head_num: tl.constexpr,
++    kv_head_num: tl.constexpr,
++    qk_head_num_sum: tl.constexpr,
++    v_batch_size_per_iter_per_vec: tl.constexpr,
++    positions_gm_ptr,
++    cos_sin_cache_gm_ptr,
++):
++    row_pid = tl.program_id(0)
++
++    q_weight_values = tl.load(q_weight_ptr + tl.arange(0, HEAD_DIM))
++    k_weight_values = tl.load(k_weight_ptr + tl.arange(0, HEAD_DIM))
++
++    batch_size_per_vec = tl.cdiv(batch_size, num_vectorcore)
++    iter_num_per_vec = tl.cdiv(batch_size_per_vec, batch_size_per_iter_per_vec)
++    v_iter_num_per_vec = tl.cdiv(batch_size_per_vec, v_batch_size_per_iter_per_vec)
++    input_batch_offset = row_pid * batch_size_per_vec
++    mblk_idx = tl.arange(0, batch_size_per_iter_per_vec) + input_batch_offset
++    nblk_idx = tl.arange(0, q_hidden_size + kv_hidden_size)
++    nmask = nblk_idx < total_hidden_size
++
++    input_batch_offset_end = min(input_batch_offset + batch_size_per_vec, batch_size)
++
++    pos_indices = input_batch_offset + tl.arange(0, batch_size_per_iter_per_vec)
++    output_q_nblk_idx = tl.arange(0, q_hidden_size)
++    output_q_nmask = output_q_nblk_idx < q_hidden_size
++    output_kv_nblk_idx = tl.arange(0, kv_hidden_size)
++    output_kv_nmask = output_kv_nblk_idx < kv_hidden_size
++    sin_cos_range = tl.arange(0, ROPE_DIM)
++    cos_sin_cache_offset = cos_sin_cache_gm_ptr + sin_cos_range
++
++    for iter in tl.range(iter_num_per_vec):
++        pos_offset = iter * batch_size_per_iter_per_vec
++        x = tl.load(
++            positions_gm_ptr + pos_indices + pos_offset,
++            mask=(pos_indices + pos_offset) < input_batch_offset_end,
++        )
++        mmask = (mblk_idx + pos_offset) < input_batch_offset_end
++        mask = (mmask[:, None]) & (nmask[None, :])
++        idx = (mblk_idx + pos_offset)[:, None] * total_hidden_size + nblk_idx[None, :]
++        values_tmp1 = tl.load(input_gm_ptr + idx, mask=mask).reshape(qk_head_nums_per_iter_per_vec, HEAD_DIM)
++        if BIAS:
++            q_bias_values = tl.load(q_bias_ptr + tl.arange(0, HEAD_DIM))
++            k_bias_values = tl.load(k_bias_ptr + tl.arange(0, HEAD_DIM))
++
++        values_tmp3 = tl.zeros((batch_size_per_iter_per_vec, ROPE_DIM), dtype=tl.bfloat16)
++        for i in tl.range(batch_size_per_iter_per_vec):
++            pos = _get_element(x, (i,))
++            values_tmp3 = _insert_slice(
++                values_tmp3.reshape(batch_size_per_iter_per_vec, ROPE_DIM),
++                tl.load(pos * ROPE_DIM + cos_sin_cache_offset[:, None]).reshape(1, ROPE_DIM),
++                offsets=(i, 0),
++                sizes=(1, ROPE_DIM),
++                strides=(1, 1),
++            )
++        values_tmp3 = values_tmp3.reshape(batch_size_per_iter_per_vec, 1, ROPE_DIM)
++        cos = _extract_slice(
++            values_tmp3,
++            offsets=(0, 0, 0),
++            sizes=(batch_size_per_iter_per_vec, 1, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++        sin = _extract_slice(
++            values_tmp3,
++            offsets=(0, 0, HALF_ROPE_DIM),
++            sizes=(batch_size_per_iter_per_vec, 1, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++
++        normalized_values = values_tmp1.to(tl.float32)
++        normalized_values = normalized_values * normalized_values
++        normalized_values = tl.sum(normalized_values, axis=1) / HEAD_DIM
++        normalized_values = 1 / tl.sqrt(normalized_values + eps).reshape(qk_head_nums_per_iter_per_vec, 1)
++        normalized_values = values_tmp1 * normalized_values
++
++        normalized_values_tmp = _extract_slice(
++            normalized_values.reshape(batch_size_per_iter_per_vec, qk_head_num_sum, HEAD_DIM),
++            offsets=(0, 0, 0),
++            sizes=(batch_size_per_iter_per_vec, q_head_num, HEAD_DIM),
++            strides=(1, 1, 1),
++        )
++
++        if BIAS:
++            normalized_values_tmp = (normalized_values_tmp * q_weight_values + q_bias_values).to(tl.bfloat16)
++        else:
++            normalized_values_tmp = (normalized_values_tmp * q_weight_values).to(tl.bfloat16)
++
++        values_tmp = tl.zeros((batch_size_per_iter_per_vec, q_head_num, ROPE_DIM), dtype=tl.bfloat16)
++        x1 = _extract_slice(
++            normalized_values_tmp,
++            offsets=(0, 0, 0),
++            sizes=(batch_size_per_iter_per_vec, q_head_num, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++        x2 = _extract_slice(
++            normalized_values_tmp,
++            offsets=(0, 0, HALF_ROPE_DIM),
++            sizes=(batch_size_per_iter_per_vec, q_head_num, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++        values_tmp = _insert_slice(
++            values_tmp,
++            x1 * cos - x2 * sin,
++            offsets=(0, 0, 0),
++            sizes=(batch_size_per_iter_per_vec, q_head_num, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++        values_tmp = _insert_slice(
++            values_tmp,
++            x2 * cos + x1 * sin,
++            offsets=(0, 0, HALF_ROPE_DIM),
++            sizes=(batch_size_per_iter_per_vec, q_head_num, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++        q_output_idx = output_q_nblk_idx[None, :] + (mblk_idx + pos_offset)[:, None] * q_hidden_size
++        mask = (mmask[:, None]) & (output_q_nmask[None, :])
++        if IS_PARTIAL_ROPE:
++            normalized_values_tmp = _insert_slice(
++                normalized_values_tmp,
++                values_tmp,
++                offsets=(0, 0, 0),
++                sizes=(batch_size_per_iter_per_vec, q_head_num, ROPE_DIM),
++                strides=(1, 1, 1),
++            )
++            tl.store(
++                q_gm_ptr + q_output_idx,
++                normalized_values_tmp.reshape(batch_size_per_iter_per_vec, q_hidden_size),
++                mask=mask,
++            )
++        else:
++            tl.store(
++                q_gm_ptr + q_output_idx,
++                values_tmp.reshape(batch_size_per_iter_per_vec, q_hidden_size),
++                mask=mask,
++            )
++
++        normalized_values_tmp1 = _extract_slice(
++            normalized_values.reshape(batch_size_per_iter_per_vec, qk_head_num_sum, HEAD_DIM),
++            offsets=(0, q_head_num, 0),
++            sizes=(batch_size_per_iter_per_vec, kv_head_num, HEAD_DIM),
++            strides=(1, 1, 1),
++        )
++
++        if BIAS:
++            normalized_values_tmp1 = (normalized_values_tmp1 * k_weight_values + k_bias_values).to(tl.bfloat16)
++        else:
++            normalized_values_tmp1 = (normalized_values_tmp1 * k_weight_values).to(tl.bfloat16)
++
++        values_tmp2 = tl.zeros((batch_size_per_iter_per_vec, kv_head_num, ROPE_DIM), dtype=tl.bfloat16)
++        x1 = _extract_slice(
++            normalized_values_tmp1,
++            offsets=(0, 0, 0),
++            sizes=(batch_size_per_iter_per_vec, kv_head_num, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++        x2 = _extract_slice(
++            normalized_values_tmp1,
++            offsets=(0, 0, HALF_ROPE_DIM),
++            sizes=(batch_size_per_iter_per_vec, kv_head_num, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++        values_tmp2 = _insert_slice(
++            values_tmp2,
++            x1 * cos - x2 * sin,
++            offsets=(0, 0, 0),
++            sizes=(batch_size_per_iter_per_vec, kv_head_num, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++        values_tmp2 = _insert_slice(
++            values_tmp2,
++            x2 * cos + x1 * sin,
++            offsets=(0, 0, HALF_ROPE_DIM),
++            sizes=(batch_size_per_iter_per_vec, kv_head_num, HALF_ROPE_DIM),
++            strides=(1, 1, 1),
++        )
++
++        kv_output_idx = output_kv_nblk_idx[None, :] + (mblk_idx + pos_offset)[:, None] * kv_hidden_size
++        mask = (mmask[:, None]) & (output_kv_nmask[None, :])
++        if IS_PARTIAL_ROPE:
++            normalized_values_tmp1 = _insert_slice(
++                normalized_values_tmp1,
++                values_tmp2,
++                offsets=(0, 0, 0),
++                sizes=(batch_size_per_iter_per_vec, kv_head_num, ROPE_DIM),
++                strides=(1, 1, 1),
++            )
++            tl.store(
++                k_gm_ptr + kv_output_idx,
++                normalized_values_tmp1.reshape(batch_size_per_iter_per_vec, kv_hidden_size),
++                mask=mask,
++            )
++        else:
++            tl.store(
++                k_gm_ptr + kv_output_idx,
++                values_tmp2.reshape(batch_size_per_iter_per_vec, kv_hidden_size),
++                mask=mask,
++            )
++
++    mblk_idx = tl.arange(0, v_batch_size_per_iter_per_vec) + input_batch_offset
++    nblk_idx = tl.arange(q_hidden_size + kv_hidden_size, total_hidden_size)
++    nmask = nblk_idx < total_hidden_size
++    out_nblk_idx = tl.arange(0, kv_hidden_size)
++    out_nmask = out_nblk_idx < kv_hidden_size
++
++    for _ in tl.range(v_iter_num_per_vec):
++        mmask = mblk_idx < input_batch_offset_end
++        mask = (mmask[:, None]) & (nmask[None, :])
++        idx = mblk_idx[:, None] * total_hidden_size + nblk_idx[None, :]
++        values = tl.load(input_gm_ptr + idx, mask=mask)
++        out_idx = mblk_idx[:, None] * kv_hidden_size + out_nblk_idx[None, :]
++        out_mask = (mmask[:, None]) & (out_nmask[None, :])
++        tl.store(v_gm_ptr + out_idx, values, mask=out_mask)
++        mblk_idx += v_batch_size_per_iter_per_vec
++
++
++def _convert_sin_cos_to_cache_and_positions(
++    sin: torch.Tensor,
++    cos: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if sin.shape != cos.shape:
++        raise ValueError(f"sin/cos shape mismatch: sin={tuple(sin.shape)} cos={tuple(cos.shape)}")
++    if sin.ndim != 4:
++        raise ValueError(
++            "Expected 4D sin/cos tensors like [1, T, 1, rope_dim] or [T, 1, 1, rope_dim], "
++            f"got {tuple(sin.shape)}"
++        )
++
++    if sin.shape[0] == 1:
++        sin_rows = sin.squeeze(0).squeeze(1)
++        cos_rows = cos.squeeze(0).squeeze(1)
++    else:
++        sin_rows = sin.squeeze(1).squeeze(1)
++        cos_rows = cos.squeeze(1).squeeze(1)
++
++    if sin_rows.ndim != 2:
++        raise ValueError(
++            "Unable to normalize sin/cos tensors into [num_tokens, rope_dim]; "
++            f"got {tuple(sin_rows.shape)}"
++        )
++
++    rope_dim = sin_rows.shape[-1]
++    if rope_dim % 2 != 0:
++        raise ValueError(f"rope_dim must be even, got {rope_dim}")
++
++    half = rope_dim // 2
++    cache = torch.cat((cos_rows[:, :half], sin_rows[:, :half]), dim=-1).contiguous()
++    positions = torch.arange(cache.shape[0], device=cache.device, dtype=torch.int64)
++    return cache, positions
++
++
++def split_qkv_rmsnorm_rope_impl_legacy(
+     input: torch.Tensor,
+     sin: torch.Tensor,
+     cos: torch.Tensor,
+@@ -214,7 +512,7 @@ def split_qkv_rmsnorm_rope_impl(
+     n_rows = num_vectorcore // n_cols
+     BIAS = q_bias is not None
+ 
+-    split_qkv_rmsnorm_rope_kernel[(n_rows, n_cols, 1)](
++    split_qkv_rmsnorm_rope_kernel_legacy[(n_rows, n_cols, 1)](
+         input,
+         sin,
+         cos,
+@@ -239,10 +537,10 @@ def split_qkv_rmsnorm_rope_impl(
+     return q_output, k_output, v_output
+ 
+ 
+-def split_qkv_rmsnorm_rope_impl_fake(
++def split_qkv_rmsnorm_rope_impl_v2(
+     input: torch.Tensor,
+-    sin: torch.Tensor,
+-    cos: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    positions: torch.Tensor,
+     q_weight: torch.Tensor,
+     k_weight: torch.Tensor,
+     q_hidden_size: int,
+@@ -252,27 +550,152 @@ def split_qkv_rmsnorm_rope_impl_fake(
+     q_bias: torch.Tensor | None = None,
+     k_bias: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-    # Fake implementation for shape inference during Dynamo/AOT tracing.
+-    # Note: sin and cos are not used in shape computation, but must be present in signature.
++    num_vectorcore = get_vectorcore_num()
++    rope_dim = cos_sin_cache.shape[-1]
+     batch_size = input.shape[0]
+-    q_output = torch.empty(
++    bias = q_bias is not None
++    is_partial_rope = rope_dim != head_dim
++    total_hidden_size = q_hidden_size + kv_hidden_size * 2
++
++    q_output = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=input.dtype)
++    k_output = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=input.dtype)
++    v_output = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=input.dtype)
++
++    q_head_num = q_hidden_size // head_dim
++    kv_head_num = kv_hidden_size // head_dim
++
++    ub_size = 87040
++    if is_partial_rope:
++        factor = 5 * q_hidden_size + 3 * kv_hidden_size + rope_dim * 4 + q_head_num * rope_dim
++        batch_size_per_iter_per_vec = int(ub_size / input.element_size()) // factor
++    else:
++        factor = 5 * q_hidden_size + 3 * kv_hidden_size + rope_dim * 2 + q_head_num * rope_dim // 2
++        batch_size_per_iter_per_vec = int(ub_size / input.element_size()) // factor
++    batch_size_per_iter_per_vec = max(1, batch_size_per_iter_per_vec)
++    qk_head_num_sum = int(q_head_num + kv_head_num)
++    qk_head_nums_per_iter_per_vec = batch_size_per_iter_per_vec * qk_head_num_sum
++
++    grid = (num_vectorcore, 1, 1)
++    v_batch_size_per_iter_per_vec = ub_size / torch.bfloat16.itemsize // (kv_hidden_size + 1)
++
++    split_qkv_rmsnorm_rope_kernel_v2[grid](
++        input,
++        q_output,
++        k_output,
++        v_output,
++        q_weight,
++        q_bias,
++        k_weight,
++        k_bias,
+         batch_size,
+         q_hidden_size,
+-        device=input.device,
+-        dtype=input.dtype,
+-    )
+-    k_output = torch.empty(
+-        batch_size,
+         kv_hidden_size,
+-        device=input.device,
+-        dtype=input.dtype,
++        total_hidden_size,
++        eps,
++        bias,
++        head_dim,
++        rope_dim,
++        rope_dim // 2,
++        is_partial_rope,
++        num_vectorcore,
++        int(batch_size_per_iter_per_vec),
++        int(qk_head_nums_per_iter_per_vec),
++        q_head_num,
++        kv_head_num,
++        qk_head_num_sum,
++        int(v_batch_size_per_iter_per_vec),
++        positions,
++        cos_sin_cache,
+     )
+-    v_output = torch.empty(
+-        batch_size,
+-        kv_hidden_size,
+-        device=input.device,
+-        dtype=input.dtype,
++    return q_output, k_output, v_output
++
++
++def split_qkv_rmsnorm_rope_impl(
++    input: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    q_hidden_size: int,
++    kv_hidden_size: int,
++    head_dim: int,
++    eps: float,
++    q_bias: torch.Tensor | None = None,
++    k_bias: torch.Tensor | None = None,
++    cos: torch.Tensor | None = None,
++    sin: torch.Tensor | None = None,
++    cos_sin_cache: torch.Tensor | None = None,
++    positions: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    init_device_properties_triton()
++
++    use_new_impl = envs_ascend.VLLM_ASCEND_USE_NEW_QKV_RMSNORM_ROPE_IMPL
++    if (cos_sin_cache is None) != (positions is None):
++        raise ValueError("cos_sin_cache and positions must be provided together.")
++
++    if cos_sin_cache is not None and positions is not None:
++        use_new_impl = True
++
++    if use_new_impl:
++        logger.info_once("qkv_rmsnorm_rope compile path: using v2 implementation")
++        if cos_sin_cache is None or positions is None:
++            if sin is None or cos is None:
++                raise ValueError(
++                    "Expected either (cos_sin_cache, positions) or legacy (sin, cos) inputs for qkv_rmsnorm_rope"
++                )
++            cos_sin_cache, positions = _convert_sin_cos_to_cache_and_positions(sin=sin, cos=cos)
++
++        return split_qkv_rmsnorm_rope_impl_v2(
++            input=input,
++            cos_sin_cache=cos_sin_cache,
++            positions=positions,
++            q_weight=q_weight,
++            k_weight=k_weight,
++            q_hidden_size=q_hidden_size,
++            kv_hidden_size=kv_hidden_size,
++            head_dim=head_dim,
++            eps=eps,
++            q_bias=q_bias,
++            k_bias=k_bias,
++        )
++
++    if sin is None or cos is None:
++        raise ValueError("Legacy implementation requires sin and cos inputs.")
++
++    logger.info_once("qkv_rmsnorm_rope compile path: using legacy implementation")
++    return split_qkv_rmsnorm_rope_impl_legacy(
++        input=input,
++        sin=sin,
++        cos=cos,
++        q_weight=q_weight,
++        k_weight=k_weight,
++        q_hidden_size=q_hidden_size,
++        kv_hidden_size=kv_hidden_size,
++        head_dim=head_dim,
++        eps=eps,
++        q_bias=q_bias,
++        k_bias=k_bias,
+     )
++
++
++def split_qkv_rmsnorm_rope_impl_fake(
++    input: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    q_hidden_size: int,
++    kv_hidden_size: int,
++    head_dim: int,
++    eps: float,
++    q_bias: torch.Tensor | None = None,
++    k_bias: torch.Tensor | None = None,
++    cos: torch.Tensor | None = None,
++    sin: torch.Tensor | None = None,
++    cos_sin_cache: torch.Tensor | None = None,
++    positions: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    del q_weight, k_weight, head_dim, eps, q_bias, k_bias, cos, sin, cos_sin_cache, positions
++    batch_size = input.shape[0]
++    q_output = torch.empty(batch_size, int(q_hidden_size), device=input.device, dtype=input.dtype)
++    k_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=input.dtype)
++    v_output = torch.empty(batch_size, int(kv_hidden_size), device=input.device, dtype=input.dtype)
+     return q_output, k_output, v_output
+ 
+ 
+-- 
+2.53.0.windows.1
+

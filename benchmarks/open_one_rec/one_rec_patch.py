@@ -220,6 +220,10 @@ async def patched_async_request_openai_chat_completions(
                                     generated_text += content
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                if "prefill_time" in usage:
+                                    output.prefill_time = usage.get("prefill_time")
+                                if "decode_time" in usage:
+                                    output.decode_time = usage.get("decode_time")
 
                             most_recent_timestamp = timestamp
 
