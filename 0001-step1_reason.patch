@@ -1,0 +1,489 @@
+From f16ce1c652f5ea1393be66b14bc9655aa6519eb1 Mon Sep 17 00:00:00 2001
+From: zhangshucheng <zhangshucheng@huawei.com>
+Date: Wed, 24 Jun 2026 11:23:43 +0800
+Subject: [PATCH] step1_reason
+
+Signed-off-by: zhangshucheng <zhangshucheng@huawei.com>
+---
+ vllm/benchmarks/lib/endpoint_request_func.py  |  28 +++-
+ vllm/benchmarks/serve.py                      | 155 ++++++++++++++++++
+ vllm/entrypoints/openai/protocol.py           |   7 +
+ vllm/entrypoints/openai/serving_chat.py       |  67 ++++++++
+ vllm/entrypoints/openai/serving_completion.py |  59 +++++++
+ 5 files changed, 312 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/benchmarks/lib/endpoint_request_func.py b/vllm/benchmarks/lib/endpoint_request_func.py
+index 70c60124f..cfd167b2e 100644
+--- a/vllm/benchmarks/lib/endpoint_request_func.py
++++ b/vllm/benchmarks/lib/endpoint_request_func.py
+@@ -90,6 +90,12 @@ class RequestFuncOutput:
+     ttft: float = 0.0  # Time to first token
+     itl: list[float] = field(default_factory=list)  # list of inter-token latencies
+     tpot: float = 0.0  # avg next-token latencies
++    request_preprocess_time: float | None = None
++    handler_time: float | None = None
++    queue_time: float | None = None
++    first_step_postprocess_time: float | None = None
++    decode_postprocess_time: float | None = None
++    finalize_time: float | None = None
+     prefill_time: float | None = None
+     decode_time: float | None = None
+     prompt_len: int = 0
+@@ -356,10 +362,24 @@ async def async_request_openai_chat_completions(
+                                 generated_text += content or ""
+                             elif usage := data.get("usage"):
+                                 output.output_tokens = usage.get("completion_tokens")
+-                                if "prefill_time" in usage:
+-                                    output.prefill_time = usage.get("prefill_time")
+-                                if "decode_time" in usage:
+-                                    output.decode_time = usage.get("decode_time")
++                                if "request_preprocess_time" in usage:
++                                    output.request_preprocess_time = usage.get(
++                                        "request_preprocess_time"
++                                    )
++                                if "handler_time" in usage:
++                                    output.handler_time = usage.get("handler_time")
++                                if "queue_time" in usage:
++                                    output.queue_time = usage.get("queue_time")
++                                if "first_step_postprocess_time" in usage:
++                                    output.first_step_postprocess_time = usage.get(
++                                        "first_step_postprocess_time"
++                                    )
++                                if "decode_postprocess_time" in usage:
++                                    output.decode_postprocess_time = usage.get(
++                                        "decode_postprocess_time"
++                                    )
++                                if "finalize_time" in usage:
++                                    output.finalize_time = usage.get("finalize_time")
+                                 if "prefill_time" in usage:
+                                     output.prefill_time = usage.get("prefill_time")
+                                 if "decode_time" in usage:
+diff --git a/vllm/benchmarks/serve.py b/vllm/benchmarks/serve.py
+index c95ad0e9d..531195ac5 100644
+--- a/vllm/benchmarks/serve.py
++++ b/vllm/benchmarks/serve.py
+@@ -361,6 +361,30 @@ class BenchmarkMetrics:
+     median_prefill_ms: float | None = None
+     std_prefill_ms: float | None = None
+     percentiles_prefill_ms: list[tuple[float, float]] | None = None
++    mean_request_preprocess_ms: float | None = None
++    median_request_preprocess_ms: float | None = None
++    std_request_preprocess_ms: float | None = None
++    percentiles_request_preprocess_ms: list[tuple[float, float]] | None = None
++    mean_handler_ms: float | None = None
++    median_handler_ms: float | None = None
++    std_handler_ms: float | None = None
++    percentiles_handler_ms: list[tuple[float, float]] | None = None
++    mean_queue_ms: float | None = None
++    median_queue_ms: float | None = None
++    std_queue_ms: float | None = None
++    percentiles_queue_ms: list[tuple[float, float]] | None = None
++    mean_first_step_postprocess_ms: float | None = None
++    median_first_step_postprocess_ms: float | None = None
++    std_first_step_postprocess_ms: float | None = None
++    percentiles_first_step_postprocess_ms: list[tuple[float, float]] | None = None
++    mean_decode_postprocess_ms: float | None = None
++    median_decode_postprocess_ms: float | None = None
++    std_decode_postprocess_ms: float | None = None
++    percentiles_decode_postprocess_ms: list[tuple[float, float]] | None = None
++    mean_finalize_ms: float | None = None
++    median_finalize_ms: float | None = None
++    std_finalize_ms: float | None = None
++    percentiles_finalize_ms: list[tuple[float, float]] | None = None
+     mean_decode_ms: float | None = None
+     median_decode_ms: float | None = None
+     std_decode_ms: float | None = None
+@@ -584,6 +608,12 @@ def calculate_metrics(
+     all_tpots: list[float] = []
+     ttfts: list[float] = []
+     e2els: list[float] = []
++    request_preprocesses: list[float] = []
++    handlers: list[float] = []
++    queues: list[float] = []
++    first_step_postprocesses: list[float] = []
++    decode_postprocesses: list[float] = []
++    finalizes: list[float] = []
+     prefills: list[float] = []
+     decodes: list[float] = []
+     for i in range(len(outputs)):
+@@ -613,6 +643,20 @@ def calculate_metrics(
+             itls += outputs[i].itl
+             ttfts.append(outputs[i].ttft)
+             e2els.append(outputs[i].latency)
++            if outputs[i].request_preprocess_time is not None:
++                request_preprocesses.append(outputs[i].request_preprocess_time)
++            if outputs[i].handler_time is not None:
++                handlers.append(outputs[i].handler_time)
++            if outputs[i].queue_time is not None:
++                queues.append(outputs[i].queue_time)
++            if outputs[i].first_step_postprocess_time is not None:
++                first_step_postprocesses.append(
++                    outputs[i].first_step_postprocess_time
++                )
++            if outputs[i].decode_postprocess_time is not None:
++                decode_postprocesses.append(outputs[i].decode_postprocess_time)
++            if outputs[i].finalize_time is not None:
++                finalizes.append(outputs[i].finalize_time)
+             if outputs[i].prefill_time is not None:
+                 prefills.append(outputs[i].prefill_time)
+             if outputs[i].decode_time is not None:
+@@ -761,6 +805,99 @@ def calculate_metrics(
+         ],
+         max_output_tokens_per_s=max_output_tokens_per_s,
+         max_concurrent_requests=max_concurrent_requests,
++        mean_request_preprocess_ms=(
++            (np.mean(request_preprocesses) * 1000)
++            if request_preprocesses
++            else None
++        ),
++        median_request_preprocess_ms=(
++            (np.median(request_preprocesses) * 1000)
++            if request_preprocesses
++            else None
++        ),
++        std_request_preprocess_ms=(
++            (np.std(request_preprocesses) * 1000)
++            if request_preprocesses
++            else None
++        ),
++        percentiles_request_preprocess_ms=(
++            [
++                (p, np.percentile(request_preprocesses, p) * 1000)
++                for p in selected_percentiles
++            ]
++            if request_preprocesses
++            else None
++        ),
++        mean_handler_ms=(np.mean(handlers) * 1000) if handlers else None,
++        median_handler_ms=(np.median(handlers) * 1000) if handlers else None,
++        std_handler_ms=(np.std(handlers) * 1000) if handlers else None,
++        percentiles_handler_ms=(
++            [(p, np.percentile(handlers, p) * 1000) for p in selected_percentiles]
++            if handlers
++            else None
++        ),
++        mean_queue_ms=(np.mean(queues) * 1000) if queues else None,
++        median_queue_ms=(np.median(queues) * 1000) if queues else None,
++        std_queue_ms=(np.std(queues) * 1000) if queues else None,
++        percentiles_queue_ms=(
++            [(p, np.percentile(queues, p) * 1000) for p in selected_percentiles]
++            if queues
++            else None
++        ),
++        mean_first_step_postprocess_ms=(
++            (np.mean(first_step_postprocesses) * 1000)
++            if first_step_postprocesses
++            else None
++        ),
++        median_first_step_postprocess_ms=(
++            (np.median(first_step_postprocesses) * 1000)
++            if first_step_postprocesses
++            else None
++        ),
++        std_first_step_postprocess_ms=(
++            (np.std(first_step_postprocesses) * 1000)
++            if first_step_postprocesses
++            else None
++        ),
++        percentiles_first_step_postprocess_ms=(
++            [
++                (p, np.percentile(first_step_postprocesses, p) * 1000)
++                for p in selected_percentiles
++            ]
++            if first_step_postprocesses
++            else None
++        ),
++        mean_decode_postprocess_ms=(
++            (np.mean(decode_postprocesses) * 1000)
++            if decode_postprocesses
++            else None
++        ),
++        median_decode_postprocess_ms=(
++            (np.median(decode_postprocesses) * 1000)
++            if decode_postprocesses
++            else None
++        ),
++        std_decode_postprocess_ms=(
++            (np.std(decode_postprocesses) * 1000)
++            if decode_postprocesses
++            else None
++        ),
++        percentiles_decode_postprocess_ms=(
++            [
++                (p, np.percentile(decode_postprocesses, p) * 1000)
++                for p in selected_percentiles
++            ]
++            if decode_postprocesses
++            else None
++        ),
++        mean_finalize_ms=(np.mean(finalizes) * 1000) if finalizes else None,
++        median_finalize_ms=(np.median(finalizes) * 1000) if finalizes else None,
++        std_finalize_ms=(np.std(finalizes) * 1000) if finalizes else None,
++        percentiles_finalize_ms=(
++            [(p, np.percentile(finalizes, p) * 1000) for p in selected_percentiles]
++            if finalizes
++            else None
++        ),
+         mean_prefill_ms=(np.mean(prefills) * 1000) if prefills else None,
+         median_prefill_ms=(np.median(prefills) * 1000) if prefills else None,
+         std_prefill_ms=(np.std(prefills) * 1000) if prefills else None,
+@@ -1269,6 +1406,24 @@ async def benchmark(
+         process_one_metric("ttft", "TTFT", "Time to First Token")
+         process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
+         process_one_metric("itl", "ITL", "Inter-token Latency")
++        process_one_metric(
++            "request_preprocess",
++            "Request Preprocess",
++            "Request Preprocess Time",
++        )
++        process_one_metric("handler", "Handler", "Handler Time")
++        process_one_metric("queue", "Queue", "Queue Time")
++        process_one_metric(
++            "first_step_postprocess",
++            "First-step Postprocess",
++            "First-step Postprocess Time",
++        )
++        process_one_metric(
++            "decode_postprocess",
++            "Decode Postprocess",
++            "Decode Postprocess Time",
++        )
++        process_one_metric("finalize", "Finalize", "Finalize Time")
+         process_one_metric("prefill", "Prefill", "Prefill Time")
+         process_one_metric("decode", "Decode", "Decode Time")
+     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 662c938f6..4c751d0ee 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -172,6 +172,13 @@ class UsageInfo(OpenAIBaseModel):
+     total_tokens: int = 0
+     completion_tokens: int | None = 0
+     prompt_tokens_details: PromptTokenUsageInfo | None = None
++    request_preprocess_time: float | None = None
++    handler_time: float | None = None
++    queue_time: float | None = None
++    first_step_postprocess_time: float | None = None
++    decode_postprocess_time: float | None = None
++    finalize_time: float | None = None
++    response_serialize_time: float | None = None
+     prefill_time: float | None = None
+     decode_time: float | None = None
+ 
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 4b12e2b2d..48812a077 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -233,6 +233,8 @@ class OpenAIServingChat(OpenAIServing):
+         for the API specification. This API mimics the OpenAI
+         Chat Completion API.
+         """
++        request_start_time = time.perf_counter()
++
+         error_check_ret = await self._check_model(request)
+         if error_check_ret is not None:
+             logger.error("Error with model %s", error_check_ret)
+@@ -346,8 +348,11 @@ class OpenAIServingChat(OpenAIServing):
+         # Extract data_parallel_rank from header (router can inject it)
+         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+ 
++        request_preprocess_time = time.perf_counter() - request_start_time
++
+         # Schedule the request and get the result generator.
+         generators: list[AsyncGenerator[RequestOutput, None]] = []
++        request_start_time = time.perf_counter()
+         try:
+             for i, engine_prompt in enumerate(engine_prompts):
+                 prompt_text, _, _ = self._get_prompt_components(engine_prompt)
+@@ -403,6 +408,8 @@ class OpenAIServingChat(OpenAIServing):
+                         params=sampling_params,
+                         lora_request=lora_request,
+                         trace_headers=trace_headers,
++                        request_start_time=request_start_time,
++                        request_preprocess_time=request_preprocess_time,
+                     )
+                 else:
+                     engine_request, tokenization_kwargs = await self._process_inputs(
+@@ -1296,8 +1303,38 @@ class OpenAIServingChat(OpenAIServing):
+                     total_tokens=num_prompt_tokens + completion_tokens,
+                 )
+                 if last_metrics is not None:
++                    explicit_request_preprocess = getattr(
++                        last_metrics, "request_preprocess_time", None
++                    )
++                    explicit_handler = getattr(last_metrics, "handler_time", None)
++                    explicit_queue = getattr(last_metrics, "queue_time", None)
++                    explicit_first_step_postprocess = getattr(
++                        last_metrics, "first_step_postprocess_time", None
++                    )
++                    explicit_decode_postprocess = getattr(
++                        last_metrics, "decode_postprocess_time", None
++                    )
++                    explicit_finalize = getattr(last_metrics, "finalize_time", None)
+                     explicit_prefill = getattr(last_metrics, "prefill_time", None)
+                     explicit_decode = getattr(last_metrics, "decode_time", None)
++                    if explicit_request_preprocess is not None:
++                        final_usage.request_preprocess_time = (
++                            explicit_request_preprocess
++                        )
++                    if explicit_handler is not None:
++                        final_usage.handler_time = explicit_handler
++                    if explicit_queue is not None:
++                        final_usage.queue_time = explicit_queue
++                    if explicit_first_step_postprocess is not None:
++                        final_usage.first_step_postprocess_time = (
++                            explicit_first_step_postprocess
++                        )
++                    if explicit_decode_postprocess is not None:
++                        final_usage.decode_postprocess_time = (
++                            explicit_decode_postprocess
++                        )
++                    if explicit_finalize is not None:
++                        final_usage.finalize_time = explicit_finalize
+                     if explicit_prefill is not None:
+                         final_usage.prefill_time = explicit_prefill
+                     elif (
+@@ -1342,8 +1379,38 @@ class OpenAIServingChat(OpenAIServing):
+                 total_tokens=num_prompt_tokens + num_completion_tokens,
+             )
+             if last_metrics is not None:
++                explicit_request_preprocess = getattr(
++                    last_metrics, "request_preprocess_time", None
++                )
++                explicit_handler = getattr(last_metrics, "handler_time", None)
++                explicit_queue = getattr(last_metrics, "queue_time", None)
++                explicit_first_step_postprocess = getattr(
++                    last_metrics, "first_step_postprocess_time", None
++                )
++                explicit_decode_postprocess = getattr(
++                    last_metrics, "decode_postprocess_time", None
++                )
++                explicit_finalize = getattr(last_metrics, "finalize_time", None)
+                 explicit_prefill = getattr(last_metrics, "prefill_time", None)
+                 explicit_decode = getattr(last_metrics, "decode_time", None)
++                if explicit_request_preprocess is not None:
++                    request_metadata.final_usage_info.request_preprocess_time = (
++                        explicit_request_preprocess
++                    )
++                if explicit_handler is not None:
++                    request_metadata.final_usage_info.handler_time = explicit_handler
++                if explicit_queue is not None:
++                    request_metadata.final_usage_info.queue_time = explicit_queue
++                if explicit_first_step_postprocess is not None:
++                    request_metadata.final_usage_info.first_step_postprocess_time = (
++                        explicit_first_step_postprocess
++                    )
++                if explicit_decode_postprocess is not None:
++                    request_metadata.final_usage_info.decode_postprocess_time = (
++                        explicit_decode_postprocess
++                    )
++                if explicit_finalize is not None:
++                    request_metadata.final_usage_info.finalize_time = explicit_finalize
+                 if explicit_prefill is not None:
+                     request_metadata.final_usage_info.prefill_time = explicit_prefill
+                 elif (
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index 3095e0f5d..21c3397f5 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -124,6 +124,7 @@ class OpenAIServingCompletion(OpenAIServing):
+         if raw_request:
+             raw_request.state.request_metadata = request_metadata
+ 
++        request_start_time = time.perf_counter()
+         try:
+             lora_request = self._maybe_get_adapters(request)
+ 
+@@ -151,6 +152,8 @@ class OpenAIServingCompletion(OpenAIServing):
+             logger.exception("Error in preprocessing prompt inputs")
+             return self.create_error_response(e)
+ 
++        request_preprocess_time = time.perf_counter() - request_start_time
++
+         # Extract data_parallel_rank from header (router can inject it)
+         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+ 
+@@ -222,6 +225,8 @@ class OpenAIServingCompletion(OpenAIServing):
+                         params=sampling_params,
+                         lora_request=lora_request,
+                         trace_headers=trace_headers,
++                        request_start_time=request_start_time,
++                        request_preprocess_time=request_preprocess_time,
+                     )
+                 else:
+                     engine_request, tokenization_kwargs = await self._process_inputs(
+@@ -487,8 +492,38 @@ class OpenAIServingCompletion(OpenAIServing):
+                 total_tokens=total_prompt_tokens + total_completion_tokens,
+             )
+             if last_metrics is not None:
++                explicit_request_preprocess = getattr(
++                    last_metrics, "request_preprocess_time", None
++                )
++                explicit_handler = getattr(last_metrics, "handler_time", None)
++                explicit_queue = getattr(last_metrics, "queue_time", None)
++                explicit_first_step_postprocess = getattr(
++                    last_metrics, "first_step_postprocess_time", None
++                )
++                explicit_decode_postprocess = getattr(
++                    last_metrics, "decode_postprocess_time", None
++                )
++                explicit_finalize = getattr(last_metrics, "finalize_time", None)
+                 explicit_prefill = getattr(last_metrics, "prefill_time", None)
+                 explicit_decode = getattr(last_metrics, "decode_time", None)
++                if explicit_request_preprocess is not None:
++                    final_usage_info.request_preprocess_time = (
++                        explicit_request_preprocess
++                    )
++                if explicit_handler is not None:
++                    final_usage_info.handler_time = explicit_handler
++                if explicit_queue is not None:
++                    final_usage_info.queue_time = explicit_queue
++                if explicit_first_step_postprocess is not None:
++                    final_usage_info.first_step_postprocess_time = (
++                        explicit_first_step_postprocess
++                    )
++                if explicit_decode_postprocess is not None:
++                    final_usage_info.decode_postprocess_time = (
++                        explicit_decode_postprocess
++                    )
++                if explicit_finalize is not None:
++                    final_usage_info.finalize_time = explicit_finalize
+                 if explicit_prefill is not None:
+                     final_usage_info.prefill_time = explicit_prefill
+                 elif (
+@@ -632,8 +667,32 @@ class OpenAIServingCompletion(OpenAIServing):
+         )
+         if last_final_res is not None and last_final_res.metrics is not None:
+             metrics = last_final_res.metrics
++            explicit_request_preprocess = getattr(
++                metrics, "request_preprocess_time", None
++            )
++            explicit_handler = getattr(metrics, "handler_time", None)
++            explicit_queue = getattr(metrics, "queue_time", None)
++            explicit_first_step_postprocess = getattr(
++                metrics, "first_step_postprocess_time", None
++            )
++            explicit_decode_postprocess = getattr(
++                metrics, "decode_postprocess_time", None
++            )
++            explicit_finalize = getattr(metrics, "finalize_time", None)
+             explicit_prefill = getattr(metrics, "prefill_time", None)
+             explicit_decode = getattr(metrics, "decode_time", None)
++            if explicit_request_preprocess is not None:
++                usage.request_preprocess_time = explicit_request_preprocess
++            if explicit_handler is not None:
++                usage.handler_time = explicit_handler
++            if explicit_queue is not None:
++                usage.queue_time = explicit_queue
++            if explicit_first_step_postprocess is not None:
++                usage.first_step_postprocess_time = explicit_first_step_postprocess
++            if explicit_decode_postprocess is not None:
++                usage.decode_postprocess_time = explicit_decode_postprocess
++            if explicit_finalize is not None:
++                usage.finalize_time = explicit_finalize
+             if explicit_prefill is not None:
+                 usage.prefill_time = explicit_prefill
+             elif getattr(metrics, "scheduled_ts", 0.0) and getattr(
+-- 
+2.53.0.windows.1
+

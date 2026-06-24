@@ -220,6 +220,24 @@ async def patched_async_request_openai_chat_completions(
                                     generated_text += content
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
+                                if "request_preprocess_time" in usage:
+                                    output.request_preprocess_time = usage.get(
+                                        "request_preprocess_time"
+                                    )
+                                if "handler_time" in usage:
+                                    output.handler_time = usage.get("handler_time")
+                                if "queue_time" in usage:
+                                    output.queue_time = usage.get("queue_time")
+                                if "first_step_postprocess_time" in usage:
+                                    output.first_step_postprocess_time = usage.get(
+                                        "first_step_postprocess_time"
+                                    )
+                                if "decode_postprocess_time" in usage:
+                                    output.decode_postprocess_time = usage.get(
+                                        "decode_postprocess_time"
+                                    )
+                                if "finalize_time" in usage:
+                                    output.finalize_time = usage.get("finalize_time")
                                 if "prefill_time" in usage:
                                     output.prefill_time = usage.get("prefill_time")
                                 if "decode_time" in usage:
