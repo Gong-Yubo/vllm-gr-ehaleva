@@ -178,6 +178,7 @@ async def patched_async_request_openai_chat_completions(
     st = time.perf_counter()
     output.start_time = st
     most_recent_timestamp = st
+    client_parse_time = 0.0
     try:
         async with session.post(url=api_url, json=payload, headers=headers) as response:
             if response.status == 200:
@@ -199,7 +200,9 @@ async def patched_async_request_openai_chat_completions(
 
                         if chunk != "[DONE]":
                             timestamp = time.perf_counter()
+                            parse_start = time.perf_counter()
                             data = json.loads(chunk)
+                            client_parse_time += time.perf_counter() - parse_start
 
                             if choices := data.get("choices"):
                                 delta = choices[0]["delta"]
@@ -238,6 +241,14 @@ async def patched_async_request_openai_chat_completions(
                                     )
                                 if "finalize_time" in usage:
                                     output.finalize_time = usage.get("finalize_time")
+                                if "response_serialize_time" in usage:
+                                    output.response_serialize_time = usage.get(
+                                        "response_serialize_time"
+                                    )
+                                if "client_parse_time" in usage:
+                                    output.client_parse_time = usage.get(
+                                        "client_parse_time"
+                                    )
                                 if "prefill_time" in usage:
                                     output.prefill_time = usage.get("prefill_time")
                                 if "decode_time" in usage:
@@ -248,6 +259,7 @@ async def patched_async_request_openai_chat_completions(
                 output.generated_text = generated_text
                 output.success = True
                 output.latency = most_recent_timestamp - st
+                output.client_parse_time = client_parse_time
             else:
                 output.error = response.reason or ""
                 output.success = False

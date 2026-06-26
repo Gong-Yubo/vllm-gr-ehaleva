@@ -1,0 +1,295 @@
+From 15ca4b69661a4c1b78f56095dd471ac5c61a6b98 Mon Sep 17 00:00:00 2001
+From: zhangshucheng <zhangshucheng@huawei.com>
+Date: Fri, 26 Jun 2026 09:41:28 +0800
+Subject: [PATCH 2/2] step2_reason_fromwork --percentile-metrics
+ ttft,tpot,itl,request_preprocess,handler,queue,first_step_postprocess,decode_postprocess,finalize,response_serialize,client_parse,framework_client_residual,prefill,decode,e2el
+
+Signed-off-by: zhangshucheng <zhangshucheng@huawei.com>
+---
+ vllm/benchmarks/lib/endpoint_request_func.py  | 27 ++++++++
+ vllm/benchmarks/serve.py                      | 62 +++++++++++++++++++
+ vllm/entrypoints/openai/serving_chat.py       |  5 ++
+ vllm/entrypoints/openai/serving_completion.py |  4 ++
+ 4 files changed, 98 insertions(+)
+
+diff --git a/vllm/benchmarks/lib/endpoint_request_func.py b/vllm/benchmarks/lib/endpoint_request_func.py
+index cfd167b2e..856645748 100644
+--- a/vllm/benchmarks/lib/endpoint_request_func.py
++++ b/vllm/benchmarks/lib/endpoint_request_func.py
+@@ -96,6 +96,9 @@ class RequestFuncOutput:
+     first_step_postprocess_time: float | None = None
+     decode_postprocess_time: float | None = None
+     finalize_time: float | None = None
++    response_serialize_time: float | None = None
++    client_parse_time: float | None = None
++    framework_client_residual_time: float | None = None
+     prefill_time: float | None = None
+     decode_time: float | None = None
+     prompt_len: int = 0
+@@ -191,6 +194,7 @@ async def async_request_openai_completions(
+     st = time.perf_counter()
+     output.start_time = st
+     most_recent_timestamp = st
++    client_parse_time = 0.0
+     try:
+         async with session.post(url=api_url, json=payload, headers=headers) as response:
+             if response.status == 200:
+@@ -213,7 +217,11 @@ async def async_request_openai_completions(
+                         chunk = message.removeprefix("data: ")
+ 
+                         if chunk != "[DONE]":
++                            parse_start = time.perf_counter()
++                            parse_start = time.perf_counter()
+                             data = json.loads(chunk)
++                            client_parse_time += time.perf_counter() - parse_start
++                            client_parse_time += time.perf_counter() - parse_start
+ 
+                             # NOTE: Some completion API might have a last
+                             # usage summary response without a token so we
+@@ -247,6 +255,7 @@ async def async_request_openai_completions(
+                     )
+                 output.generated_text = generated_text
+                 output.latency = most_recent_timestamp - st
++                output.client_parse_time = client_parse_time
+             else:
+                 output.error = response.reason or ""
+                 output.success = False
+@@ -346,7 +355,9 @@ async def async_request_openai_chat_completions(
+ 
+                         if chunk != "[DONE]":
+                             timestamp = time.perf_counter()
++                            parse_start = time.perf_counter()
+                             data = json.loads(chunk)
++                            client_parse_time += time.perf_counter() - parse_start
+ 
+                             if choices := data.get("choices"):
+                                 content = choices[0]["delta"].get("content")
+@@ -362,6 +373,10 @@ async def async_request_openai_chat_completions(
+                                 generated_text += content or ""
+                             elif usage := data.get("usage"):
+                                 output.output_tokens = usage.get("completion_tokens")
++                                if "response_serialize_time" in usage:
++                                    output.response_serialize_time = usage.get(
++                                        "response_serialize_time"
++                                    )
+                                 if "request_preprocess_time" in usage:
+                                     output.request_preprocess_time = usage.get(
+                                         "request_preprocess_time"
+@@ -380,6 +395,10 @@ async def async_request_openai_chat_completions(
+                                     )
+                                 if "finalize_time" in usage:
+                                     output.finalize_time = usage.get("finalize_time")
++                                if "response_serialize_time" in usage:
++                                    output.response_serialize_time = usage.get(
++                                        "response_serialize_time"
++                                    )
+                                 if "prefill_time" in usage:
+                                     output.prefill_time = usage.get("prefill_time")
+                                 if "decode_time" in usage:
+@@ -390,6 +409,8 @@ async def async_request_openai_chat_completions(
+                 output.generated_text = generated_text
+                 output.success = True
+                 output.latency = most_recent_timestamp - st
++                output.client_parse_time = client_parse_time
++                output.client_parse_time = client_parse_time
+             else:
+                 output.error = response.reason or ""
+                 output.success = False
+@@ -458,6 +479,7 @@ async def async_request_openai_audio(
+         st = time.perf_counter()
+         output.start_time = st
+         most_recent_timestamp = st
++        client_parse_time = 0.0
+         try:
+             async with session.post(
+                 url=api_url, data=form, headers=headers
+@@ -475,7 +497,11 @@ async def async_request_openai_audio(
+                             chunk = message.decode("utf-8").removeprefix("data: ")
+                             if chunk != "[DONE]":
+                                 timestamp = time.perf_counter()
++                                parse_start = time.perf_counter()
+                                 data = json.loads(chunk)
++                                client_parse_time += (
++                                    time.perf_counter() - parse_start
++                                )
+ 
+                                 if choices := data.get("choices"):
+                                     content = choices[0]["delta"].get("content")
+@@ -501,6 +527,7 @@ async def async_request_openai_audio(
+                     output.generated_text = generated_text
+                     output.success = True
+                     output.latency = most_recent_timestamp - st
++                    output.client_parse_time = client_parse_time
+                 else:
+                     output.error = response.reason or ""
+                     output.success = False
+diff --git a/vllm/benchmarks/serve.py b/vllm/benchmarks/serve.py
+index 531195ac5..7bcda574b 100644
+--- a/vllm/benchmarks/serve.py
++++ b/vllm/benchmarks/serve.py
+@@ -385,6 +385,18 @@ class BenchmarkMetrics:
+     median_finalize_ms: float | None = None
+     std_finalize_ms: float | None = None
+     percentiles_finalize_ms: list[tuple[float, float]] | None = None
++    mean_response_serialize_ms: float | None = None
++    median_response_serialize_ms: float | None = None
++    std_response_serialize_ms: float | None = None
++    percentiles_response_serialize_ms: list[tuple[float, float]] | None = None
++    mean_client_parse_ms: float | None = None
++    median_client_parse_ms: float | None = None
++    std_client_parse_ms: float | None = None
++    percentiles_client_parse_ms: list[tuple[float, float]] | None = None
++    mean_framework_client_residual_ms: float | None = None
++    median_framework_client_residual_ms: float | None = None
++    std_framework_client_residual_ms: float | None = None
++    percentiles_framework_client_residual_ms: list[tuple[float, float]] | None = None
+     mean_decode_ms: float | None = None
+     median_decode_ms: float | None = None
+     std_decode_ms: float | None = None
+@@ -614,6 +626,9 @@ def calculate_metrics(
+     first_step_postprocesses: list[float] = []
+     decode_postprocesses: list[float] = []
+     finalizes: list[float] = []
++    response_serializes: list[float] = []
++    client_parses: list[float] = []
++    framework_client_residuals: list[float] = []
+     prefills: list[float] = []
+     decodes: list[float] = []
+     for i in range(len(outputs)):
+@@ -657,6 +672,14 @@ def calculate_metrics(
+                 decode_postprocesses.append(outputs[i].decode_postprocess_time)
+             if outputs[i].finalize_time is not None:
+                 finalizes.append(outputs[i].finalize_time)
++            if outputs[i].response_serialize_time is not None:
++                response_serializes.append(outputs[i].response_serialize_time)
++            if outputs[i].client_parse_time is not None:
++                client_parses.append(outputs[i].client_parse_time)
++            if outputs[i].framework_client_residual_time is not None:
++                framework_client_residuals.append(
++                    outputs[i].framework_client_residual_time
++                )
+             if outputs[i].prefill_time is not None:
+                 prefills.append(outputs[i].prefill_time)
+             if outputs[i].decode_time is not None:
+@@ -898,6 +921,30 @@ def calculate_metrics(
+             if finalizes
+             else None
+         ),
++        mean_response_serialize_ms=(np.mean(response_serializes) * 1000) if response_serializes else None,
++        median_response_serialize_ms=(np.median(response_serializes) * 1000) if response_serializes else None,
++        std_response_serialize_ms=(np.std(response_serializes) * 1000) if response_serializes else None,
++        percentiles_response_serialize_ms=(
++            [(p, np.percentile(response_serializes, p) * 1000) for p in selected_percentiles]
++            if response_serializes
++            else None
++        ),
++        mean_client_parse_ms=(np.mean(client_parses) * 1000) if client_parses else None,
++        median_client_parse_ms=(np.median(client_parses) * 1000) if client_parses else None,
++        std_client_parse_ms=(np.std(client_parses) * 1000) if client_parses else None,
++        percentiles_client_parse_ms=(
++            [(p, np.percentile(client_parses, p) * 1000) for p in selected_percentiles]
++            if client_parses
++            else None
++        ),
++        mean_framework_client_residual_ms=(np.mean(framework_client_residuals) * 1000) if framework_client_residuals else None,
++        median_framework_client_residual_ms=(np.median(framework_client_residuals) * 1000) if framework_client_residuals else None,
++        std_framework_client_residual_ms=(np.std(framework_client_residuals) * 1000) if framework_client_residuals else None,
++        percentiles_framework_client_residual_ms=(
++            [(p, np.percentile(framework_client_residuals, p) * 1000) for p in selected_percentiles]
++            if framework_client_residuals
++            else None
++        ),
+         mean_prefill_ms=(np.mean(prefills) * 1000) if prefills else None,
+         median_prefill_ms=(np.median(prefills) * 1000) if prefills else None,
+         std_prefill_ms=(np.std(prefills) * 1000) if prefills else None,
+@@ -1424,6 +1471,21 @@ async def benchmark(
+             "Decode Postprocess Time",
+         )
+         process_one_metric("finalize", "Finalize", "Finalize Time")
++        process_one_metric(
++            "response_serialize",
++            "Response Serialize",
++            "Response Serialize Time",
++        )
++        process_one_metric(
++            "client_parse",
++            "Client Parse",
++            "Client Parse Time",
++        )
++        process_one_metric(
++            "framework_client_residual",
++            "Framework/Client Residual",
++            "Framework/Client Residual Time",
++        )
+         process_one_metric("prefill", "Prefill", "Prefill Time")
+         process_one_metric("decode", "Decode", "Decode Time")
+     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index 48812a077..31f7b97b0 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -1297,6 +1297,7 @@ class OpenAIServingChat(OpenAIServing):
+             # is sent, send the usage
+             if include_usage:
+                 completion_tokens = sum(previous_num_tokens)
++                response_serialize_start = time.perf_counter()
+                 final_usage = UsageInfo(
+                     prompt_tokens=num_prompt_tokens,
+                     completion_tokens=completion_tokens,
+@@ -1358,6 +1359,7 @@ class OpenAIServingChat(OpenAIServing):
+                         cached_tokens=num_cached_tokens
+                     )
+ 
++                response_serialize_start = time.perf_counter()
+                 final_usage_chunk = ChatCompletionStreamResponse(
+                     id=request_id,
+                     object=chunk_object_type,
+@@ -1429,6 +1431,9 @@ class OpenAIServingChat(OpenAIServing):
+                     request_metadata.final_usage_info.decode_time = (
+                         last_metrics.last_token_ts - last_metrics.first_token_ts
+                     )
++                request_metadata.final_usage_info.response_serialize_time = (
++                    time.perf_counter() - response_serialize_start
++                )
+ 
+             # Log complete streaming response if output logging is enabled
+             if self.enable_log_outputs and self.request_logger:
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index 21c3397f5..c141bc0da 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -318,6 +318,7 @@ class OpenAIServingCompletion(OpenAIServing):
+         # When user requests streaming but we don't stream, we still need to
+         # return a streaming response with a single event.
+         if request.stream:
++            response_serialize_start = time.perf_counter()
+             response_json = response.model_dump_json()
+ 
+             async def fake_stream_generator() -> AsyncGenerator[str, None]:
+@@ -486,6 +487,7 @@ class OpenAIServingCompletion(OpenAIServing):
+ 
+             total_prompt_tokens = sum(num_prompt_tokens)
+             total_completion_tokens = sum(previous_num_tokens)
++            response_serialize_start = time.perf_counter()
+             final_usage_info = UsageInfo(
+                 prompt_tokens=total_prompt_tokens,
+                 completion_tokens=total_completion_tokens,
+@@ -524,6 +526,7 @@ class OpenAIServingCompletion(OpenAIServing):
+                     )
+                 if explicit_finalize is not None:
+                     final_usage_info.finalize_time = explicit_finalize
++                final_usage_info.response_serialize_time = time.perf_counter() - response_serialize_start
+                 if explicit_prefill is not None:
+                     final_usage_info.prefill_time = explicit_prefill
+                 elif (
+@@ -693,6 +696,7 @@ class OpenAIServingCompletion(OpenAIServing):
+                 usage.decode_postprocess_time = explicit_decode_postprocess
+             if explicit_finalize is not None:
+                 usage.finalize_time = explicit_finalize
++            usage.response_serialize_time = time.perf_counter() - response_serialize_start
+             if explicit_prefill is not None:
+                 usage.prefill_time = explicit_prefill
+             elif getattr(metrics, "scheduled_ts", 0.0) and getattr(
+-- 
+2.53.0.windows.1
+
